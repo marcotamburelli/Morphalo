@@ -18,7 +18,7 @@ def load_hocon_spec(path: str) -> dict:
     # Normalize common fields
     _normalize_model(spec)
     _normalize_seed(spec)
-    _normalize_prompt(spec)
+    # _normalize_prompt(spec)
 
     return spec
 
@@ -40,13 +40,13 @@ def _normalize_seed(spec: dict) -> None:
     if seed is None:
         spec['seed'] = 'random'
 
-def _normalize_prompt(spec:dict, joiner: str = '\n') -> str:
-    prompt = spec.get('prompt')
-    if prompt is None:
-        return
+# def _normalize_prompt(spec:dict, joiner: str = '\n') -> str:
+#     prompt = spec.get('prompt')
+#     if prompt is None:
+#         return
 
-    if isinstance(prompt, str):
-        spec['prompt'] = prompt.strip()
+#     if isinstance(prompt, str):
+#         spec['prompt'] = prompt.strip()
 
-    if isinstance(prompt, list):
-        spec['prompt'] = joiner.join(prompt).strip()
+#     if isinstance(prompt, list):
+#         spec['prompt'] = joiner.join(prompt).strip()
