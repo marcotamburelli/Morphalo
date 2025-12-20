@@ -1,14 +1,12 @@
-from __future__ import annotations
-
 import json
 import os
 import time
-from pathlib import Path
-from typing import Any, Union
 
 import torch
-from diffusers import *
+from diffusers import (AutoencoderKL, AutoPipelineForImage2Image,
+                       StableDiffusionXLPipeline)
 
+from stability.core.config import *
 from stability.nodes import *
 
 
@@ -17,6 +15,11 @@ def run_i2i(spec: dict, image: Union[str, Path, Image.Image], out_dir: Path) -> 
     Image-to-image node.
     Returns a JSON-serializable dict (intended to be printed to stdout).
     """
+    # Hugging Face env (must be set before loading)
+    os.environ["HF_HOME"] = HF_HOME
+    os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = HF_HUB_DISABLE_TELEMETRY
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- model settings ---
@@ -64,13 +67,13 @@ def run_i2i(spec: dict, image: Union[str, Path, Image.Image], out_dir: Path) -> 
     # --- load pipeline ---
     pipe_t2i = StableDiffusionXLPipeline.from_single_file(
         model_path,
-        vae=vae,
         torch_dtype=dtype,
+        **({'vae': vae} if vae is not None else {})
     ).to(device)
 
     pipe_i2i = AutoPipelineForImage2Image.from_pipe(pipe_t2i).to(device)
 
-    pipe_i2i.enable_vae_tiling()
+    # pipe_i2i.enable_vae_tiling()
 
     init_img = load_init_image(image)
 

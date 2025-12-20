@@ -1,7 +1,7 @@
 from configparser import ConfigParser
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.ini"
 
 config = ConfigParser()

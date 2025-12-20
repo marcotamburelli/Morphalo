@@ -1,13 +1,11 @@
-# from __future__ import annotations
-
 import json
 import os
 import time
-from pathlib import Path
 
 import torch
 from diffusers import AutoencoderKL, StableDiffusionXLPipeline
 
+from stability.core.config import *
 from stability.nodes import *
 
 
@@ -16,6 +14,11 @@ def run_t2i(spec: dict, out_dir: Path) -> dict:
     Text-to-image node.
     Returns a JSON-serializable dict (intended to be printed to stdout).
     """
+    # Hugging Face env (must be set before loading)
+    os.environ["HF_HOME"] = HF_HOME
+    os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = HF_HUB_DISABLE_TELEMETRY
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- model settings ---
@@ -58,12 +61,12 @@ def run_t2i(spec: dict, out_dir: Path) -> dict:
     # --- load pipeline ---
     pipe = StableDiffusionXLPipeline.from_single_file(
         model_path,
-        vae=vae,
         torch_dtype=dtype,
+        **({'vae': vae} if vae is not None else {})
     ).to(device)
 
     # memory-friendly
-    pipe.enable_vae_tiling()
+    # pipe.enable_vae_tiling()
 
     # --- measure time + memory ---
     if device.startswith('cuda'):
