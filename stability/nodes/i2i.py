@@ -3,8 +3,7 @@ import os
 import time
 
 import torch
-from diffusers import (AutoencoderKL, AutoPipelineForImage2Image,
-                       StableDiffusionXLPipeline)
+from diffusers import (AutoencoderKL, StableDiffusionXLImg2ImgPipeline)
 
 from stability.core.config import *
 from stability.nodes import *
@@ -65,13 +64,11 @@ def run_i2i(spec: dict, image: Union[str, Path, Image.Image], out_dir: Path) -> 
             vae_id, torch_dtype=dtype).to(device)
 
     # --- load pipeline ---
-    pipe_t2i = StableDiffusionXLPipeline.from_single_file(
+    pipe_i2i = StableDiffusionXLImg2ImgPipeline.from_single_file(
         model_path,
         torch_dtype=dtype,
         **({'vae': vae} if vae is not None else {})
     ).to(device)
-
-    pipe_i2i = AutoPipelineForImage2Image.from_pipe(pipe_t2i).to(device)
 
     # pipe_i2i.enable_vae_tiling()
 

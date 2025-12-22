@@ -119,14 +119,16 @@ class NodeRef:
     That output is propagated to downstream nodes via edges and assembled into the
     ``input`` mapping passed to ``run()``.
 
+    Parameters
+    ----------
+    id : str
+        Unique node identifier within a DAG.
+
     Attributes
     ----------
     op : str
-        Operator identifier (e.g. ``"t2i"``, ``"i2i"``, ``"file_image"``).
-        The runner may use this value to decide how to interpret default edges
-        and/or to route execution to the correct implementation.
-    id : str
-        Unique node identifier within a DAG.
+        Operator identifier automatically derived from the concrete node class
+        name (lowercase or snake_case).
 
     Notes
     -----
@@ -135,8 +137,8 @@ class NodeRef:
     and implement ``run()``.
     """
 
-    op: str
     id: str
+    op: str = field(init=False)
 
     def __post_init__(self) -> None:
         """
@@ -150,6 +152,10 @@ class NodeRef:
             If no DAG context is active (i.e. the node is created outside a
             ``with DAG(...):`` block).
         """
+        # operator name derived from concrete class
+        self.op = self.__class__.__name__.lower()
+
+        # register node in current DAG context
         _DagContext.current().add_node(self)
 
     # node >> other

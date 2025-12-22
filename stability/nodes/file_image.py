@@ -1,0 +1,72 @@
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+from stability.dag import NodeRef
+
+
+@dataclass
+class FileImage(NodeRef):
+    """
+    Source node that exposes an existing image from the filesystem.
+
+    This node does not perform any computation. It simply validates that the
+    referenced file exists and returns a JSON-serializable output dictionary
+    containing the image path.
+
+    The node is typically used as a source in a DAG to provide an initial image
+    for downstream nodes such as Img2Img or ControlNet-conditioned pipelines.
+
+    Parameters
+    ----------
+    id : str
+        Unique node identifier within the DAG.
+    path : str or Path
+        Filesystem path to the image to be used as a DAG input.
+
+    Attributes
+    ----------
+    op : str
+        Operator identifier automatically derived from the concrete class
+        name (e.g. ``"file_image"``).
+    """
+
+    path: Union[str, Path]
+
+    def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        """
+        Returns the image path as node output.
+
+        Parameters
+        ----------
+        output_dir : str or Path-like
+            Unused (kept for interface compatibility).
+        input : dict, optional
+            Unused. Source nodes are executed with empty inputs.
+
+        Returns
+        -------
+        dict
+            Output dictionary containing:
+            - 'ok': True
+            - 'node': 'file_image'
+            - 'id': node id
+            - 'image': absolute path to the image file
+        """
+        p = Path(str(self.path)).expanduser()
+        # non forzo resolve() se vuoi mantenere symlink; ma per robustezza spesso conviene:
+        p = p.resolve()
+
+        if not p.exists():
+            raise FileNotFoundError(
+                f"FileImage node '{self.id}': file not found: {p}")
+        if not p.is_file():
+            raise FileNotFoundError(
+                f"FileImage node '{self.id}': not a file: {p}")
+
+        return {
+            'ok': True,
+            'node': 'file_image',
+            'id': self.id,
+            'image': str(p),
+        }
