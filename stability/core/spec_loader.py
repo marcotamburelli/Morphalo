@@ -1,16 +1,39 @@
-from pathlib import Path
 import os
+from pathlib import Path
+from typing import Union
+
 from pyhocon import ConfigFactory
 
 
-def load_hocon_spec(path: str) -> dict:
+def load_hocon_spec(path: Union[str, Path]) -> dict:
     """
     Load a HOCON configuration file and return a plain Python dict
     with all includes and substitutions resolved.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the HOCON configuration file.
+
+    Returns
+    -------
+    dict
+        Parsed and normalized configuration dictionary.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the configuration file does not exist.
     """
     path = Path(path).expanduser().resolve()
 
-    conf = ConfigFactory.parse_file(path)
+    if not path.exists():
+        raise FileNotFoundError(f'HOCON spec file not found: {path}')
+
+    if not path.is_file():
+        raise ValueError(f'HOCON spec path is not a file: {path}')
+
+    conf = ConfigFactory.parse_file(str(path))
 
     # Convert to plain dict (no ConfigTree)
     spec = conf.as_plain_ordered_dict()
@@ -18,7 +41,6 @@ def load_hocon_spec(path: str) -> dict:
     # Normalize common fields
     _normalize_model(spec)
     _normalize_seed(spec)
-    # _normalize_prompt(spec)
 
     return spec
 
@@ -39,14 +61,3 @@ def _normalize_seed(spec: dict) -> None:
     seed = spec.get('seed')
     if seed is None:
         spec['seed'] = 'random'
-
-# def _normalize_prompt(spec:dict, joiner: str = '\n') -> str:
-#     prompt = spec.get('prompt')
-#     if prompt is None:
-#         return
-
-#     if isinstance(prompt, str):
-#         spec['prompt'] = prompt.strip()
-
-#     if isinstance(prompt, list):
-#         spec['prompt'] = joiner.join(prompt).strip()

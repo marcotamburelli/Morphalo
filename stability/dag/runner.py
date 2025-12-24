@@ -130,7 +130,10 @@ class DAGRunner:
                             execution.output = out
                             next_to_execute = {
                                 **next_to_execute,
-                                **{n.id: n for n in self.__dag.nodes if n.id == execution.edge.node_to}
+                                **{
+                                    n.id: n for n in self.__dag.nodes
+                                    if n.id == execution.edge.node_to and n.id not in node_to_execute
+                                }
                             }
 
             node_to_execute = {**pending, **next_to_execute}
