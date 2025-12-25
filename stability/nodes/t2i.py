@@ -32,8 +32,8 @@ def run_t2i(spec: dict, out_dir: Path) -> dict:
     model_path = os.path.expanduser(model_path)
 
     # --- prompts ---
-    prompt = norm_prompt(spec.get('prompt'))
-    negative = norm_prompt(spec.get('negative_prompt'), joiner=', ')
+    prompt = norm_prompt_pair(spec.get('prompt'))
+    negative = norm_prompt_pair(spec.get('negative_prompt'), joiner=', ')
 
     # --- params ---
     params = spec.get('params', {})

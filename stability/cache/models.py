@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 from diffusers import AutoencoderKL, ControlNetModel, StableDiffusionXLPipeline
-from transformers import DPTForDepthEstimation, DPTImageProcessor
+from transformers import CLIPVisionModelWithProjection, DPTForDepthEstimation, DPTImageProcessor
 
 from stability.cache import CacheKey, ModelCache
 
@@ -119,3 +119,29 @@ def get_depth_estimator(*, model_id: str, device: str) -> Tuple[DPTImageProcesso
         ModelCache.put(mod_key, model)
 
     return processor, model
+
+
+def get_ip_image_encoder(
+    *,
+        repo_id: str,
+        subfolder: str,
+        device: str,
+        dtype: torch.dtype
+) -> CLIPVisionModelWithProjection:
+    key = CacheKey(
+        kind='ip_image_encoder',
+        ref=f'{repo_id}:{subfolder}',
+        device=device,
+        dtype=_dtype_key(dtype)
+    )
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    enc = CLIPVisionModelWithProjection.from_pretrained(
+        repo_id,
+        subfolder=subfolder,
+        torch_dtype=dtype
+    ).to(device)
+
+    return ModelCache.put(key, enc)

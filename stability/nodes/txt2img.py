@@ -52,10 +52,12 @@ class Txt2Img(NodeRef):
 
     spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
     controlnet: ControlNetRegistry = field(init=False, repr=False)
+    ip_adapter: IpAdapterRegistry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()  # registra il nodo nel DAG, assegna id/op
         self.controlnet = ControlNetRegistry(owner=self)
+        self.ip_adapter = IpAdapterRegistry(owner=self)
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         """
@@ -81,8 +83,11 @@ class Txt2Img(NodeRef):
             raise ValueError('spec.model.path is required')
 
         # --- prompts ---
-        prompt = norm_prompt(spec.get('prompt'))
-        negative = norm_prompt(spec.get('negative_prompt'), joiner=', ')
+        prompt, prompt_2 = norm_prompt_pair(spec.get('prompt'))
+        negative_prompt, negative_prompt_2 = norm_prompt_pair(
+            spec.get('negative_prompt'),
+            joiner=', '
+        )
 
         # --- params ---
         params = spec.get('params', {})
@@ -108,6 +113,12 @@ class Txt2Img(NodeRef):
             device=device,
             input=input
         )
+        ip_bundle = IpAdapterBundle(
+            self.ip_adapter.specs,
+            dtype=dtype,
+            device=device,
+            input=input
+        )
 
         base = get_sdxl_base_pipe(
             model_path=model_path,
@@ -128,6 +139,15 @@ class Txt2Img(NodeRef):
                 **base.components
             )
 
+        if ip_bundle.has_ip_adapter:
+            pipe.register_modules(image_encoder=ip_bundle.image_encoder)
+            pipe.load_ip_adapter(
+                ip_bundle.model_id_arg,
+                subfolder=ip_bundle.subfolder_arg,
+                weight_name=[ip_bundle.weight_names_arg]
+            )
+            pipe.set_ip_adapter_scale(ip_bundle.scale_arg)
+
         # --- measure time + memory ---
         if device.startswith('cuda'):
             torch.cuda.reset_peak_memory_stats()
@@ -138,16 +158,21 @@ class Txt2Img(NodeRef):
         # --- call pipeline ---
         result = pipe(
             prompt=prompt,
-            negative_prompt=negative,
+            prompt_2=prompt_2,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
             num_inference_steps=steps,
             guidance_scale=cfg,
             width=width,
             height=height,
             generator=gen,
             **({
-                'control_image': cn_bundle.control_image_arg,
+                'image': cn_bundle.control_image_arg,
                 'controlnet_conditioning_scale': cn_bundle.conditioning_scale_arg,
-            } if cn_bundle.has_controlnet else {})
+            } if cn_bundle.has_controlnet else {}),
+            **({
+                'ip_adapter_image': ip_bundle.ip_adapter_image,
+            } if ip_bundle.has_ip_adapter else {})
         )
 
         if device.startswith('cuda'):
@@ -199,6 +224,19 @@ class Txt2Img(NodeRef):
                     'input_id': f'controlnet:{cn.key}',
                 }
                 for cn in self.controlnet.specs
+            ],
+            'ip-adapters': [
+                {
+                    'key': ipa.key,
+                    'model_id': ipa.model_id,
+                    'weight_name': ipa.weight_name,
+                    'subfolder': ipa.subfolder,
+                    'scale': ipa.scale,
+                    'encoder_key': ipa.encoder_key,
+                    'encoder_subfolder': ipa.encoder_subfolder,
+                    'input_id': f'ip-adapter:{ipa.key}',
+                }
+                for ipa in self.ip_adapter.specs
             ],
             'timing': {'seconds': round(dt_s, 3)},
             'cuda_mem': mem,

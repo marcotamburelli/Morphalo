@@ -32,8 +32,8 @@ def run_i2i(spec: dict, image: Union[str, Path, Image.Image], out_dir: Path) -> 
     model_path = os.path.expanduser(model_path)
 
     # --- prompts ---
-    prompt = norm_prompt(spec.get('prompt'))
-    negative = norm_prompt(spec.get('negative_prompt'), joiner=', ')
+    prompt = norm_prompt_pair(spec.get('prompt'))
+    negative = norm_prompt_pair(spec.get('negative_prompt'), joiner=', ')
 
     # --- params ---
     params = spec.get('params', {})
