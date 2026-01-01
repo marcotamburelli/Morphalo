@@ -5,7 +5,7 @@ from stability.nodes.file_image import FileImage
 from stability.nodes.ltx.img2video import Img2Video
 from stability.nodes.ltx.txt2video import Txt2Video
 from stability.nodes.ltx.video_image import FileVideo
-from stability.nodes.ltx.video_pose_map import VideoPoseMap
+from stability.nodes.ltx.preprocess import VideoCannyMap, VideoPoseMap
 
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
@@ -29,5 +29,8 @@ with DAG('demo_video_proc', out_dir=ROOT / 'outputs' / 'demo_video_proc') as dag
     initial = FileVideo(id='guide_img', path='~/videos/source_video.mp4')
     pose = VideoPoseMap(id='pose', spec=CONF /
                         'video' / 'spec_video2pose.conf')
+    canny = VideoCannyMap(id='canny', spec=CONF /
+                        'video' / 'spec_video2canny.conf')
 
     initial >> pose
+    initial >> canny

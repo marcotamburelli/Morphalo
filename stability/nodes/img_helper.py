@@ -14,6 +14,8 @@ from stability.cache.models import get_depth_estimator
 from stability.dag import NodeRef
 from stability.nodes import make_node_output_path
 
+# TODO This Node should take conf as other nodes and use CannyExtractor
+
 
 @dataclass
 class CannyEdge(NodeRef):

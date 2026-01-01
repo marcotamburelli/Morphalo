@@ -185,7 +185,7 @@ class Txt2Video(NodeRef):
             seed=seed,
             ext='mp4'
         )
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        # out_path.parent.mkdir(parents=True, exist_ok=True)
         export_to_video(video, str(out_path), fps=fps)
 
         # --- memory stats ---
