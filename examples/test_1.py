@@ -1,7 +1,7 @@
 import torch
 from diffusers import DiffusionPipeline
 from diffusers.quantizers import PipelineQuantizationConfig
-from common.config import *
+from stability.core.config import *
 import os
 
 

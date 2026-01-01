@@ -17,16 +17,16 @@ out_dir.mkdir(exist_ok=True)
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-quant_config = PipelineQuantizationConfig(
-    quant_backend="bitsandbytes_4bit",
-    quant_kwargs={
-        "load_in_4bit": True,
-        "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_compute_dtype": torch.bfloat16,
-    },
-    # components_to_quantize=["transformer", "text_encoder"],
-    components_to_quantize=["text_encoder"],
-)
+# quant_config = PipelineQuantizationConfig(
+#     quant_backend="bitsandbytes_4bit",
+#     quant_kwargs={
+#         "load_in_4bit": True,
+#         "bnb_4bit_quant_type": "nf4",
+#         "bnb_4bit_compute_dtype": torch.bfloat16,
+#     },
+#     # components_to_quantize=["transformer", "text_encoder"],
+#     components_to_quantize=["text_encoder"],
+# )
 
 pipeline = DiffusionPipeline.from_pretrained(
     "Qwen/Qwen-Image",

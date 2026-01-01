@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 from typing import Optional
 
 import typer
 
 from stability.core.spec_loader import load_hocon_spec
-from stability.dag import DAG, DagRegistry
+from stability.dag import DagRegistry
 from stability.dag.runner import DAGRunner
-from stability.dag.validation import validate_dag
 
 app = typer.Typer(help='Stability CLI')
 

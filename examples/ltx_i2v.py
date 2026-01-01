@@ -1,0 +1,267 @@
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+import torch
+from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline
+from diffusers.hooks import apply_group_offloading
+from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
+from diffusers.utils import export_to_video, load_image, load_video
+from pyhocon import ConfigFactory
+
+from stability.core.config import *
+
+
+def round_to_vae(height: int, width: int, pipe: LTXConditionPipeline) -> Tuple[int, int]:
+    height = height - (height % pipe.vae_spatial_compression_ratio)
+    width = width - (width % pipe.vae_spatial_compression_ratio)
+    return height, width
+
+
+def _as_str_prompt(x: Any, joiner: str = "\n") -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    if isinstance(x, list):
+        return joiner.join(str(i) for i in x).strip()
+    return str(x).strip()
+
+
+def load_hocon(path: str | Path) -> Dict[str, Any]:
+    cfg = ConfigFactory.parse_file(str(Path(path).expanduser()))
+    return cfg.as_plain_ordered_dict()
+
+
+def main():
+    os.environ['HF_HOME'] = HF_HOME
+    os.environ['HF_HUB_CACHE'] = HF_HUB_CACHE
+    os.environ['HF_HUB_DISABLE_TELEMETRY'] = HF_HUB_DISABLE_TELEMETRY
+
+    import sys
+    if len(sys.argv) != 2:
+        raise SystemExit("Usage: python ltx_i2v_hocon.py path/to/spec.conf")
+
+    spec_path = Path(sys.argv[1]).expanduser()
+    spec = load_hocon(spec_path)
+
+    model = spec.get("model", {})
+    params = spec.get("params", {})
+    inp = spec.get("input", {})
+
+    # --- config with defaults (mirrors your argparse defaults) ---
+    model_id = model.get("id", "Lightricks/LTX-Video-0.9.7-dev")
+    upscaler_id = model.get(
+        "upscaler", "Lightricks/ltxv-spatial-upscaler-0.9.7")
+
+    image_src = inp.get("image") or spec.get("image")
+    if not image_src:
+        raise ValueError(
+            "spec.input.image (or legacy spec.image) is required (path or URL)")
+
+    frame_index = int(inp.get("frame_index", 0))
+
+    prompt = _as_str_prompt(spec.get("prompt"))
+    if not prompt:
+        raise ValueError("spec.prompt is required (string or list of strings)")
+
+    negative = _as_str_prompt(
+        spec.get("negative_prompt",
+                 "worst quality, inconsistent motion, blurry, jittery, distorted"),
+        joiner=", ",
+    )
+
+    out = spec.get("out", "output_i2v.mp4")
+    height = int(params.get("height", 480))
+    width = int(params.get("width", 832))
+    fps = int(params.get("fps", 24))
+    num_frames = int(params.get("num_frames", 96))
+    seed = int(spec.get("seed", 0))
+    steps_main = int(params.get("steps_main", 30))
+    steps_refine = int(params.get("steps_refine", 10))
+    denoise_strength = float(params.get("denoise_strength", 0.4))
+    downscale_factor = float(params.get("downscale_factor", 2 / 3))
+    upscale_factor = float(params.get("upscale_latent_factor", 2))
+
+    decode_timestep = float(params.get("decode_timestep", 0.05))
+    image_cond_noise_scale = float(params.get("image_cond_noise_scale", 0.025))
+
+    # --- device / dtype ---
+    device = model.get(
+        "device", "cuda" if torch.cuda.is_available() else "cpu")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print("WARNING: model.device is CUDA but torch.cuda.is_available() is False; falling back to CPU.")
+        device = "cpu"
+
+    dtype_s = str(model.get("dtype", "")).lower().strip()
+    if dtype_s in ("bf16", "bfloat16"):
+        dtype = torch.bfloat16
+    elif dtype_s in ("fp16", "float16"):
+        dtype = torch.float16
+    elif dtype_s in ("fp32", "float32", ""):
+        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+    else:
+        raise ValueError(f"Unsupported model.dtype: {dtype_s}")
+
+    pipe = LTXConditionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype
+    )
+
+    pipe.enable_attention_slicing("max")
+
+    # VAE: riduce il picco nel decode (conv3d)
+    pipe.vae.enable_tiling()
+    pipe.vae.enable_slicing()
+
+    pipe_upsample = LTXLatentUpsamplePipeline.from_pretrained(
+        upscaler_id,
+        vae=pipe.vae,
+        torch_dtype=dtype,
+    ).to(device)
+
+    onload_device = torch.device(device)
+    offload_device = torch.device("cpu")
+
+    # Transformer (di solito è il pezzo più grosso)
+    pipe.transformer.enable_group_offload(
+        onload_device=onload_device,
+        offload_device=offload_device,
+        offload_type="leaf_level",
+        use_stream=True,
+    )
+
+    # Text encoder: spesso conviene a blocchi
+    apply_group_offloading(
+        pipe.text_encoder,
+        onload_device=onload_device,
+        offload_device=offload_device,
+        offload_type="block_level",
+        num_blocks_per_group=2,
+    )
+
+    # VAE: così non resta piantato in GPU quando non serve
+    apply_group_offloading(
+        pipe.vae,
+        onload_device=onload_device,
+        offload_device=offload_device,
+        offload_type="leaf_level",
+    )
+
+    # --- build condition from single image ---
+    image = load_image(image_src)
+
+    # NOTE: this is the same trick as your original script:
+    # export_to_video([image]) -> a 1-frame mp4 -> load_video(mp4_bytes/path) -> LTXVideoCondition
+    video_1frame = load_video(export_to_video([image]))
+    condition = LTXVideoCondition(video=video_1frame, frame_index=frame_index)
+
+    # --- sizes ---
+    expected_h, expected_w = height, width
+    down_h = int(expected_h * downscale_factor)
+    down_w = int(expected_w * downscale_factor)
+    down_h, down_w = round_to_vae(down_h, down_w, pipe)
+
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    # --- measure time + memory ---
+    if device.startswith('cuda'):
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+
+    # Part 1: generate at smaller res -> latent video
+    latents = pipe(
+        conditions=[condition],
+        prompt=prompt,
+        negative_prompt=negative,
+        width=down_w,
+        height=down_h,
+        num_frames=num_frames,
+        num_inference_steps=steps_main,
+        generator=gen,
+        output_type="latent",
+    ).frames
+
+    # Part 2: latent upsample (2x)
+    up_h, up_w = int(down_h * upscale_factor), int(down_w * upscale_factor)
+    up_latents = pipe_upsample(latents=latents, output_type="latent").frames
+
+    # Part 3: short denoise refine
+    video = pipe(
+        conditions=[condition],
+        prompt=prompt,
+        negative_prompt=negative,
+        width=up_w,
+        height=up_h,
+        num_frames=num_frames,
+        denoise_strength=denoise_strength,
+        num_inference_steps=steps_refine,
+        latents=up_latents,
+        decode_timestep=decode_timestep,
+        image_cond_noise_scale=image_cond_noise_scale,
+        generator=gen,
+        output_type="pil",
+    ).frames[0]
+
+    dt_s = time.perf_counter() - t0
+
+    # Part 4: resize down to target
+    video = [f.resize((expected_w, expected_h)) for f in video]
+
+    out_path = Path(out).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    export_to_video(video, str(out_path), fps=fps)
+
+    # --- memory stats ---
+    mem = {}
+    if device.startswith('cuda'):
+        mem = {
+            'allocated_gb': round(torch.cuda.memory_allocated() / 1024**3, 3),
+            'reserved_gb': round(torch.cuda.memory_reserved() / 1024**3, 3),
+            'peak_allocated_gb': round(torch.cuda.max_memory_allocated() / 1024**3, 3),
+            'peak_reserved_gb': round(torch.cuda.max_memory_reserved() / 1024**3, 3),
+        }
+
+    meta = {
+        "ok": True,
+        "node": "ltx_i2v_standalone",
+        "spec": str(spec_path),
+        "input_image": str(image_src),
+        "out": str(out_path),
+        "model": {
+            "id": model_id,
+            "upscaler": upscaler_id,
+            "device": device,
+            "dtype": str(dtype).replace("torch.", ""),
+        },
+        "params": {
+            "width": expected_w,
+            "height": expected_h,
+            "fps": fps,
+            "num_frames": num_frames,
+            "seed": seed,
+            "steps_main": steps_main,
+            "steps_refine": steps_refine,
+            "denoise_strength": denoise_strength,
+            "downscale_factor": downscale_factor,
+            "decode_timestep": decode_timestep,
+            "image_cond_noise_scale": image_cond_noise_scale,
+            "frame_index": frame_index,
+        },
+        'timing': {'seconds': round(dt_s, 3)},
+        'cuda_mem': mem,
+    }
+    meta_path = out_path.with_suffix(".json")
+    meta_path.write_text(json.dumps(
+        meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("Saved:", out_path)
+    print("Meta :", meta_path)
+
+
+if __name__ == "__main__":
+    main()

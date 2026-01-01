@@ -3,5 +3,8 @@ transformers
 bitsandbytes
 pyhocon
 typer
-opencv-python
 opencv-python-headless
+imageio
+imageio-ffmpeg
+sentencepiece
+mediapipe

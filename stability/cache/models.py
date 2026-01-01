@@ -4,12 +4,13 @@ from typing import Optional, Tuple
 
 import torch
 from diffusers import AutoencoderKL, ControlNetModel, StableDiffusionXLPipeline
-from transformers import CLIPVisionModelWithProjection, DPTForDepthEstimation, DPTImageProcessor
+from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
+                          DPTImageProcessor)
 
 from stability.cache import CacheKey, ModelCache
 
 
-def _dtype_key(dtype: torch.dtype) -> str:
+def dtype_key(dtype: torch.dtype) -> str:
     # stable cache key string
     return str(dtype).replace('torch.', '')
 
@@ -29,7 +30,7 @@ def get_sdxl_base_pipe(
         kind='sdxl_base_pipe',
         ref=model_ref,
         device=device,
-        dtype=_dtype_key(dtype),
+        dtype=dtype_key(dtype),
         extra=extra
     )
 
@@ -57,7 +58,7 @@ def get_controlnet(*, model_id: str, device: str, dtype: torch.dtype) -> Control
         kind='controlnet',
         ref=model_id,
         device=device,
-        dtype=_dtype_key(dtype)
+        dtype=dtype_key(dtype)
     )
 
     cached = ModelCache.get(key)
@@ -77,7 +78,7 @@ def get_vae(*, vae_id: str, device: str, dtype: torch.dtype) -> AutoencoderKL:
         kind='vae',
         ref=vae_id,
         device=device,
-        dtype=_dtype_key(dtype)
+        dtype=dtype_key(dtype)
     )
 
     cached = ModelCache.get(key)
@@ -123,16 +124,16 @@ def get_depth_estimator(*, model_id: str, device: str) -> Tuple[DPTImageProcesso
 
 def get_ip_image_encoder(
     *,
-        repo_id: str,
-        subfolder: str,
-        device: str,
-        dtype: torch.dtype
+    repo_id: str,
+    subfolder: str,
+    device: str,
+    dtype: torch.dtype
 ) -> CLIPVisionModelWithProjection:
     key = CacheKey(
         kind='ip_image_encoder',
         ref=f'{repo_id}:{subfolder}',
         device=device,
-        dtype=_dtype_key(dtype)
+        dtype=dtype_key(dtype)
     )
     cached = ModelCache.get(key)
     if cached is not None:

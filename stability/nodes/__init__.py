@@ -50,6 +50,30 @@ def resolve_seed(seed: Any) -> int:
     return int(seed)
 
 
+def norm_prompt(value: Any, *, joiner: str = '\n') -> str:
+    """
+    Normalize a prompt that can be:
+      - str
+      - list[str]
+    """
+
+    if value is None:
+        return ''
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, list):
+        # filter Nones / non-str defensively
+        parts = [str(x).strip()
+                 for x in value if x is not None and str(x).strip()]
+        return joiner.join(parts).strip()
+
+    # be strict: better to fail early than silently stringify weird objects
+    raise TypeError(
+        f'Prompt must be str or list[str], got {type(value).__name__}')
+
+
 def norm_prompt_pair(value: Any, *, joiner: str = "\n") -> Tuple[str, str]:
     """
     Normalize a prompt that can be:
@@ -60,33 +84,17 @@ def norm_prompt_pair(value: Any, *, joiner: str = "\n") -> Tuple[str, str]:
     Returns (content, style).
     """
 
-    def norm_prompt_atom(value: Any, joiner: str) -> str:
-        if value is None:
-            return ''
-        if isinstance(value, str):
-            return value.strip()
-
-        if isinstance(value, list):
-            # filter Nones / non-str defensively
-            parts = [str(x).strip()
-                     for x in value if x is not None and str(x).strip()]
-            return joiner.join(parts).strip()
-
-        # be strict: better to fail early than silently stringify weird objects
-        raise TypeError(
-            f'Prompt must be str or list[str], got {type(value).__name__}')
-
     if value is None:
         return '', ''
 
     # legacy / simple form: treat as content
     if isinstance(value, (str, list)):
-        return norm_prompt_atom(value, joiner=joiner), ''
+        return norm_prompt(value, joiner=joiner), ''
 
     # structured form
     if isinstance(value, dict):
-        content = norm_prompt_atom(value.get('content'), joiner=joiner)
-        style = norm_prompt_atom(value.get('style'), joiner=joiner)
+        content = norm_prompt(value.get('content'), joiner=joiner)
+        style = norm_prompt(value.get('style'), joiner=joiner)
         return content, style
 
     raise TypeError(

@@ -68,7 +68,7 @@ class Img2Img(NodeRef):
     ip_adapter: IpAdapterRegistry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        super().__post_init__()  # registra il nodo nel DAG, assegna id/op
+        super().__post_init__()
         self.controlnet = ControlNetRegistry(owner=self)
         self.ip_adapter = IpAdapterRegistry(owner=self)
 
@@ -173,6 +173,8 @@ class Img2Img(NodeRef):
                 weight_name=[ip_bundle.weight_names_arg]
             )
             pipe.set_ip_adapter_scale(ip_bundle.scale_arg)
+        else:
+            pipe.unload_ip_adapter()
 
         # run
         if device.startswith('cuda'):
@@ -267,8 +269,10 @@ class Img2Img(NodeRef):
         }
 
         meta_path = img_path.with_suffix('.json')
-        meta_path.write_text(json.dumps(
-            out, indent=2, ensure_ascii=False), encoding='utf-8')
+        meta_path.write_text(
+            json.dumps(out, indent=2, ensure_ascii=False),
+            encoding='utf-8'
+        )
         out['metadata'] = str(meta_path)
 
         return out

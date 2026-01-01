@@ -54,17 +54,17 @@ source "$VENV_DIR/bin/activate"
 
 # Upgrade packaging tools
 echo ">> Upgrading pip, setuptools and wheel"
-pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip setuptools wheel
 
 # Install PyTorch (CUDA 12.8)
 # NOTE: PyTorch wheels include the CUDA runtime.
 echo ">> Installing PyTorch (CUDA 12.8)"
-pip3 install torch torchvision
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Install project requirements (if present)
 if [ -f "$PROJECT_ROOT/requirements.txt" ]; then
   echo ">> Installing project requirements"
-  pip install -r "$PROJECT_ROOT/requirements.txt"
+  python -m pip install -r "$PROJECT_ROOT/requirements.txt"
 fi
 
 # Quick sanity check (non-blocking)

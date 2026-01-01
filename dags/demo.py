@@ -87,26 +87,6 @@ with DAG('demo_ip_adapter_2', out_dir=ROOT / 'outputs' / 'demo_ip_adapter_2') as
     )
 
 
-# with DAG('demo_ip_adapter_2', out_dir=ROOT / 'outputs' / 'demo_ip_adapter_2') as dag:
-#     # sorgente “foto” da cui estrai la depth map
-#     initial = FileImage(id='guide_img', path='~/images/elven_princess.png')
-
-#     # 1) genera un’immagine dal prompt
-#     gen = Txt2Img(id='gen', spec=CONF / 'jobs' / 'model_pool_t2i.conf')
-
-#     # 2) img2img a partire da gen, condizionata dalla immagine iniziale
-#     out = Img2Img(id='out', spec=CONF / 'jobs' /
-#                   'elf_princess_garden_i2i.conf')
-
-#     gen >> out  # init image per img2img
-#     initial >> out.ip_adapter.add(
-#         'h94/IP-Adapter',
-#         subfolder='sdxl_models',
-#         weight_name='ip-adapter_sdxl.bin',
-#         scale=0.5,
-#         key='IPA1',
-#     )
-
 with DAG('demo_mix', out_dir=ROOT / 'outputs' / 'demo_mix') as dag:
     # sorgente “foto” da cui estrai la depth map
     initial = FileImage(id='guide_img', path='~/images/elven_princess.png')
@@ -131,6 +111,10 @@ with DAG('demo_mix', out_dir=ROOT / 'outputs' / 'demo_mix') as dag:
     )
     canny >> out.controlnet.add(
         'diffusers/controlnet-canny-sdxl-1.0',
-        conditioning_scale=0.5,
+        conditioning_scale=0.3,
         key='canny1',
     )
+
+    out2 = Txt2Img(id='out2', spec=CONF / 'jobs' / 'model_pool_t2i.conf')
+
+    out >> out2

@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional
 
 from stability.dag import *
-from stability.dag.validation import validate_dag
+from stability.dag.validation import DagValidationError, validate_dag
 
 
 @dataclass
@@ -124,6 +124,11 @@ class DAGRunner:
                         execution.edge.input_id: execution.output for execution in source_executions
                     }
                     out = node.run(self.__dag.out_dir, input=input)
+
+                    if not out:
+                        raise DagValidationError(
+                            f"No output for node '{node.id}'"
+                        )
 
                     for execution in self._executions:
                         if execution.edge.node_from == node.id:

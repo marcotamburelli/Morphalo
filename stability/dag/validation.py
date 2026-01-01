@@ -60,11 +60,11 @@ def validate_dag(dag: DAG) -> None:
     for e in dag.edges:
         if e.node_from not in node_ids:
             raise DagValidationError(
-                f"Edge refers to missing source node '{e.node_from}'"
+                f"Edge refers to missing source node '{e.node_from}' to '{e.node_to}'"
             )
         if e.node_to not in node_ids:
             raise DagValidationError(
-                f"Edge refers to missing destination node '{e.node_to}'"
+                f"Edge refers to missing destination node '{e.node_to}' from '{e.node_from}'"
             )
 
     # 2) duplicate input_id on same destination
