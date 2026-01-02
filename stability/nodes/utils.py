@@ -1,11 +1,15 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
+import torch
+from transformers import DPTForDepthEstimation, DPTImageProcessor
+
+from stability.cache import CacheKey, ModelCache
 
 # ----------------------------
 # Config
@@ -531,6 +535,7 @@ class SkeletonExtractor:
     def render_frame(
         self,
         frame_bgr: cv2.typing.MatLike,
+        *,
         thickness: int = 2,
         point_radius: int = 2,
         preserve_bg: bool = False,
@@ -668,7 +673,7 @@ class CannyExtractor:
 
     def render_frame(
         self,
-        frame_bgr: np.ndarray,
+        frame_bgr: cv2.typing.MatLike,
         *,
         low_threshold: int = 80,
         high_threshold: int = 160,
@@ -681,13 +686,13 @@ class CannyExtractor:
         preserve_bg: bool = False,
         invert: bool = False,
         long_side: int | None = None,
-    ) -> np.ndarray:
+    ) -> cv2.typing.MatLike:
         """
         Render a Canny edge overlay for a single frame.
 
         Parameters
         ----------
-        frame_bgr : np.ndarray
+        frame_bgr : cv2.typing.MatLike
             Input frame in BGR format.
         low_threshold, high_threshold : int
             Canny thresholds.
@@ -712,15 +717,24 @@ class CannyExtractor:
 
         Returns
         -------
-        np.ndarray
+        cv2.typing.MatLike
             Output BGR frame.
         """
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # Ensure we operate on a NumPy array (MatLike may be UMat, etc.)
+        frame = np.asarray(frame_bgr)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if blur_ksize and blur_ksize > 1:
+            # OpenCV requires odd kernel sizes
             if blur_ksize % 2 == 0:
                 blur_ksize += 1
             gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), blur_sigma)
+
+        # Canny aperture size must be 3, 5, or 7
+        if aperture_size not in (3, 5, 7):
+            raise ValueError(
+                f"aperture_size must be 3, 5, or 7, got {aperture_size}")
 
         edges = cv2.Canny(
             gray,
@@ -737,19 +751,173 @@ class CannyExtractor:
         if invert:
             edges = 255 - edges
 
-        # edges is single-channel; convert to BGR
         edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
 
         if preserve_bg:
-            # white edges over original
-            out = frame_bgr.copy()
-            # mask where edges are "on"
+            out = frame.copy()
             m = edges > 0
             out[m] = (255, 255, 255)
         else:
             out = edges_bgr
 
         if long_side is not None:
-            out = resize_long_side(out, long_side)
+            out = resize_long_side(out, int(long_side))
 
+        return out
+
+
+@dataclass
+class DepthVideoExtractor:
+    """
+    Depth estimator for video frames using DPT (MiDaS/DPT via HuggingFace).
+
+    This extractor is responsible for:
+    - lazy-loading and caching the processor/model
+    - running per-frame depth estimation
+    - converting depth to a 3-channel BGR control frame
+    """
+
+    model_id: str = "Intel/dpt-hybrid-midas"
+    device: str = "cuda"
+    autocast: bool = True
+
+    # cached per-process handles (avoid repeated lookups in hot loop)
+    _processor: Optional[DPTImageProcessor] = field(
+        default=None, init=False, repr=False)
+    _model: Optional[DPTForDepthEstimation] = field(
+        default=None, init=False, repr=False)
+
+    def _lazy_load(self) -> None:
+        if self._processor is not None and self._model is not None:
+            return
+
+        # Use your existing cache logic (same as get_depth_estimator)
+        proc_key = CacheKey(kind="depth_processor",
+                            ref=self.model_id, device="cpu", dtype="na")
+        mod_key = CacheKey(kind="depth_model", ref=self.model_id,
+                           device=self.device, dtype="na")
+
+        processor = ModelCache.get(proc_key)
+        if processor is None:
+            processor = ModelCache.put(
+                proc_key, DPTImageProcessor.from_pretrained(self.model_id))
+
+        model = ModelCache.get(mod_key)
+        if model is None:
+            model = DPTForDepthEstimation.from_pretrained(
+                self.model_id).to(self.device)
+            model.eval()
+            ModelCache.put(mod_key, model)
+
+        self._processor = processor
+        self._model = model
+
+    @torch.no_grad()
+    def predict_depth_tensor(
+        self,
+        frame_bgr: cv2.typing.MatLike,
+        *,
+        long_side_infer: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Return raw predicted depth as a (H, W) float tensor on the model device.
+        """
+        from PIL import Image
+
+        self._lazy_load()
+        assert self._processor is not None
+        assert self._model is not None
+
+        frame = np.asarray(frame_bgr)
+        if long_side_infer is not None:
+            frame = resize_long_side(frame, int(long_side_infer))
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+
+        pixel_values = self._processor(
+            images=pil, return_tensors="pt").pixel_values.to(self.device)
+
+        use_autocast = bool(self.autocast) and str(
+            self.device).startswith("cuda")
+        if use_autocast:
+            with torch.autocast("cuda"):
+                depth = self._model(pixel_values).predicted_depth
+        else:
+            depth = self._model(pixel_values).predicted_depth
+
+        return depth[0].to(dtype=torch.float32)
+
+    @torch.no_grad()
+    def render_frame(
+        self,
+        frame_bgr: cv2.typing.MatLike,
+        *,
+        long_side_infer: int | None = None,
+        normalize: Literal["per_frame", "global"] = "per_frame",
+        invert: bool = False,
+        clip_p_low: float = 2.0,
+        clip_p_high: float = 98.0,
+        global_minmax: Optional[Tuple[float, float]] = None,
+    ) -> cv2.typing.MatLike:
+        """
+
+        Estimate depth for a single frame and return a 3-channel BGR depth map.
+
+        Parameters
+        ----------
+        frame_bgr : cv2.typing.MatLike
+            Input frame in BGR format.
+        long_side_infer : int or None
+            Optional resize (long side) applied *before* inference (speed/quality tradeoff).
+        normalize : {"per_frame", "global"}
+            Normalization strategy for mapping depth to [0, 255].
+        invert : bool
+            If True, invert depth visualization (near/far swap).
+        clip_p_low, clip_p_high : float
+            Percentile clipping to reduce outlier influence before normalization.
+        global_minmax : (float, float) or None
+            If normalize="global", provide (min, max) depth values used for normalization.
+
+        Returns
+        -------
+        cv2.typing.MatLike
+            Depth visualization as BGR uint8 (H, W, 3).
+        """
+        d = self.predict_depth_tensor(
+            frame_bgr,
+            long_side_infer=long_side_infer
+        )
+
+        if normalize == "global" and global_minmax is not None:
+            glo, ghi = global_minmax
+            lo = torch.tensor(glo, device=d.device, dtype=d.dtype)
+            hi = torch.tensor(ghi, device=d.device, dtype=d.dtype)
+
+            # scale (no hard clamp)
+            d = (d - lo) / (hi - lo + 1e-8)
+
+            # soft bound to [0, 1]
+            d = torch.clamp(d, 0.0, 1.0)
+
+        else:
+            # per-frame robust scaling (no hard clamp)
+            ql = float(clip_p_low) / 100.0
+            qh = float(clip_p_high) / 100.0
+
+            dq = d.float()  # quantile requires float32
+            lo = torch.quantile(dq, ql)
+            hi = torch.quantile(dq, qh)
+
+            # scale instead of clamp
+            d = (d - lo) / (hi - lo + 1e-8)
+
+            # soft bound
+            d = torch.clamp(d, 0.0, 1.0)
+
+        if invert:
+            d = 1.0 - d
+
+        img = (d * 255.0).clamp(0, 255).to(torch.uint8).detach().cpu().numpy()
+        out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return out

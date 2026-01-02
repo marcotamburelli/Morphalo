@@ -15,14 +15,14 @@ with DAG('demo_depth_1', out_dir=ROOT / 'outputs' / 'demo_depth_1') as dag:
     initial = FileImage(id='guide_img', path='~/images/elven_princess.png')
 
     # preprocess: foto -> depth map
-    canny = DepthMap(id='depth', device='cuda', size=1024)
-    initial >> canny
+    depth = DepthMap(id='depth', device='cuda', size=1024)
+    initial >> depth
 
     # 1) genera un’immagine dal prompt con la mappa di profondita
     out = Txt2Img(id='gen', spec=CONF / 'jobs' /
                   'elf_princess_garden_i2i.conf')
 
-    canny >> out.controlnet.add(
+    depth >> out.controlnet.add(
         'diffusers/controlnet-depth-sdxl-1.0',
         conditioning_scale=0.5,
         key='depth1',
@@ -33,8 +33,8 @@ with DAG('demo_depth_2', out_dir=ROOT / 'outputs' / 'demo_depth_2') as dag:
     initial = FileImage(id='guide_img', path='~/images/elven_princess.png')
 
     # preprocess: foto -> depth map
-    canny = DepthMap(id='depth', device='cuda', size=1024)
-    initial >> canny
+    depth = DepthMap(id='depth', device='cuda', size=1024)
+    initial >> depth
 
     # 1) genera un’immagine dal prompt
     gen = Txt2Img(id='gen', spec=CONF / 'jobs' / 'model_pool_t2i.conf')
@@ -44,7 +44,7 @@ with DAG('demo_depth_2', out_dir=ROOT / 'outputs' / 'demo_depth_2') as dag:
                   'elf_princess_garden_i2i.conf')
 
     gen >> out  # init image per img2img
-    canny >> out.controlnet.add(
+    depth >> out.controlnet.add(
         'diffusers/controlnet-depth-sdxl-1.0',
         conditioning_scale=0.5,
         key='depth1',
@@ -94,9 +94,9 @@ with DAG('demo_mix', out_dir=ROOT / 'outputs' / 'demo_mix') as dag:
     # 1) genera un’immagine dal prompt
     gen = Txt2Img(id='gen', spec=CONF / 'jobs' / 'model_pool_t2i.conf')
     # preprocess: foto -> canny edges
-    canny = CannyEdge(id='canny')
+    depth = CannyEdge(id='canny')
 
-    gen >> canny
+    gen >> depth
     # 2) img2img a partire da gen, condizionata dalla immagine iniziale
     out = Img2Img(id='out', spec=CONF / 'jobs' /
                   'elf_princess_garden_i2i.conf')
@@ -109,7 +109,7 @@ with DAG('demo_mix', out_dir=ROOT / 'outputs' / 'demo_mix') as dag:
         scale=0.5,
         key='IPA1',
     )
-    canny >> out.controlnet.add(
+    depth >> out.controlnet.add(
         'diffusers/controlnet-canny-sdxl-1.0',
         conditioning_scale=0.3,
         key='canny1',

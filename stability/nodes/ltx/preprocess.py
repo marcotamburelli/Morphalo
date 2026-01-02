@@ -6,11 +6,14 @@ from typing import Any, Dict, Optional, Union
 
 import cv2
 import numpy as np
+import torch
 
 from stability.dag import NodeRef
 from stability.nodes import make_node_output_path, resolve_spec
 from stability.nodes.ltx import read_video_info
-from stability.nodes.utils import CannyExtractor, ModelPaths, SkeletonExtractor, compute_long_side_resize
+from stability.nodes.utils import (CannyExtractor, DepthVideoExtractor,
+                                   ModelPaths, SkeletonExtractor,
+                                   compute_long_side_resize)
 
 
 # -----------------------------
@@ -537,6 +540,245 @@ class VideoCannyMap(NodeRef):
             },
 
             'timing': {'seconds': round(dt_s, 3)},
+        }
+
+        meta_path = out_video_path.with_suffix('.json')
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding='utf-8'
+        )
+
+        return meta
+
+
+_model_id: str = "Intel/dpt-hybrid-midas"
+_device: str = "cuda"
+_autocast: bool = True
+
+
+@dataclass
+class VideoDepthMap(NodeRef):
+    """
+    Video depth preprocessing node producing a single packed control video.
+
+    See DepthMap for the single-image analogue. This node processes an input video
+    and writes a packed depth control video (mp4) plus a JSON sidecar.
+    """
+
+    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+    def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        input = input or {}
+        upstream = input.get("default")
+        if upstream is None:
+            raise ValueError(
+                "VideoDepthMap requires an input video wired to the default input.")
+
+        in_path = upstream.get("video") or upstream.get("path")
+        if not in_path:
+            raise ValueError("Upstream output does not contain a video path.")
+
+        spec = resolve_spec(self.spec)
+
+        preserve_bg = bool(
+            spec.get("preserve_bg", False)
+        )  # usually False for depth
+        max_frames = int(spec.get("max_frames", -1))
+
+        # output resize (control resolution)
+        long_side = spec.get("long_side", 384)
+        # inference resize (can be higher than output)
+        long_side_infer = spec.get("long_side_infer", None)
+
+        normalize = spec.get("normalize", "per_frame")  # per_frame|global
+        invert = bool(spec.get("invert_depth", False))
+        clip_p_low = float(spec.get("clip_p_low", 2.0))
+        clip_p_high = float(spec.get("clip_p_high", 98.0))
+
+        fps_override = spec.get("fps", None)
+
+        model = spec.get('model', {
+            "id": _model_id,
+            "device": _device,
+            "autocast": _autocast,
+        })
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cap = cv2.VideoCapture(str(in_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Unable to open video: {in_path}")
+
+        fps_in = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        in_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        in_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        in_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        fps_out = float(fps_override) if fps_override else (
+            fps_in if fps_in > 0 else 24.0)
+
+        # build extractor (model cached internally via ModelCache)
+        extractor = DepthVideoExtractor(
+            model_id=model['id'],
+            device=model['device'],
+            autocast=model['autocast'],
+        )
+
+        # probe first frame to define output size
+        ok, frame0 = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError("Empty video or failed first frame read.")
+
+        # compute output frame (depth) size
+        depth0 = extractor.render_frame(
+            frame0,
+            long_side_infer=long_side_infer,
+            normalize="per_frame",
+            invert=invert,
+            clip_p_low=clip_p_low,
+            clip_p_high=clip_p_high,
+        )
+
+        # If you want preserve_bg, you can overlay depth on original. Typically false.
+        if preserve_bg:
+            # simple overlay: use depth as luminance mask (debug)
+            out0 = cv2.addWeighted(frame0, 0.6, resize_long_side(depth0, max(
+                frame0.shape[:2])) if long_side_infer else depth0, 0.4, 0.0)
+        else:
+            out0 = depth0
+
+        if long_side is not None:
+            out0 = resize_long_side(out0, int(long_side))
+
+        out_h, out_w = out0.shape[:2]
+
+        out_video_path = make_node_output_path(
+            out_dir=out_dir,
+            node_id=self.id,
+            ext='mp4'
+        )
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(out_video_path), fourcc, fps_out, (out_w, out_h))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"Unable to open VideoWriter: {out_video_path}")
+
+        # rewind
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        # optional global normalization pass (two-pass)
+        # NOTE: global requires computing min/max over frames. Keeping it simple:
+        global_minmax = None
+        if normalize == "global":
+            # Pass 1: compute a global robust range from per-frame quantiles on raw depth.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            ql = float(clip_p_low) / 100.0
+            qh = float(clip_p_high) / 100.0
+
+            global_lo = None
+            global_hi = None
+            idx = 0
+
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                idx += 1
+                if max_frames > 0 and idx > max_frames:
+                    break
+
+                d = extractor.predict_depth_tensor(fr, long_side_infer=long_side_infer)
+                lo = torch.quantile(d, ql).item()
+                hi = torch.quantile(d, qh).item()
+
+                global_lo = lo if global_lo is None else min(global_lo, lo)
+                global_hi = hi if global_hi is None else max(global_hi, hi)
+
+            if global_lo is None or global_hi is None or global_hi <= global_lo:
+                # Safety fallback
+                normalize = "per_frame"
+                global_minmax = None
+            else:
+                global_minmax = (float(global_lo), float(global_hi))
+
+            # Rewind for Pass 2
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        # main pass
+        frames_total = 0
+        frames_written = 0
+        t0 = time.perf_counter()
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames_total += 1
+            if max_frames > 0 and frames_total > max_frames:
+                break
+
+            depth_bgr = extractor.render_frame(
+                frame,
+                long_side_infer=long_side_infer,
+                normalize=normalize,
+                invert=invert,
+                clip_p_low=clip_p_low,
+                clip_p_high=clip_p_high,
+                global_minmax=global_minmax,
+            )
+
+            out = depth_bgr if not preserve_bg else cv2.addWeighted(
+                frame, 0.6, resize_long_side(depth_bgr, max(frame.shape[:2])), 0.4, 0.0)
+
+            if long_side is not None:
+                out = resize_long_side(out, int(long_side))
+
+            writer.write(out)
+            frames_written += 1
+
+        cap.release()
+        writer.release()
+
+        dt_s = time.perf_counter() - t0
+
+        meta = {
+            "ok": True,
+            "node": self.op,
+            "id": self.id,
+            "video": str(out_video_path),
+            "input": {
+                "video": str(in_path),
+                "fps": fps_in,
+                "width": in_w,
+                "height": in_h,
+                "num_frames": in_n,
+            },
+            "params": {
+                "preserve_bg": preserve_bg,
+                "max_frames": max_frames,
+                "long_side": long_side,
+                "long_side_infer": long_side_infer,
+                "normalize": normalize,
+                "invert_depth": invert,
+                "clip_p_low": clip_p_low,
+                "clip_p_high": clip_p_high,
+                "fps_out": fps_out,
+                "fourcc": "mp4v",
+            },
+            "stats": {
+                "frames_total": frames_total,
+                "frames_written": frames_written,
+            },
+            'model': model,
+            "timing": {"seconds": round(dt_s, 3)}
         }
 
         meta_path = out_video_path.with_suffix('.json')
