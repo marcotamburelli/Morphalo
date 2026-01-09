@@ -274,11 +274,11 @@ class ControlNetRegistry:
 class ControlNetBundle:
     def __init__(
         self,
-            controlnets: List[ControlNetSpec],
-            *,
-            dtype,
-            device,
-            input: Optional[Dict[str, Dict]]
+        controlnets: List[ControlNetSpec],
+        *,
+        dtype,
+        device,
+        input: Optional[Dict[str, Dict]]
     ):
         self._cn_images: List[str] = []
         self._cn_scales: List[float] = []

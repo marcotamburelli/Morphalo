@@ -6,15 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
-from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
-from diffusers.utils import export_to_video, load_image, load_video
+from diffusers.utils import export_to_video, load_video
 
-from stability.cache.ltx_models import (get_ltx_condition,
-                                        get_ltx_latent_upsample)
+from stability.cache.ltx_models import *
 from stability.core.config import *
 from stability.dag import NodeRef
 from stability.nodes import *
-from stability.nodes.ltx import round_to_vae
+from stability.nodes.ltx import *
 
 _default_model = 'Lightricks/LTX-Video-0.9.7-dev'
 _default_upscaler = 'Lightricks/ltxv-spatial-upscaler-0.9.7'
@@ -25,10 +23,16 @@ class Txt2Video(NodeRef):
     """
     Text-to-video node based on LTX-Video.
 
-    This node generates a short video clip directly from a text prompt,
-    without requiring an input image or video. Motion, appearance, and
-    temporal coherence are inferred entirely by the underlying LTX-Video
-    diffusion model.
+    This node generates a short video clip from a text prompt using the
+    LTX-Video diffusion model. Video content is produced through a
+    multi-stage process that first generates a low-resolution latent
+    video and then refines it into a final high-resolution sequence.
+
+    Optionally, the generation can be conditioned using a single
+    Image-Conditioned LoRA (IC-LoRA). When an IC-LoRA is attached, an
+    upstream video (typically edge-based, depth, or similar structural
+    guidance) is used to constrain the generated motion and geometry
+    while preserving the model's generative freedom.
 
     The node produces a single primary output dictionary containing at least:
     - ``video``: filesystem path to the generated MP4 video
@@ -42,10 +46,25 @@ class Txt2Video(NodeRef):
         enclosing DAG.
     spec : dict
         Configuration dictionary describing the model, prompts, and
-        text-to-video parameters. Typical keys include ``model``, ``prompt``,
-        ``negative_prompt``, ``params`` (e.g. ``width``, ``height``,
-        ``num_frames``, ``fps``, ``steps_main``, ``steps_refine``,
-        ``denoise_strength``), and ``seed``.
+        text-to-video parameters.
+
+        Typical keys include:
+
+        - ``model``: model identifiers and runtime options
+        - ``prompt``: text prompt describing the desired video
+        - ``negative_prompt``: optional negative prompt
+        - ``seed``: random seed (or ``"random"``)
+        - ``params``:
+            - ``width`` / ``height``: target output resolution
+            - ``fps``: frames per second
+            - ``num_frames``: total number of frames
+            - ``steps_main``: diffusion steps for latent generation
+            - ``steps_refine``: diffusion steps for refinement
+            - ``denoise_strength``: refinement denoise strength
+            - ``guidance_scale`` / ``guidance_rescale``: classifier-free guidance parameters
+            - ``downscale_factor``: spatial downscaling factor for latent generation
+            - ``decode_timestep`` / ``decode_noise_scale``: decode-time noise controls
+            - ``image_cond_noise_scale``: noise applied to conditioning inputs
 
     Attributes
     ----------
@@ -53,17 +72,32 @@ class Txt2Video(NodeRef):
         Operator identifier automatically derived from the concrete class
         name (e.g. ``"txt2video"``).
 
+    ic_lora : ICLoRaRegistry
+        Registry used to attach a single Image-Conditioned LoRA (IC-LoRA)
+        to this node. The registry exposes an AttachmentSink that allows
+        an upstream video node to be wired as structural conditioning.
+
     Notes
     -----
     - This node does not consume any default DAG input.
-    - Video motion and temporal structure are generated purely from the
-      textual description.
+    - When no IC-LoRA is attached, video motion and temporal structure
+      are generated purely from the textual prompt.
+    - When an IC-LoRA is attached, the conditioning video is used as a
+      reference signal to guide motion and geometry, without directly
+      copying pixel content.
+    - Only one IC-LoRA attachment is supported by design.
+    - The node executes in three conceptual stages:
+        1. Latent video generation at reduced resolution
+        2. Latent upsampling
+        3. Short refinement pass to produce the final video
     """
 
     spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    ic_lora: ICLoRaRegistry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.ic_lora = ICLoRaRegistry(self)
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # HF env
@@ -92,26 +126,36 @@ class Txt2Video(NodeRef):
 
         # params
         params = spec.get('params', {})
+        guidance_scale = float(params.get('guidance_scale', 3))
+        guidance_rescale = float(params.get('guidance_rescale', 0.7))
+
         height = int(params.get('height', 480))
         width = int(params.get('width', 832))
         fps = int(params.get('fps', 24))
         num_frames = int(params.get('num_frames', 96))
+
         steps_main = int(params.get('steps_main', 30))
         steps_refine = int(params.get('steps_refine', 10))
         denoise_strength = float(params.get('denoise_strength', 0.4))
         downscale_factor = float(params.get('downscale_factor', 2 / 3))
         upscale_factor = float(params.get('upscale_latent_factor', 2))
-        max_sequence_length = int(params.get('max_sequence_length', 512))
 
         decode_timestep = float(params.get('decode_timestep', 0.05))
+        decode_noise_scale = float(params.get('decode_noise_scale', 0.025))
         image_cond_noise_scale = float(
             params.get('image_cond_noise_scale', 0.025)
         )
-        frame_index = int(params.get('frame_index', 0))
+
+        max_sequence_length = int(params.get('max_sequence_length', 512))
 
         # seed
         seed = resolve_seed(spec.get('seed', 'random'))
         gen = torch.Generator(device=device).manual_seed(seed)
+
+        ic_lora_bundle = ICLoRaBundle(
+            ic_lora=self.ic_lora.spec,
+            input=input
+        )
 
         pipe = get_ltx_condition(model_id=model_id, device=device, dtype=dtype)
         pipe_upsample = get_ltx_latent_upsample(
@@ -136,17 +180,40 @@ class Txt2Video(NodeRef):
 
         t0 = time.perf_counter()
 
+        if ic_lora_bundle.has_has_ic_lora:
+            pipe.load_lora_weights(
+                ic_lora_bundle.model_id,
+                weight_name=ic_lora_bundle.weight_name,
+                adapter_name=ic_lora_bundle.adapter_name
+            )
+
+            pipe.set_adapters(
+                [ic_lora_bundle.adapter_name],
+                [ic_lora_bundle.adapter_weight]
+            )
+
+            control_frames = load_video(ic_lora_bundle.video_path)
+            reference_video = read_video_tensor(control_frames, device=device)
+        else:
+            pipe.unload_lora_weights()
+            reference_video = None
+
         # Part 1: generate at smaller res -> latent video
         latents = pipe(
-            conditions=None,
+            reference_video=reference_video,
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=down_w,
             height=down_h,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
             num_frames=num_frames,
             num_inference_steps=steps_main,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            image_cond_noise_scale=image_cond_noise_scale,
             generator=gen,
-            output_type='latent',
+            output_type="latent",
             max_sequence_length=max_sequence_length
         ).frames
 
@@ -158,26 +225,30 @@ class Txt2Video(NodeRef):
         ).frames
 
         # Part 3: short denoise refine
-        video = pipe(
+        video_out = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=up_w,
             height=up_h,
+            guidance_scale=guidance_scale,
+            guidance_rescale=guidance_rescale,
             num_frames=num_frames,
             denoise_strength=denoise_strength,
             num_inference_steps=steps_refine,
             latents=up_latents,
             decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
             image_cond_noise_scale=image_cond_noise_scale,
             generator=gen,
-            output_type='pil',
+            output_type="pil",
             max_sequence_length=max_sequence_length
         ).frames[0]
 
         dt_s = time.perf_counter() - t0
 
         # Part 4: resize down to target
-        video = [f.resize((expected_w, expected_h)) for f in video]
+        video_out = [f.resize((expected_w, expected_h))
+                     for f in video_out]
 
         out_path = make_node_output_path(
             out_dir=out_dir,
@@ -186,7 +257,7 @@ class Txt2Video(NodeRef):
             ext='mp4'
         )
         # out_path.parent.mkdir(parents=True, exist_ok=True)
-        export_to_video(video, str(out_path), fps=fps)
+        export_to_video(video_out, str(out_path), fps=fps)
 
         # --- memory stats ---
         mem = {}
@@ -209,7 +280,10 @@ class Txt2Video(NodeRef):
                 'device': device,
                 'dtype': str(dtype).replace('torch.', ''),
             },
+            'seed': seed,
             'params': {
+                'guidance_scale': guidance_scale,
+                'guidance_rescale': guidance_rescale,
                 'width': expected_w,
                 'height': expected_h,
                 'fps': fps,
@@ -221,7 +295,7 @@ class Txt2Video(NodeRef):
                 'downscale_factor': downscale_factor,
                 'decode_timestep': decode_timestep,
                 'image_cond_noise_scale': image_cond_noise_scale,
-                'frame_index': frame_index,
+                'max_sequence_length': max_sequence_length
             },
             'timing': {'seconds': round(dt_s, 3)},
             'cuda_mem': mem,

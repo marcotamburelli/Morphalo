@@ -154,18 +154,91 @@ def _to_px(x: float, y: float, w: int, h: int) -> Tuple[int, int]:
     return int(round(x * w)), int(round(y * h))
 
 
-def draw_edges(img: np.ndarray, pts_xy: List[Tuple[int, int]], edges: List[Tuple[int, int]], color: Tuple[int, int, int], thickness: int):
+def _unit_perp(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    v = b - a
+    n = np.linalg.norm(v)
+    if n < 1e-6:
+        return np.array([0.0, 0.0], dtype=np.float32)
+    v = v / n
+    # perpendicular
+    return np.array([-v[1], v[0]], dtype=np.float32)
+
+
+def _add_quad(polys: List[np.ndarray], p0, p1, p2, w0, w1, w2):
+    """
+    Build two quads for (p0->p1) and (p1->p2) with widths (w0,w1,w2).
+    This creates a 'bulge' at p1.
+    """
+    p0 = np.array(p0, dtype=np.float32)
+    p1 = np.array(p1, dtype=np.float32)
+    p2 = np.array(p2, dtype=np.float32)
+
+    n01 = _unit_perp(p0, p1)
+    n12 = _unit_perp(p1, p2)
+
+    # left/right offsets
+    q01 = np.array([
+        p0 + n01 * w0, p1 + n01 * w1,
+        p1 - n01 * w1, p0 - n01 * w0
+    ], dtype=np.float32)
+
+    q12 = np.array([
+        p1 + n12 * w1, p2 + n12 * w2,
+        p2 - n12 * w2, p1 - n12 * w1
+    ], dtype=np.float32)
+
+    polys.append(q01)
+    polys.append(q12)
+
+
+def draw_tapered_edges(
+    img: np.ndarray,
+    pts_xy: List[Tuple[int, int]],
+    edges: List[Tuple[int, int]],
+    color: Tuple[int, int, int],
+    w_end: float = 2.0,
+    w_mid: float = 6.0,
+    joint_radius: int = 3,
+    draw_joints: bool = True,
+):
+    """
+    Draw edges as filled tapered 'ribbons' (bulged in the middle), plus optional joints.
+    """
+    h, w = img.shape[:2]
+
     for a, b in edges:
-        if 0 <= a < len(pts_xy) and 0 <= b < len(pts_xy):
-            cv2.line(img, pts_xy[a], pts_xy[b], color,
-                     thickness, lineType=cv2.LINE_AA)
+        if not (0 <= a < len(pts_xy) and 0 <= b < len(pts_xy)):
+            continue
 
+        ax, ay = pts_xy[a]
+        bx, by = pts_xy[b]
+        if ax < 0 or ay < 0 or bx < 0 or by < 0:
+            continue
 
-def draw_face_connections(img: np.ndarray, pts_xy: List[Tuple[int, int]], connections, color: Tuple[int, int, int], thickness: int):
-    for a, b in connections:
-        if 0 <= a < len(pts_xy) and 0 <= b < len(pts_xy):
-            cv2.line(img, pts_xy[a], pts_xy[b], color,
-                     thickness, lineType=cv2.LINE_AA)
+        A = np.array([ax, ay], dtype=np.float32)
+        B = np.array([bx, by], dtype=np.float32)
+        d = np.linalg.norm(B - A)
+        if d < 1.0:
+            continue
+
+        # Midpoint (you can bias this if you want)
+        M = (A + B) * 0.5
+
+        polys: List[np.ndarray] = []
+        _add_quad(polys, A, M, B, w_end, w_mid, w_end)
+
+        for poly in polys:
+            # clip to image bounds just in case
+            poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
+            poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
+            cv2.fillConvexPoly(img, poly.astype(np.int32),
+                               color, lineType=cv2.LINE_AA)
+
+    if draw_joints:
+        for x, y in pts_xy:
+            if x >= 0 and y >= 0:
+                cv2.circle(img, (x, y), joint_radius, color,
+                           thickness=-1, lineType=cv2.LINE_AA)
 
 
 def draw_face_points(img: np.ndarray, pts_xy: List[Tuple[int, int]], connections, radius, color: Tuple[int, int, int], thickness: int = -1):
@@ -622,12 +695,14 @@ class SkeletonExtractor:
             for tid in sorted(pose_tracks.keys()):
                 lm = pose_tracks[tid]
                 pts = [_to_px(p.x, p.y, w, h) for p in lm]
-                draw_edges(
+                draw_tapered_edges(
                     img=out,
                     pts_xy=pts,
                     edges=POSE33_EDGES,
                     color=POSE_COLOR,
-                    thickness=thickness
+                    w_end=1,
+                    w_mid=thickness,
+                    joint_radius=point_radius
                 )
 
         hand_tracks = self._track_and_stabilize(
@@ -640,12 +715,14 @@ class SkeletonExtractor:
             for tid in sorted(hand_tracks.keys()):
                 lm = hand_tracks[tid]
                 pts = [_to_px(p.x, p.y, w, h) for p in lm]
-                draw_edges(
+                draw_tapered_edges(
                     img=out,
                     pts_xy=pts,
                     edges=HAND21_EDGES,
                     color=HAND_COLOR,
-                    thickness=thickness
+                    w_end=1,
+                    w_mid=thickness,
+                    joint_radius=point_radius
                 )
 
         if face_res.face_landmarks:

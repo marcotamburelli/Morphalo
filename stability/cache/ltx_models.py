@@ -1,11 +1,12 @@
 
 
 import torch
-from diffusers import LTXConditionPipeline, LTXLatentUpsamplePipeline
+from diffusers import LTXLatentUpsamplePipeline
 from diffusers.hooks import apply_group_offloading
 
 from stability.cache import CacheKey, ModelCache
 from stability.cache.models import dtype_key
+from stability.lightricks import LTXConditionPipeline
 
 
 def get_ltx_condition(*, model_id: str, device: str, dtype: torch.dtype) -> LTXConditionPipeline:

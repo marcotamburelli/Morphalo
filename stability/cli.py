@@ -10,7 +10,11 @@ from stability.core.spec_loader import load_hocon_spec
 from stability.dag import DagRegistry
 from stability.dag.runner import DAGRunner
 
-app = typer.Typer(help='Stability CLI')
+app = typer.Typer(
+    help='Stability CLI',
+    rich_markup_mode=None,
+    pretty_exceptions_enable=False,
+)
 
 
 @app.command()
