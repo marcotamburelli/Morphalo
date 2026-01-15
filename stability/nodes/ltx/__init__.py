@@ -1,13 +1,16 @@
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import PIL.Image
 import torch
 from diffusers import LTXConditionPipeline
+from diffusers.utils import export_to_video
 from torchvision import transforms
 
 from stability.dag import AttachmentSink, NodeRef
+from stability.nodes import make_node_output_path
 
 
 def round_to_vae(height: int, width: int, pipe: LTXConditionPipeline) -> Tuple[int, int]:
@@ -38,6 +41,25 @@ def read_video_tensor(video: List[PIL.Image.Image], device: str) -> torch.Tensor
     ]).to(device)
 
     return video_tensor
+
+
+def save_video(
+    out_dir: Path,
+    *,
+    node_id: str,
+    seed: int,
+    video_out: torch.Tensor,
+    fps: int
+) -> Path:
+    video_path = make_node_output_path(
+        out_dir=out_dir,
+        node_id=node_id,
+        seed=seed,
+        ext='mp4'
+    )
+
+    export_to_video(video_out, str(video_path), fps=fps)
+    return video_path
 
 
 @dataclass
@@ -97,7 +119,7 @@ class ICLoRaRegistry:
 
         self._owner = owner
         self._counter = 0
-        self._spec: ICLoRaSpec = None
+        self._spec: Optional[ICLoRaSpec] = None
 
     def __call__(
         self,
@@ -167,11 +189,11 @@ class ICLoRaRegistry:
         return AttachmentSink(
             id=f'ic_lora:{key}',
             target=self._owner,
-            input_id=f'ic_lora:{key}',
+            input_id=f'ic_lora:{key}'
         )
 
     @property
-    def spec(self) -> ICLoRaSpec:
+    def spec(self) -> Optional[ICLoRaSpec]:
         return self._spec
 
 

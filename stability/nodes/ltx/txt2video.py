@@ -1,25 +1,19 @@
-import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-import torch
-from diffusers.utils import export_to_video, load_video
 
 from stability.cache.ltx_models import *
 from stability.core.config import *
 from stability.dag import NodeRef
 from stability.nodes import *
 from stability.nodes.ltx import *
-
-_default_model = 'Lightricks/LTX-Video-0.9.7-dev'
-_default_upscaler = 'Lightricks/ltxv-spatial-upscaler-0.9.7'
+from stability.nodes.ltx.ltx_common import *
+from stability.nodes.sdxl_common import PromptMixin, setup_env
 
 
 @dataclass
-class Txt2Video(NodeRef):
+class Txt2Video(IcLoRaMixin, PromptMixin, NodeRef):
     """
     Text-to-video node based on LTX-Video.
 
@@ -27,6 +21,9 @@ class Txt2Video(NodeRef):
     LTX-Video diffusion model. Video content is produced through a
     multi-stage process that first generates a low-resolution latent
     video and then refines it into a final high-resolution sequence.
+
+    Prompts are resolved from the node configuration and may optionally be
+    overridden by an upstream prompt bundle attached through the prompt channel.
 
     Optionally, the generation can be conditioned using a single
     Image-Conditioned LoRA (IC-LoRA). When an IC-LoRA is attached, an
@@ -76,6 +73,14 @@ class Txt2Video(NodeRef):
         Registry used to attach a single Image-Conditioned LoRA (IC-LoRA)
         to this node. The registry exposes an AttachmentSink that allows
         an upstream video node to be wired as structural conditioning.
+    prompt : PromptRegistry
+        Registry used to attach an upstream prompt bundle, provided by ``PromptMixin``.
+
+    Inputs
+    ------
+    prompt:default : dict, optional
+        Optional upstream prompt bundle. If present, it overrides prompt fields from
+        ``spec``. Expected keys include ``prompt`` and ``negative_prompt``.
 
     Notes
     -----
@@ -93,69 +98,21 @@ class Txt2Video(NodeRef):
     """
 
     spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
-    ic_lora: ICLoRaRegistry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.ic_lora = ICLoRaRegistry(self)
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # HF env
-        os.environ['HF_HOME'] = HF_HOME
-        os.environ['HF_HUB_CACHE'] = HF_HUB_CACHE
-        os.environ['HF_HUB_DISABLE_TELEMETRY'] = HF_HUB_DISABLE_TELEMETRY
+        setup_env()
 
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        spec, device, dtype, model_id, upscaler_id, guidance_scale, \
+            guidance_rescale, height, width, fps, num_frames, steps_main, \
+            steps_refine, denoise_strength, downscale_factor, upscale_factor, \
+            decode_timestep, decode_noise_scale, image_cond_noise_scale, \
+            max_sequence_length, seed, gen = resolve_ltx_common(self.spec)
 
-        spec = resolve_spec(self.spec)
-
-        # model settings
-        model = spec.get('model', {})
-        device = model.get('device', 'cuda')
-        dtype = resolve_dtype(model.get('dtype', 'bf16'))
-        model_id = model.get('id', _default_model)
-        upscaler_id = model.get('upscaler', _default_upscaler)
-
-        # prompts
-        prompt = norm_prompt(spec.get('prompt'))
-        negative_prompt = norm_prompt(
-            spec.get('negative_prompt'),
-            joiner=', '
-        )
-
-        # params
-        params = spec.get('params', {})
-        guidance_scale = float(params.get('guidance_scale', 3))
-        guidance_rescale = float(params.get('guidance_rescale', 0.7))
-
-        height = int(params.get('height', 480))
-        width = int(params.get('width', 832))
-        fps = int(params.get('fps', 24))
-        num_frames = int(params.get('num_frames', 96))
-
-        steps_main = int(params.get('steps_main', 30))
-        steps_refine = int(params.get('steps_refine', 10))
-        denoise_strength = float(params.get('denoise_strength', 0.4))
-        downscale_factor = float(params.get('downscale_factor', 2 / 3))
-        upscale_factor = float(params.get('upscale_latent_factor', 2))
-
-        decode_timestep = float(params.get('decode_timestep', 0.05))
-        decode_noise_scale = float(params.get('decode_noise_scale', 0.025))
-        image_cond_noise_scale = float(
-            params.get('image_cond_noise_scale', 0.025)
-        )
-
-        max_sequence_length = int(params.get('max_sequence_length', 512))
-
-        # seed
-        seed = resolve_seed(spec.get('seed', 'random'))
-        gen = torch.Generator(device=device).manual_seed(seed)
-
-        ic_lora_bundle = ICLoRaBundle(
-            ic_lora=self.ic_lora.spec,
-            input=input
-        )
+        ic_lora_bundle = self.build_ic_lora_bundle(input)
 
         pipe = get_ltx_condition(model_id=model_id, device=device, dtype=dtype)
         pipe_upsample = get_ltx_latent_upsample(
@@ -166,43 +123,25 @@ class Txt2Video(NodeRef):
         )
 
         # --- sizes ---
-        expected_h, expected_w = height, width
-        down_h = int(expected_h * downscale_factor)
-        down_w = int(expected_w * downscale_factor)
-        down_h, down_w = round_to_vae(down_h, down_w, pipe)
+        down_h, down_w = downscale_size(height, width, downscale_factor, pipe)
+        up_h, up_w = upscale_size(down_h, down_w, upscale_factor)
 
-        gen = torch.Generator(device=device).manual_seed(seed)
+        reference_video = apply_ic_lora(ic_lora_bundle, pipe)
 
-        # --- measure time + memory ---
-        if device.startswith('cuda'):
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
+        prompt_bundle = PromptBundle(
+            spec=spec,
+            input=input
+        )
+
+        cuda_prerun(device)
 
         t0 = time.perf_counter()
-
-        if ic_lora_bundle.has_has_ic_lora:
-            pipe.load_lora_weights(
-                ic_lora_bundle.model_id,
-                weight_name=ic_lora_bundle.weight_name,
-                adapter_name=ic_lora_bundle.adapter_name
-            )
-
-            pipe.set_adapters(
-                [ic_lora_bundle.adapter_name],
-                [ic_lora_bundle.adapter_weight]
-            )
-
-            control_frames = load_video(ic_lora_bundle.video_path)
-            reference_video = read_video_tensor(control_frames, device=device)
-        else:
-            pipe.unload_lora_weights()
-            reference_video = None
 
         # Part 1: generate at smaller res -> latent video
         latents = pipe(
             reference_video=reference_video,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt=prompt_bundle.prompt,
+            negative_prompt=prompt_bundle.negative_prompt,
             width=down_w,
             height=down_h,
             guidance_scale=guidance_scale,
@@ -217,8 +156,8 @@ class Txt2Video(NodeRef):
             max_sequence_length=max_sequence_length
         ).frames
 
-        # Part 2: latent upsample (2x)
-        up_h, up_w = int(down_h * upscale_factor), int(down_w * upscale_factor)
+
+        # Part 2: latent upsample
         up_latents = pipe_upsample(
             latents=latents,
             output_type='latent'
@@ -226,8 +165,8 @@ class Txt2Video(NodeRef):
 
         # Part 3: short denoise refine
         video_out = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
+            prompt=prompt_bundle.prompt,
+            negative_prompt=prompt_bundle.negative_prompt,
             width=up_w,
             height=up_h,
             guidance_scale=guidance_scale,
@@ -244,48 +183,34 @@ class Txt2Video(NodeRef):
             max_sequence_length=max_sequence_length
         ).frames[0]
 
+        cuda_sync(device)
         dt_s = time.perf_counter() - t0
 
         # Part 4: resize down to target
-        video_out = [f.resize((expected_w, expected_h))
+        video_out = [f.resize((width, height))
                      for f in video_out]
 
-        out_path = make_node_output_path(
+        out_dir = ensure_out_dir(output_dir)
+        video_path = save_video(
             out_dir=out_dir,
             node_id=self.id,
             seed=seed,
-            ext='mp4'
+            video_out=video_out,
+            fps=fps
         )
-        # out_path.parent.mkdir(parents=True, exist_ok=True)
-        export_to_video(video_out, str(out_path), fps=fps)
 
-        # --- memory stats ---
-        mem = {}
-        if device.startswith('cuda'):
-            mem = {
-                'allocated_gb': round(torch.cuda.memory_allocated() / 1024**3, 3),
-                'reserved_gb': round(torch.cuda.memory_reserved() / 1024**3, 3),
-                'peak_allocated_gb': round(torch.cuda.max_memory_allocated() / 1024**3, 3),
-                'peak_reserved_gb': round(torch.cuda.max_memory_reserved() / 1024**3, 3),
-            }
+        mem = cuda_mem_stats(device)
 
-        meta = {
-            'ok': True,
-            'node': 'ltx_i2v',
-            'id': self.id,
-            'video': str(out_path),
-            'model': {
-                'id': model_id,
-                'upscaler': upscaler_id,
-                'device': device,
-                'dtype': str(dtype).replace('torch.', ''),
-            },
-            'seed': seed,
-            'params': {
+        out = finalize_video_output(
+            node_kind=str(self.op),
+            node_id=self.id,
+            video_path=video_path,
+            seed=seed,
+            params={
                 'guidance_scale': guidance_scale,
                 'guidance_rescale': guidance_rescale,
-                'width': expected_w,
-                'height': expected_h,
+                'width': width,
+                'height': height,
                 'fps': fps,
                 'num_frames': num_frames,
                 'seed': seed,
@@ -297,13 +222,15 @@ class Txt2Video(NodeRef):
                 'image_cond_noise_scale': image_cond_noise_scale,
                 'max_sequence_length': max_sequence_length
             },
-            'timing': {'seconds': round(dt_s, 3)},
-            'cuda_mem': mem,
-        }
-        meta_path = out_path.with_suffix('.json')
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False),
-            encoding='utf-8'
+            dt_s=dt_s,
+            cuda_mem=mem,
+            ic_lora_specs=self.ic_lora.spec,
+            model_info={
+                'id': model_id,
+                'upscaler': upscaler_id,
+                'device': device,
+                'dtype': str(dtype).replace('torch.', ''),
+            }
         )
 
-        return meta
+        return out

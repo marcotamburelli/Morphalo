@@ -68,7 +68,7 @@ class FileImage(NodeRef):
 
         return {
             'ok': True,
-            'node': 'file_image',
+            'node': self.op,
             'id': self.id,
             'image': str(p),
         }

@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import torch
 from diffusers import AutoencoderKL, ControlNetModel, StableDiffusionXLPipeline
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
-                          DPTImageProcessor)
+                          DPTImageProcessor, pipeline)
 
 from stability.cache import CacheKey, ModelCache
 
@@ -146,3 +146,31 @@ def get_ip_image_encoder(
     ).to(device)
 
     return ModelCache.put(key, enc)
+
+
+def get_translator(
+    *,
+    model_id: str,
+    source_lang: str,
+    target_lang: str,
+    device: str
+) -> pipeline:
+    key = CacheKey(
+        kind='translator',
+        ref=f'{model_id}:{source_lang}:{target_lang}',
+        device=device,
+        dtype='-'
+    )
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    translator = pipeline(
+        task='translation',
+        model=model_id,
+        src_lang=target_lang,
+        tgt_lang=target_lang,
+        device=0 if device == 'cuda' else -1
+    )
+
+    return ModelCache.put(key, translator)

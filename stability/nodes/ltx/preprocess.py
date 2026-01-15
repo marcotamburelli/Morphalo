@@ -11,14 +11,13 @@ import torch
 from stability.dag import NodeRef
 from stability.nodes import make_node_output_path, resolve_spec
 from stability.nodes.ltx import read_video_info
-from stability.nodes.utils import (CannyExtractor, DepthVideoExtractor,
-                                   ModelPaths, SkeletonExtractor,
-                                   compute_long_side_resize)
-
+from stability.nodes.preprocess.utils import *
 
 # -----------------------------
 # Small utils
 # -----------------------------
+
+
 def resize_long_side(bgr: np.ndarray, long_side: int) -> np.ndarray:
     h, w = bgr.shape[:2]
     scale = float(long_side) / float(max(h, w))
@@ -251,7 +250,8 @@ class VideoPoseMap(NodeRef):
 
         out = {
             'ok': True,
-            'node': 'VideoPoseMap',
+            'node': self.op,
+            'id': self.id,
             'input_video': in_path,
             'video': str(out_video_path),
             'model': {
@@ -695,7 +695,8 @@ class VideoDepthMap(NodeRef):
                 if max_frames > 0 and idx > max_frames:
                     break
 
-                d = extractor.predict_depth_tensor(fr, long_side_infer=long_side_infer)
+                d = extractor.predict_depth_tensor(
+                    fr, long_side_infer=long_side_infer)
                 lo = torch.quantile(d, ql).item()
                 hi = torch.quantile(d, qh).item()
 

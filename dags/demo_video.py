@@ -2,10 +2,10 @@ from pathlib import Path
 
 from stability.dag import DAG
 from stability.nodes.file_image import FileImage
+from stability.nodes.ltx.file_video import FileVideo
 from stability.nodes.ltx.img2video import Img2Video
+from stability.nodes.ltx.preprocess import *
 from stability.nodes.ltx.txt2video import Txt2Video
-from stability.nodes.ltx.video_image import FileVideo
-from stability.nodes.ltx.preprocess import VideoCannyMap, VideoDepthMap, VideoPoseMap
 
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
@@ -85,7 +85,7 @@ with DAG('demo_video_ic_lora_depth', out_dir=ROOT / 'outputs' / 'demo_video_dept
     )
 
     pose = VideoDepthMap(id='depth', spec=CONF /
-                        'video' / 'spec_video2depth.conf')
+                         'video' / 'spec_video2depth.conf')
 
     out = Txt2Video(id='out', spec=CONF / 'video' /
                     'spec_t2v-ic-lora-depth.conf')
