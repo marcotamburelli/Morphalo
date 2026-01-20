@@ -65,7 +65,7 @@ def finalize_video_output(
     cuda_mem: dict,
     input_image: Optional[str] = None,
     input_video: Optional[str] = None,
-    ic_lora_specs: Optional["ICLoRaSpec"] = None,
+    ic_lora_specs: Optional[ICLoRaSpec] = None,
     model_info: Optional[dict] = None,
 ) -> dict:
     out = {
@@ -75,9 +75,11 @@ def finalize_video_output(
         'video': str(video_path),
         'seed': seed,
         'params': params,
-        'timing': {'seconds': round(dt_s, 3)},
-        'cuda_mem': cuda_mem,
+        'timing': {'seconds': round(dt_s, 3)}
     }
+
+    if cuda_mem:
+        out['cuda_mem'] = cuda_mem
 
     if input_image is not None:
         out['input_image'] = input_image

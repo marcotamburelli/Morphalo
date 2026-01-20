@@ -3,7 +3,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from diffusers import (StableDiffusionXLControlNetPipeline,
+from diffusers import (StableDiffusionXLAdapterPipeline,
+                       StableDiffusionXLControlNetPipeline,
                        StableDiffusionXLPipeline)
 
 from stability.cache.models import get_sdxl_base_pipe
@@ -14,18 +15,29 @@ from stability.nodes.sdxl_common import *
 
 
 @dataclass
-class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
+class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
     """
-    SDXL text-to-image generation node with optional ControlNet and IP-Adapter.
+    SDXL text-to-image generation node with optional ControlNet, T2I-Adapter and IP-Adapter.
 
     This node generates an image from text prompts using Stable Diffusion XL.
     Prompts are resolved from the node configuration and may optionally be
     overridden by an upstream prompt bundle attached through the prompt channel.
-    When one or more ControlNet specifications are configured, the node uses
+
+    Depending on the configured conditioning mechanisms, the node selects one of
+    the following pipelines:
+
+    - When one or more ControlNet specifications are configured, the node uses
     ``StableDiffusionXLControlNetPipeline`` and conditions the generation on the
-    attached ControlNet images (e.g. canny, depth, lineart). Otherwise, it uses
-    the standard ``StableDiffusionXLPipeline``. IP-Adapter conditioning is enabled
-    or disabled based on the resolved IP-Adapter bundle.
+    attached ControlNet images (e.g. canny, depth, lineart).
+    - When one or more T2I-Adapter specifications are configured (and no ControlNet
+    is present), the node uses ``StableDiffusionXLAdapterPipeline`` and conditions
+    the generation on the attached adapter images.
+    - When neither ControlNet nor T2I-Adapter are configured, the node falls back
+    to the standard ``StableDiffusionXLPipeline``.
+
+    IP-Adapter conditioning (image-based reference guidance) is orthogonal to the
+    above choices and may be enabled or disabled independently, based on the
+    resolved IP-Adapter bundle.
 
     Parameters
     ----------
@@ -48,25 +60,30 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
     Attributes
     ----------
     op : str
-        Operator identifier derived from the concrete node class name (e.g. ``"txt2img"``).
+        Operator identifier derived from the concrete node class name
+        (e.g. ``'txt2img'``).
     controlnet : ControlNetRegistry
-        Registry used to declare ControlNet conditioning inputs (via sinks), provided
-        by ``ControlNetMixin``.
+        Registry used to declare ControlNet conditioning inputs (via sinks),
+        provided by ``ControlNetMixin``.
+    t2i_adapter : T2IAdapterRegistry
+        Registry used to declare T2I-Adapter conditioning inputs (via sinks),
+        provided by ``T2IAdapterMixin``.
     ip_adapter : IpAdapterRegistry
-        Registry used to declare IP-Adapter reference inputs (via sinks), provided
-        by ``ControlNetMixin``.
+        Registry used to declare IP-Adapter reference inputs (via sinks),
+        provided by ``ControlNetMixin``.
     prompt : PromptRegistry
-        Registry used to attach an upstream prompt bundle, provided by ``PromptMixin``.
+        Registry used to attach an upstream prompt bundle, provided by
+        ``PromptMixin``.
 
     Inputs
     ------
     prompt:default : dict, optional
         Optional upstream prompt bundle. If present, it overrides prompt fields from
-        ``spec``. Expected keys include ``prompt``, ``prompt_2``, ``negative_prompt``,
-        and ``negative_prompt_2``.
+        ``spec``. Expected keys include ``prompt``, ``prompt_2``,
+        ``negative_prompt`` and ``negative_prompt_2``.
 
-    Additional typed inputs may be attached via ControlNet/IP-Adapter sinks declared
-    on this node (see Notes).
+    Additional typed inputs may be attached via ControlNet, T2I-Adapter or
+    IP-Adapter sinks declared on this node (see Notes).
 
     Outputs
     -------
@@ -74,28 +91,37 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
         Primary output dictionary with at least:
 
         - ``ok`` : bool
-        - ``node`` : str (typically ``"txt2img"``)
+        - ``node`` : str (typically ``'txt2img'``)
         - ``id`` : str (node id)
         - ``image`` : str (path to the generated image)
         - ``metadata`` : str (path to a JSON sidecar with generation details)
 
         The metadata sidecar includes resolved parameters, model information,
-        timing information, and (when running on CUDA) memory statistics.
+        timing information and (when running on CUDA) memory statistics.
 
     Notes
     -----
-    - Hugging Face cache/environment variables are configured via ``setup_env()``
-      prior to loading any pipeline components.
-    - Prompt resolution is performed by ``PromptBundle``:
-      if a prompt bundle is wired into ``prompt:default``, it takes precedence over
-      the local ``spec``; otherwise the local ``spec`` is used.
-    - ControlNet and IP-Adapter inputs are collected from DAG wiring through their
-      respective registries and bundled via ``build_control_bundles``.
-    - When ControlNet is enabled for text-to-image, conditioning images are passed
-      through the ``image`` argument of the SDXL ControlNet pipeline, together with
-      ``controlnet_conditioning_scale``.
+    - Hugging Face cache and environment variables are configured via
+    ``setup_env()`` prior to loading any pipeline components.
+    - Prompt resolution is performed by ``PromptBundle``: if a prompt bundle is
+    wired into ``prompt:default``, it takes precedence over the local ``spec``;
+    otherwise the local ``spec`` is used.
+    - ControlNet and T2I-Adapter inputs are collected from DAG wiring through their
+    respective registries and resolved into runtime bundles before pipeline
+    construction.
+    - ControlNet and T2I-Adapter are mutually exclusive within the same node.
+    Attempting to enable both at once results in an error.
+    - When ControlNet is enabled, conditioning images are passed through the
+    ``image`` argument of the SDXL ControlNet pipeline together with
+    ``controlnet_conditioning_scale``.
+    - When T2I-Adapter is enabled, conditioning images are passed through the
+    ``image`` argument of the SDXL Adapter pipeline together with
+    ``adapter_conditioning_scale``.
+    - IP-Adapter conditioning uses one or more reference images passed through
+    ``ip_adapter_image`` and may be combined with either ControlNet or
+    T2I-Adapter.
     - Outputs are written as an image file plus a JSON sidecar containing run
-      metadata (parameters, model info, timing, and optional CUDA memory stats).
+    metadata (parameters, model info, timing and optional CUDA memory stats).
     """
 
     spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
@@ -119,6 +145,7 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
 
         # --- resolve ControlNet inputs from DAG wiring ---
         cn_bundle, ip_bundle = self.build_control_bundles(input, device, dtype)
+        t2i_bundle = self.build_t2i_adapter_bundle(input, device, dtype)
 
         base = get_sdxl_base_pipe(
             model_path=model_path,
@@ -127,30 +154,38 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
             vae_id=vae_id
         )
 
-        # --- load pipeline (with or without controlnet) ---
-        # Path A: try direct ControlNet pipeline from single file (if supported in your diffusers version)
+        if cn_bundle.has_controlnet and t2i_bundle.has_t2i_adapter:
+            raise ValueError(
+                'ControlNet and T2I-Adapter are mutually exclusive in Txt2Img (choose one).')
+
         if cn_bundle.has_controlnet:
             pipe = StableDiffusionXLControlNetPipeline(
                 **base.components,
                 controlnet=cn_bundle.controlnet_arg
             )
-        else:
-            pipe = StableDiffusionXLPipeline(
-                **base.components
+        elif t2i_bundle.has_t2i_adapter:
+            pipe = StableDiffusionXLAdapterPipeline(
+                **base.components,
+                adapter=t2i_bundle.adapter_model_arg
             )
+        else:
+            pipe = StableDiffusionXLPipeline(**base.components)
 
         apply_ip_adapter(ip_bundle, pipe)
 
-        prompt_bundle = PromptBundle(
-            spec=spec,
-            input=input
-        )
+        prompt_bundle = PromptBundle(spec=spec, input=input)
 
         cuda_prerun(device)
-
         t0 = time.perf_counter()
 
-        # --- call pipeline ---
+        cross_attention_kwargs = build_cross_attention_kwargs(
+            ip_bundle,
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype,
+        )
+
         result = pipe(
             prompt=prompt_bundle.prompt,
             prompt_2=prompt_bundle.prompt_2,
@@ -166,8 +201,13 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
                 'controlnet_conditioning_scale': cn_bundle.conditioning_scale_arg,
             } if cn_bundle.has_controlnet else {}),
             **({
+                'image': t2i_bundle.adapter_image_arg,
+                'adapter_conditioning_scale': t2i_bundle.conditioning_scale_arg,
+            } if t2i_bundle.has_t2i_adapter else {}),
+            **({
                 'ip_adapter_image': ip_bundle.ip_adapter_image,
-            } if ip_bundle.has_ip_adapter else {})
+            } if ip_bundle.has_ip_adapter else {}),
+            **cross_attention_kwargs
         )
 
         cuda_sync(device)
@@ -194,6 +234,7 @@ class Txt2Img(ControlNetMixin, PromptMixin, NodeRef):
             dt_s=dt_s,
             cuda_mem=mem,
             controlnet_specs=self.controlnet.specs,
+            t2i_adapter_specs=self.t2i_adapter.specs,
             ip_adapter_specs=self.ip_adapter.specs,
             model_info={
                 'path': model_path,

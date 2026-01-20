@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Union
 
 from stability.cache.models import get_translator
 from stability.const import ENG
 from stability.dag import NodeRef
-from stability.nodes import norm_prompt_pair
+from stability.nodes import norm_prompt_pair, resolve_spec
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
 
@@ -20,7 +21,7 @@ def _translate(tr: Any, text: str) -> str:
     return out[0]['translation_text']
 
 
-@dataclass(kw_only=True)
+@dataclass
 class Prompt(NodeRef):
     """
     Prepare and normalize text prompts from a configuration specification.
@@ -73,7 +74,9 @@ class Prompt(NodeRef):
 
         - ``prompt``
         - ``negative_prompt``
-        - ``lang`` (source language code, e.g. ``ita_Latn``)
+        - ``lang`` (source language code, e.g. ``ita_Latn``); for language
+          codes see
+          https://github.com/facebookresearch/flores/blob/main/flores200/README.md 
         - ``translate_model`` (optional Hugging Face model id)
         - ``device`` (default 'cuda')
 
@@ -91,10 +94,10 @@ class Prompt(NodeRef):
     - The output format is intentionally minimal and stable to allow easy
       consumption by downstream generator nodes.
     """
-    spec: Dict[str, Any]
+    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
 
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
-        spec = self.spec
+        spec = resolve_spec(self.spec)
 
         src_lang = spec.get('lang', ENG)
         model_id = spec.get('translate_model', DEFAULT_MODEL)
@@ -111,8 +114,8 @@ class Prompt(NodeRef):
         if src_lang and src_lang != ENG:
             tr = get_translator(
                 model_id=model_id,
-                source_lang=ENG,
-                target_lang=src_lang,
+                source_lang=src_lang,
+                target_lang=ENG,
                 device=device
             )
             prompt = _translate(tr, prompt)
@@ -135,5 +138,7 @@ class Prompt(NodeRef):
             out['prompt_2'] = prompt_2
         if negative_prompt_2:
             out['negative_prompt_2'] = negative_prompt_2
+
+        print(out)
 
         return out

@@ -6,5 +6,7 @@ typer
 opencv-python-headless
 imageio
 imageio-ffmpeg
+peft
 sentencepiece
-mediapipe
+controlnet-aux
+matplotlib

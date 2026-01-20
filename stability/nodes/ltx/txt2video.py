@@ -126,7 +126,11 @@ class Txt2Video(IcLoRaMixin, PromptMixin, NodeRef):
         down_h, down_w = downscale_size(height, width, downscale_factor, pipe)
         up_h, up_w = upscale_size(down_h, down_w, upscale_factor)
 
-        reference_video = apply_ic_lora(ic_lora_bundle, pipe)
+        reference_video = apply_ic_lora(
+            ic_lora_bundle,
+            pipe=pipe,
+            device=device
+        )
 
         prompt_bundle = PromptBundle(
             spec=spec,
@@ -155,7 +159,6 @@ class Txt2Video(IcLoRaMixin, PromptMixin, NodeRef):
             output_type="latent",
             max_sequence_length=max_sequence_length
         ).frames
-
 
         # Part 2: latent upsample
         up_latents = pipe_upsample(

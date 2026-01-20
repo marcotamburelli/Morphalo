@@ -167,6 +167,14 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
 
         t0 = time.perf_counter()
 
+        cross_attention_kwargs = build_cross_attention_kwargs(
+            ip_bundle,
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype,
+        )
+
         # IMPORTANT: Img2Img + ControlNet uses image=init and control_image=control :contentReference[oaicite:3]{index=3}
         result = pipe(
             prompt=prompt_bundle.prompt,
@@ -186,7 +194,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             } if cn_bundle.has_controlnet else {}),
             **({
                 'ip_adapter_image': ip_bundle.ip_adapter_image,
-            } if ip_bundle.has_ip_adapter else {})
+            } if ip_bundle.has_ip_adapter else {}),
+            **cross_attention_kwargs
         )
 
         cuda_sync(device)

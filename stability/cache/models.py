@@ -1,9 +1,10 @@
 
 import os
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
-from diffusers import AutoencoderKL, ControlNetModel, StableDiffusionXLPipeline
+from diffusers import (AutoencoderKL, ControlNetModel,
+                       StableDiffusionXLPipeline, T2IAdapter)
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
                           DPTImageProcessor, pipeline)
 
@@ -168,9 +169,55 @@ def get_translator(
     translator = pipeline(
         task='translation',
         model=model_id,
-        src_lang=target_lang,
+        src_lang=source_lang,
         tgt_lang=target_lang,
         device=0 if device == 'cuda' else -1
     )
 
     return ModelCache.put(key, translator)
+
+
+def get_t2i_adapter(*, model_id: str, device: str, dtype: torch.dtype) -> T2IAdapter:
+    key = CacheKey(
+        kind='t2i_adapter',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype)
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    adapter = T2IAdapter.from_pretrained(
+        model_id,
+        torch_dtype=dtype
+    ).to(device)
+
+    return ModelCache.put(key, adapter)
+
+
+def get_controlnet_aux_annotator(
+        *,
+        processor: str,
+        cls: Any, device: str,
+        repo_id: str = "lllyasviel/Annotators"
+):
+    """
+    Cache wrapper for controlnet-aux annotators that support .from_pretrained(repo_id).
+
+    Note: This only covers "checkpoint=True" annotators (HED, Midas, Openpose, etc.).
+    """
+    key = CacheKey(
+        kind='controlnet_aux_annotator',
+        ref=f'{processor}:{repo_id}',
+        device=device,
+        dtype='na'
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    proc = cls.from_pretrained(repo_id).to(device)
+    return ModelCache.put(key, proc)

@@ -51,8 +51,9 @@ def finalize_image_output(
     params: dict,
     dt_s: float,
     cuda_mem: dict,
-    controlnet_specs: List["ControlNetSpec"],
-    ip_adapter_specs: List["IpAdapterSpec"],
+    controlnet_specs: List[ControlNetSpec] = None,
+    t2i_adapter_specs: List[T2IAdapterSpec] = None,
+    ip_adapter_specs: List['IpAdapterSpec'] = None,
     model_info: Optional[dict] = None,
 ) -> dict:
     out = {
@@ -62,17 +63,27 @@ def finalize_image_output(
         'image': str(img_path),
         'seed': seed,
         'params': params,
-        'controlnet': controlnet_meta(controlnet_specs),
-        'ip-adapters': ip_adapter_meta(ip_adapter_specs),
-        'timing': {'seconds': round(dt_s, 3)},
-        'cuda_mem': cuda_mem,
+        'timing': {'seconds': round(dt_s, 3)}
     }
+
+    if cuda_mem:
+        out['cuda_mem'] = cuda_mem
+
+    if controlnet_specs:
+        out['controlnet'] = controlnet_meta(controlnet_specs)
+
+    if t2i_adapter_specs:
+        out['t2i-adapters'] = t2i_adapter_meta(t2i_adapter_specs)
+
+    if ip_adapter_specs:
+        out['ip-adapters'] = ip_adapter_meta(ip_adapter_specs)
 
     if model_info is not None:
         out['model'] = model_info
 
     meta_path = write_json_sidecar(img_path, out)
     out['metadata'] = str(meta_path)
+
     return out
 
 
@@ -92,17 +103,55 @@ class ControlNetMixin:
         return cn_bundle, ip_bundle
 
 
+class T2IAdapterMixin:
+    def __post_init__(self):
+        super().__post_init__()
+        self.t2i_adapter = T2IAdapterRegistry(owner=self)
+
+    def build_t2i_adapter_bundle(self, input: Optional[Dict[str, Dict]], device: str, dtype: torch.dtype) -> T2IAdapterBundle:
+        return T2IAdapterBundle(
+            adapters=self.t2i_adapter.specs,
+            dtype=dtype,
+            device=device,
+            input=input or {}
+        )
+
+
 def apply_ip_adapter(ip_bundle: IpAdapterBundle, pipe: DiffusionPipeline | IPAdapterMixin):
     if ip_bundle.has_ip_adapter:
         pipe.register_modules(image_encoder=ip_bundle.image_encoder)
         pipe.load_ip_adapter(
             ip_bundle.model_id_arg,
             subfolder=ip_bundle.subfolder_arg,
-            weight_name=[ip_bundle.weight_names_arg]
+            weight_name=ip_bundle.weight_names_arg
         )
         pipe.set_ip_adapter_scale(ip_bundle.scale_arg)
     else:
         pipe.unload_ip_adapter()
+
+
+def build_cross_attention_kwargs(
+    ip_bundle: IpAdapterBundle,
+    *,
+    height: int,
+    width: int,
+    device: str,
+    dtype: torch.dtype
+):
+    ip_masks = ip_bundle.build_ip_adapter_masks(
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype
+    )
+
+    cross_attention_kwargs = {}
+    if ip_masks is not None:
+        cross_attention_kwargs['cross_attention_kwargs'] = {
+            'ip_adapter_masks': ip_masks
+        }
+
+    return cross_attention_kwargs
 
 
 def controlnet_meta(controlnet_specs: List[ControlNetSpec]) -> list[dict]:
@@ -137,3 +186,15 @@ class PromptMixin:
     def __post_init__(self):
         super().__post_init__()
         self.prompt = PromptRegistry(owner=self)
+
+
+def t2i_adapter_meta(t2i_adapter_specs: List[T2IAdapterSpec]) -> list[dict]:
+    return [
+        {
+            'key': a.key,
+            'model_id': a.model_id,
+            'conditioning_scale': a.conditioning_scale,
+            'input_id': f't2i-adapter:{a.key}',
+        }
+        for a in (t2i_adapter_specs or [])
+    ]
