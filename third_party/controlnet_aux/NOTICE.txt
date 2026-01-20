@@ -1,0 +1,15 @@
+This directory contains code derived from the following project:
+
+controlnet_aux
+https://github.com/huggingface/controlnet_aux
+
+Copyright (c) Hugging Face
+
+Licensed under the Apache License, Version 2.0.
+
+The code has been copied and modified to:
+- remove deprecated APIs
+- eliminate runtime warnings
+- improve internal consistency with the host project
+
+All modifications are not part of the original project.

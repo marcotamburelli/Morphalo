@@ -8,5 +8,7 @@ imageio
 imageio-ffmpeg
 peft
 sentencepiece
-controlnet-aux
 matplotlib
+einops
+scikit-image
+timm

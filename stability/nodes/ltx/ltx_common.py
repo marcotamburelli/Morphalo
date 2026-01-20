@@ -3,9 +3,9 @@ from diffusers.utils import *
 
 from stability.cache.ltx_models import *
 from stability.core.config import *
-from stability.lightricks.pipeline_ltx_condition_control import LTXVideoCondition
 from stability.nodes import *
 from stability.nodes.ltx import *
+from third_party.lightricks import LTXVideoCondition
 
 _default_model = 'Lightricks/LTX-Video-0.9.7-dev'
 _default_upscaler = 'Lightricks/ltxv-spatial-upscaler-0.9.7'

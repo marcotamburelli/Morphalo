@@ -1,0 +1,16 @@
+__version__ = "0.0.10"
+
+from .canny import CannyDetector
+from .dwpose import DWposeDetector
+from .hed import HEDdetector
+from .leres import LeresDetector
+from .lineart import LineartDetector
+from .lineart_anime import LineartAnimeDetector
+from .lineart_standard import LineartStandardDetector
+from .midas import MidasDetector
+from .mlsd import MLSDdetector
+from .normalbae import NormalBaeDetector
+from .open_pose import OpenposeDetector
+from .pidi import PidiNetDetector
+from .shuffle import ContentShuffleDetector
+from .zoe import ZoeDetector
