@@ -25,11 +25,20 @@ with DAG('demo_img2video', out_dir=ROOT / 'outputs' / 'demo_img2video') as dag:
 
 with DAG('demo_video_proc', out_dir=ROOT / 'outputs' / 'demo_video_proc') as dag:
     initial_video = FileVideo(id='guide_img', path='~/videos/source_video.mp4')
-    pose = VideoAuxMap(id='pose', spec={'processor': 'openpose_full'})
-    canny = VideoAuxMap(id='canny', spec={'processor': 'canny'})
-    depth = VideoAuxMap(id='depth', spec={'processor': 'depth_midas'})
+    depth = VideoPoseMap(
+        id='pose',
+        spec=CONF / 'video' / 'spec_video2pose.conf'
+    )
+    canny = VideoCannyMap(
+        id='canny',
+        spec=CONF / 'video' / 'spec_video2canny.conf'
+    )
+    depth = VideoDepthMap(
+        id='depth',
+        spec=CONF / 'video' / 'spec_video2depth.conf'
+    )
 
-    initial_video >> pose
+    initial_video >> depth
     initial_video >> canny
     initial_video >> depth
 
@@ -38,16 +47,17 @@ with DAG('demo_video_ic_lora_canny', out_dir=ROOT / 'outputs' / 'demo_video_cann
         id='initial_video',
         path='~/videos/source_video.mp4'
     )
-    # initial_image = FileImage(id='initial_img', path='~/images/keyframe.png')
 
-    canny = VideoAuxMap(id='canny', spec={'processor': 'canny'})
+    canny = VideoCannyMap(
+        id='canny',
+        spec=CONF / 'video' / 'spec_video2canny.conf'
+    )
 
     out = Txt2Video(
         id='out',
         spec=CONF / 'video' / 'spec_t2v-ic-lora-canny.conf'
     )
 
-    # initial_image >> out
     initial_video >> canny >> out.ic_lora(
         model_id='Lightricks/LTX-Video-ICLoRA-canny-13b-0.9.7',
         weight_name='ltxv-097-ic-lora-canny-control-diffusers.safetensors',
@@ -61,14 +71,17 @@ with DAG('demo_video_ic_lora_pose', out_dir=ROOT / 'outputs' / 'demo_video_pose'
         path='~/videos/source_video.mp4'
     )
 
-    pose = VideoAuxMap(id='pose', spec={'processor': 'openpose_full'})
+    depth = VideoPoseMap(
+        id='pose',
+        spec=CONF / 'video' / 'spec_video2pose.conf'
+    )
 
     out = Txt2Video(
         id='out',
         spec=CONF / 'video' / 'spec_t2v-ic-lora-pose.conf'
     )
 
-    initial_video >> pose >> out.ic_lora(
+    initial_video >> depth >> out.ic_lora(
         model_id='Lightricks/LTX-Video-ICLoRA-pose-13b-0.9.7',
         weight_name='ltxv-097-ic-lora-pose-control-diffusers.safetensors',
         adapter_name='pose',
@@ -81,16 +94,19 @@ with DAG('demo_video_ic_lora_depth', out_dir=ROOT / 'outputs' / 'demo_video_dept
         path='~/videos/source_video.mp4'
     )
 
-    pose = VideoAuxMap(id='depth', spec={'processor': 'depth_midas'})
+    depth = VideoDepthMap(
+        id='depth',
+        spec=CONF / 'video' / 'spec_video2depth.conf'
+    )
 
     out = Txt2Video(
         id='out',
         spec=CONF / 'video' / 'spec_t2v-ic-lora-depth.conf'
     )
 
-    initial_video >> pose >> out.ic_lora(
+    initial_video >> depth >> out.ic_lora(
         model_id='Lightricks/LTX-Video-ICLoRA-depth-13b-0.9.7',
         weight_name='ltxv-097-ic-lora-depth-control-diffusers.safetensors',
         adapter_name='depth',
-        adapter_weight=1.0
+        adapter_weight=1.2
     )
