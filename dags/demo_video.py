@@ -9,7 +9,6 @@ from stability.nodes.ltx.txt2video import Txt2Video
 
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
-OUT = ROOT / 'outputs' / 'demo_depth_cn'
 
 with DAG('demo_txt2video', out_dir=ROOT / 'outputs' / 'demo_txt2video') as dag:
     out = Txt2Video(id='gen', spec=CONF / 'video' / 'spec_t2v.conf')

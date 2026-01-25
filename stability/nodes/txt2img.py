@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from diffusers import (StableDiffusionXLAdapterPipeline,
                        StableDiffusionXLControlNetPipeline,
@@ -10,8 +10,9 @@ from diffusers import (StableDiffusionXLAdapterPipeline,
 from stability.cache.models import get_sdxl_base_pipe
 from stability.core.config import *
 from stability.dag import NodeRef
-from stability.nodes import *
 from stability.nodes.sdxl_common import *
+from stability.nodes.utils import *
+from stability.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
@@ -143,8 +144,12 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             dict
         ) else spec.get('vae')
 
-        # --- resolve ControlNet inputs from DAG wiring ---
-        cn_bundle, ip_bundle = self.build_control_bundles(input, device, dtype)
+        # --- resolve inputs from DAG wiring ---
+        cn_bundle, ip_bundle, face_bundle = self.build_control_bundles(
+            input=input,
+            device=device,
+            dtype=dtype
+        )
         t2i_bundle = self.build_t2i_adapter_bundle(input, device, dtype)
 
         base = get_sdxl_base_pipe(
@@ -154,9 +159,15 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             vae_id=vae_id
         )
 
+        if ip_bundle.has_ip_adapter and face_bundle.has_face_id:
+            raise ValueError(
+                'IP_Adapter and IP-Adapter-FaceID are mutually exclusive (chose one).'
+            )
+
         if cn_bundle.has_controlnet and t2i_bundle.has_t2i_adapter:
             raise ValueError(
-                'ControlNet and T2I-Adapter are mutually exclusive in Txt2Img (choose one).')
+                'ControlNet and T2I-Adapter are mutually exclusive in Txt2Img (choose one).'
+            )
 
         if cn_bundle.has_controlnet:
             pipe = StableDiffusionXLControlNetPipeline(
@@ -171,20 +182,29 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
         else:
             pipe = StableDiffusionXLPipeline(**base.components)
 
-        apply_ip_adapter(ip_bundle, pipe)
-
         prompt_bundle = PromptBundle(spec=spec, input=input)
 
         cuda_prerun(device)
         t0 = time.perf_counter()
 
-        cross_attention_kwargs = build_cross_attention_kwargs(
-            ip_bundle,
+        apply_ip_adapter(ip_bundle, face_bundle, pipe, device, dtype)
+
+        pipe_kwargs = build_pipe_kwargs(
+            cn_bundle=cn_bundle,
+            t2i_bundle=t2i_bundle,
+            ip_bundle=ip_bundle,
+            face_bundle=face_bundle,
             height=height,
             width=width,
             device=device,
             dtype=dtype,
         )
+
+        if 'cross_attention_kwargs' in pipe_kwargs:
+            l = len(ip_bundle.weight_names_arg) + \
+                len(face_bundle.weight_names_arg)
+            masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']
+            assert len(masks) == l
 
         result = pipe(
             prompt=prompt_bundle.prompt,
@@ -196,18 +216,7 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             width=width,
             height=height,
             generator=gen,
-            **({
-                'image': cn_bundle.control_image_arg,
-                'controlnet_conditioning_scale': cn_bundle.conditioning_scale_arg,
-            } if cn_bundle.has_controlnet else {}),
-            **({
-                'image': t2i_bundle.adapter_image_arg,
-                'adapter_conditioning_scale': t2i_bundle.conditioning_scale_arg,
-            } if t2i_bundle.has_t2i_adapter else {}),
-            **({
-                'ip_adapter_image': ip_bundle.ip_adapter_image,
-            } if ip_bundle.has_ip_adapter else {}),
-            **cross_attention_kwargs
+            **pipe_kwargs
         )
 
         cuda_sync(device)
@@ -226,16 +235,17 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             img_path=img_path,
             seed=seed,
             params={
-                "steps": steps,
-                "guidance_scale": cfg,
-                "width": width,
-                "height": height,
+                'steps': steps,
+                'guidance_scale': cfg,
+                'width': width,
+                'height': height,
             },
             dt_s=dt_s,
             cuda_mem=mem,
             controlnet_specs=self.controlnet.specs,
             t2i_adapter_specs=self.t2i_adapter.specs,
             ip_adapter_specs=self.ip_adapter.specs,
+            face_id_specs=self.face_id.specs,
             model_info={
                 'path': model_path,
                 **({'vae_id': vae_id} if vae_id is not None else {}),

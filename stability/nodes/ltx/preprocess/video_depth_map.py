@@ -8,10 +8,9 @@ import cv2
 import torch
 
 from stability.dag import NodeRef
-from stability.nodes import make_node_output_path, resolve_spec
 from stability.nodes.ltx.preprocess.utils.depth_extractor import \
     DepthVideoExtractor
-from stability.nodes.ltx.preprocess.utils.drawing_utils import resize_long_side
+from stability.nodes.utils import make_node_output_path, resolve_spec
 
 _model_id: str = 'Intel/dpt-hybrid-midas'
 _device: str = 'cuda'

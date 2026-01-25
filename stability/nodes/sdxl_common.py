@@ -1,11 +1,17 @@
 import os
+from typing import List
 
 import torch
 from diffusers import DiffusionPipeline
 from diffusers.loaders import IPAdapterMixin
 
 from stability.core.config import *
-from stability.nodes import *
+from stability.nodes.utils import *
+from stability.nodes.wiring.controlnet import *
+from stability.nodes.wiring.face_id import *
+from stability.nodes.wiring.ip_adapter import *
+from stability.nodes.wiring.prompt import PromptRegistry
+from stability.nodes.wiring.t2i_adapter import *
 
 
 def setup_env():
@@ -54,6 +60,7 @@ def finalize_image_output(
     controlnet_specs: List[ControlNetSpec] = None,
     t2i_adapter_specs: List[T2IAdapterSpec] = None,
     ip_adapter_specs: List['IpAdapterSpec'] = None,
+    face_id_specs: List[FaceIdSpec] = None,
     model_info: Optional[dict] = None,
 ) -> dict:
     out = {
@@ -78,6 +85,9 @@ def finalize_image_output(
     if ip_adapter_specs:
         out['ip-adapters'] = ip_adapter_meta(ip_adapter_specs)
 
+    if face_id_specs:
+        out['face-id'] = face_id_meta(face_id_specs)
+
     if model_info is not None:
         out['model'] = model_info
 
@@ -92,6 +102,8 @@ class ControlNetMixin:
         super().__post_init__()
         self.controlnet = ControlNetRegistry(owner=self)
         self.ip_adapter = IpAdapterRegistry(owner=self)
+        self.ip_adapter = IpAdapterRegistry(owner=self)
+        self.face_id = FaceIdRegistry(owner=self)
 
     def build_control_bundles(self, input, device, dtype):
         cn_bundle = ControlNetBundle(
@@ -100,7 +112,10 @@ class ControlNetMixin:
         ip_bundle = IpAdapterBundle(
             self.ip_adapter.specs, dtype=dtype, device=device, input=input
         )
-        return cn_bundle, ip_bundle
+        face_bundle = FaceIdBundle(
+            self.face_id.specs, dtype=dtype, device=device, input=input
+        )
+        return cn_bundle, ip_bundle, face_bundle
 
 
 class T2IAdapterMixin:
@@ -117,7 +132,13 @@ class T2IAdapterMixin:
         )
 
 
-def apply_ip_adapter(ip_bundle: IpAdapterBundle, pipe: DiffusionPipeline | IPAdapterMixin):
+def apply_ip_adapter(
+    ip_bundle: IpAdapterBundle,
+    face_bundle: FaceIdBundle,
+    pipe: DiffusionPipeline | IPAdapterMixin,
+    device: str,
+    dtype: torch.dtype,
+):
     if ip_bundle.has_ip_adapter:
         pipe.register_modules(image_encoder=ip_bundle.image_encoder)
         pipe.load_ip_adapter(
@@ -126,32 +147,190 @@ def apply_ip_adapter(ip_bundle: IpAdapterBundle, pipe: DiffusionPipeline | IPAda
             weight_name=ip_bundle.weight_names_arg
         )
         pipe.set_ip_adapter_scale(ip_bundle.scale_arg)
+    elif face_bundle.has_face_id:
+        if face_bundle.image_encoder is not None:
+            pipe.register_modules(image_encoder=face_bundle.image_encoder)
+
+        pipe.load_ip_adapter(
+            face_bundle.model_id_arg,
+            subfolder=None,
+            weight_name=face_bundle.weight_names_arg,
+            image_encoder_folder=None
+        )
+        pipe.set_ip_adapter_scale(face_bundle.scale_arg)
+
+        apply_faceid_clip(
+            face_bundle=face_bundle,
+            pipe=pipe,
+            device=torch.device(device),
+            dtype=dtype,
+        )
+
     else:
         pipe.unload_ip_adapter()
 
 
-def build_cross_attention_kwargs(
-    ip_bundle: IpAdapterBundle,
+def apply_faceid_clip(
     *,
+    face_bundle: FaceIdBundle,
+    pipe: DiffusionPipeline | IPAdapterMixin,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_images: int = 1,
+):
+    """
+    Inject CLIP image embeddings into the hidden projection layers for
+    IP-Adapter FaceID Plus / PlusV2 models.
+
+    This function must be called AFTER `apply_face_id(...)` and BEFORE
+    invoking the pipeline (`pipe(...)`).
+
+    Parameters
+    ----------
+    face_bundle:
+        Bundle of FaceID adapters. Only FaceID Plus / PlusV2 slots require
+        CLIP image embeddings; base FaceID slots are ignored here.
+
+    pipe:
+        The Diffusers pipeline instance with IP-Adapters already loaded.
+
+    device:
+        Torch device used by the pipeline (e.g. torch.device("cuda")).
+
+    dtype:
+        Torch dtype used by the pipeline (e.g. torch.float16).
+
+    num_images:
+        Number of images generated per prompt (equivalent to
+        `num_images_per_prompt` in Diffusers).
+
+        In the common case where a single image is generated per prompt,
+        this value should be set to 1 (default).
+
+        This parameter is required so Diffusers can correctly replicate
+        CLIP embeddings to match the internal batch size. If you are not
+        using batching or generating multiple images per prompt, using
+        `num_images = 1` is correct and sufficient.
+    """
+    if not face_bundle.has_face_id:
+        return
+
+    entries = face_bundle.clip_images_per_slot
+    if not entries:
+        return
+
+    layers = pipe.unet.encoder_hid_proj.image_projection_layers
+
+    if len(entries) != len(face_bundle.weight_names_arg):
+        raise RuntimeError(
+            f'FaceID clip entries mismatch: entries={len(entries)} but face weights={len(face_bundle.weight_names_arg)}.'
+        )
+
+    for j, entry in enumerate(entries):
+        if entry is None:
+            continue
+
+        images, is_plusv2 = entry
+        img_list = images if isinstance(images, list) else [images]
+
+        clip_embeds = pipe.prepare_ip_adapter_image_embeds(
+            [img_list], None, device, num_images, True
+        )[0].to(device=device, dtype=dtype)
+
+        layer = layers[j]
+        layer.clip_embeds = clip_embeds
+
+        if is_plusv2:
+            layer.shortcut = False
+
+
+def build_cross_attention_kwargs(
+    *,
+    ip_bundle: IpAdapterBundle,
+    face_bundle: FaceIdBundle,
     height: int,
     width: int,
     device: str,
     dtype: torch.dtype
 ):
-    ip_masks = ip_bundle.build_ip_adapter_masks(
-        height=height,
-        width=width,
-        device=device,
-        dtype=dtype
-    )
-
     cross_attention_kwargs = {}
-    if ip_masks is not None:
+
+    if (ip_bundle.with_mask or face_bundle.with_mask):
+        ip_masks = ip_bundle.build_ip_adapter_masks(
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype
+        )
+
+        face_masks = face_bundle.build_ip_adapter_masks(
+            height=height,
+            width=width,
+            device=device,
+            dtype=dtype
+        )
+
         cross_attention_kwargs['cross_attention_kwargs'] = {
-            'ip_adapter_masks': ip_masks
+            'ip_adapter_masks': ip_masks + face_masks
         }
 
     return cross_attention_kwargs
+
+
+def build_pipe_kwargs(
+    *,
+    cn_bundle: ControlNetBundle,
+    t2i_bundle: T2IAdapterBundle = None,
+    ip_bundle: IpAdapterBundle,
+    face_bundle: FaceIdBundle,
+    height: int,
+    width: int,
+    device: str,
+    dtype,
+) -> Dict[str, Any]:
+    """
+    Assemble kwargs for pipe(...) from all bundles.
+
+    Notes:
+      - FaceID Plus/V2 CLIP injection is NOT done here; call apply_faceid_clip(...)
+        after load_ip_adapter and before pipe(...).
+      - Mask wiring logic is delegated to build_cross_attention_kwargs(...).
+    """
+    kwargs: Dict[str, Any] = {}
+
+    # ControlNet
+    if cn_bundle.has_controlnet:
+        kwargs.update({
+            'image': cn_bundle.control_image_arg,
+            'controlnet_conditioning_scale': cn_bundle.conditioning_scale_arg,
+        })
+
+    # T2I-Adapter
+    if t2i_bundle is not None and t2i_bundle.has_t2i_adapter:
+        kwargs.update({
+            'image': t2i_bundle.adapter_image_arg,
+            'adapter_conditioning_scale': t2i_bundle.conditioning_scale_arg,
+        })
+
+    # IP-Adapter (normal)
+    if ip_bundle.has_ip_adapter:
+        kwargs['ip_adapter_image'] = ip_bundle.ip_adapter_image
+
+    # FaceID
+    if face_bundle.has_face_id:
+        kwargs['ip_adapter_image_embeds'] = face_bundle.ip_adapter_image_embeds
+
+    # Cross-attention masks (IP + FaceID), merged inside the helper
+    kwargs.update(build_cross_attention_kwargs(
+        ip_bundle=ip_bundle,
+        face_bundle=face_bundle,
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype,
+    ))
+
+    return kwargs
 
 
 def controlnet_meta(controlnet_specs: List[ControlNetSpec]) -> list[dict]:
@@ -174,11 +353,25 @@ def ip_adapter_meta(ip_adapter_specs: List[IpAdapterSpec]) -> list[dict]:
             'weight_name': ipa.weight_name,
             'subfolder': ipa.subfolder,
             'scale': ipa.scale,
-            'encoder_key': ipa.encoder_key,
-            'encoder_subfolder': ipa.encoder_subfolder,
             'input_id': f'ip-adapter:{ipa.key}',
         }
         for ipa in ip_adapter_specs
+    ]
+
+
+def face_id_meta(face_specs: List[FaceIdSpec]) -> list[dict]:
+    return [
+        {
+            'key': fid.key,
+            'model_id': fid.model_id,
+            'weight_name': fid.weight_name,
+            'subfolder': fid.subfolder,
+            'scale': fid.scale,
+            'has_mask': fid.has_mask,
+            'input_id': f'face_id:{fid.key}',
+            'mask_input_id': f'ip_adapter_mask:{fid.key}' if fid.has_mask else None,
+        }
+        for fid in face_specs
     ]
 
 

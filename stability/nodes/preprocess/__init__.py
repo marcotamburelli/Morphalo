@@ -10,8 +10,8 @@ from PIL import Image
 
 from stability.cache.models import get_controlnet_aux_annotator
 from stability.dag import NodeRef
-from stability.nodes import make_node_output_path, resolve_spec
 from stability.nodes.preprocess.utils import *
+from stability.nodes.utils import *
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 
 

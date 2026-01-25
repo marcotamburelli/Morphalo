@@ -7,10 +7,10 @@ from typing import Any, Dict, Optional, Union
 import cv2
 
 from stability.dag import NodeRef
-from stability.nodes import make_node_output_path, resolve_spec
 from stability.nodes.ltx import read_video_info
 from stability.nodes.ltx.preprocess.utils.canny_extractor import CannyExtractor
 from stability.nodes.ltx.preprocess.utils.drawing_utils import resize_long_side
+from stability.nodes.utils import make_node_output_path, resolve_spec
 
 
 @dataclass

@@ -13,3 +13,5 @@ matplotlib
 einops
 scikit-image
 timm
+insightface
+onnxruntime

@@ -6,10 +6,11 @@ from typing import Any, Dict, Optional
 from stability.cache.ltx_models import *
 from stability.core.config import *
 from stability.dag import NodeRef
-from stability.nodes import *
 from stability.nodes.ltx import *
 from stability.nodes.ltx.ltx_common import *
 from stability.nodes.sdxl_common import PromptMixin, setup_env
+from stability.nodes.utils import *
+from stability.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass

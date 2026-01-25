@@ -9,7 +9,6 @@ from stability.nodes.txt2img import Txt2Img
 
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
-OUT = ROOT / 'outputs' / 'demo_depth_cn'
 
 with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
     components = FileImage(id='style_img', path=[

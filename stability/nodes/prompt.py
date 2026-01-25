@@ -7,7 +7,7 @@ from typing import Any, Dict, Union
 from stability.cache.models import get_translator
 from stability.const import ENG
 from stability.dag import NodeRef
-from stability.nodes import norm_prompt_pair, resolve_spec
+from stability.nodes.utils import norm_prompt_pair, resolve_spec
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
 
@@ -62,6 +62,7 @@ class Prompt(NodeRef):
     If ``spec["lang"]`` is defined and differs from ``eng_Latn``, all extracted
     prompt fields are translated into English (``eng_Latn``) using a cached
     Hugging Face translation pipeline (NLLB by default).
+    See https://github.com/facebookresearch/flores/blob/main/flores200/README.md
 
     The target language is always English, as downstream diffusion models are
     assumed to operate optimally with English prompts.
