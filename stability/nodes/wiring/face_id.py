@@ -20,7 +20,13 @@ FaceIdScale = Union[
 ]
 
 ClipImgPath = Tuple[Union[str, List[str]], bool]
-ClipImg = Tuple[Union[Image.Image, List[Image.Image]], bool]
+
+
+@dataclass
+class ClipImg:
+    image: Union[Image.Image, List[Image.Image]]
+    clip_strength: float = 1.0
+    is_plusv2: bool = False
 
 
 @dataclass
@@ -39,6 +45,7 @@ class FaceIdSpec:
     weight_name: str
     subfolder: Optional[str] = None
     scale: FaceIdScale = 1.0
+    clip_strength: float = 1.0
 
     has_mask: bool = False
 
@@ -63,8 +70,93 @@ class FaceIdRegistry:
         weight_name: str,
         subfolder: Optional[str] = None,
         scale: FaceIdScale = 1.0,
+        clip_strength: float = 1.0,
         key: Optional[str] = None,
     ) -> IpAdapterAttachmentSink:
+        """
+        Declare a FaceID adapter slot and return a DAG sink for wiring.
+
+        This method registers one FaceID "slot" on the owning node. The slot
+        describes a single FaceID-capable IP-Adapter weight to be loaded at runtime
+        (e.g. FaceID, FaceID Plus, FaceID PlusV2). The returned sink is used to wire
+        an upstream node that provides both:
+
+        - identity embeddings (`embeds`: path to a saved tensor), and
+        - reference image(s) (`image`: path or list of paths), which are required
+        only for FaceID Plus / PlusV2 CLIP injection.
+
+        The slot is later materialized into a runtime bundle (``FaceIdBundle``),
+        which is responsible for:
+        - collecting the wired embedding paths,
+        - loading tensors from disk,
+        - collecting optional masks (via IpAdapterAttachmentSink behavior),
+        - collecting reference images for CLIP (Plus / PlusV2),
+        - producing arguments for `pipe.load_ip_adapter`, `pipe.set_ip_adapter_scale`,
+            and `pipe(...)`.
+
+        Parameters
+        ----------
+        model_id:
+            Hugging Face repo id (or local path) containing the FaceID adapter weights.
+            Example: ``"h94/IP-Adapter-FaceID"``.
+
+        weight_name:
+            File name of the FaceID adapter weights inside the repo (e.g.
+            ``"ip-adapter-faceid-plusv2_sdxl.bin"``). This is the value later passed
+            to Diffusers ``pipe.load_ip_adapter(weight_name=...)``.
+
+        subfolder:
+            Optional subfolder within the repo containing the weight file.
+            For most h94 FaceID weights this is typically ``None``.
+            If used, it is forwarded to Diffusers `load_ip_adapter(subfolder=...)`.
+
+        scale:
+            Adapter strength / scaling, forwarded to `pipe.set_ip_adapter_scale(...)`.
+            Supports:
+            - float (single scale),
+            - list[float] (per-reference scale) if you support multi-reference,
+            - dict (reserved for per-block scales, if you keep parity with IP-Adapter).
+
+        clip_strength:
+            Multiplicative factor applied to the CLIP embeddings injected for this
+            slot (FaceID Plus / PlusV2 only). This controls how much "visual" signal
+            from the CLIP embedding influences the adapter relative to the FaceID
+            identity embedding.
+
+            - `1.0` (default): use CLIP as computed by Diffusers.
+            - `0.0`: effectively neutralize the visual component (while still injecting
+            a correctly-shaped tensor to satisfy Plus/PlusV2 execution).
+            - `0 < value < 1`: attenuate visual influence.
+            - `> 1`: amplify visual influence (use carefully; may reintroduce style bleed).
+
+            Note: this does *not* replace the adapter `scale`; it modulates only the
+            CLIP side-channel used by Plus/PlusV2.
+
+        key:
+            Optional stable identifier for this slot. If omitted, a unique key is
+            auto-generated (``fid1``, ``fid2``, ...). The key determines the input
+            channel name in the DAG.
+
+        Returns
+        -------
+        IpAdapterAttachmentSink
+            A sink that can be wired to an upstream node providing FaceID inputs.
+
+            The sink uses input id: ``face_id:{key}`` and expects upstream output
+            to contain at least:
+            - ``embeds`` or ``path`` : str (path to `.pt` tensor)
+            - ``image`` : str or list[str] (reference images), required when this
+                adapter weight requires CLIP (Plus/PlusV2)
+
+            Mask wiring is handled by `IpAdapterAttachmentSink` using the standard
+            `ip_adapter_mask:{key}` (and optional indexed variants) channels.
+
+        Raises
+        ------
+        ValueError
+            If `clip_strength` is not finite or is negative (recommended to enforce).
+            If `key` is invalid (if you choose to validate naming).
+        """
         if key is None:
             self._counter += 1
             key = f'fid{self._counter}'
@@ -75,6 +167,7 @@ class FaceIdRegistry:
             weight_name=weight_name,
             subfolder=subfolder,
             scale=scale,
+            clip_strength=clip_strength
         )
         self._specs.append(spec)
 
@@ -126,6 +219,7 @@ class FaceIdBundle:
         self._embeds: List[torch.Tensor] = []
         self._masks: List[Optional[str]] = []
         self._clip_img_paths: List[Optional[ClipImgPath]] = []
+        self._clip_images_per_slot: Optional[List[Optional[ClipImg]]] = None
 
         self._dtype = dtype
         self._device = device
@@ -439,31 +533,95 @@ class FaceIdBundle:
     @property
     def clip_images_per_slot(self) -> List[Optional[ClipImg]]:
         """
-        Optional PIL images per slot for Plus/PlusV2.
+        Return per-slot CLIP reference images (Plus / PlusV2 only), with per-slot strength.
 
-        The runner can compute clip_embeds like:
-            clip = pipe.prepare_ip_adapter_image_embeds([images], None, device, num_images, True)[0]
-        then inject into:
-            pipe.unet.encoder_hid_proj.image_projection_layers[idx].clip_embeds = clip
+        This property exposes optional reference images required by FaceID Plus /
+        FaceID PlusV2 adapters. Base FaceID adapters do not need CLIP reference images
+        and therefore return ``None`` for their slot.
 
-        We return a per-slot structure similar to IpAdapterBundle.ip_adapter_image:
-          - None if not needed
-          - Image if single image
-          - List[Image] if multiple images for that slot
+        The returned list is aligned with FaceID slot order (and therefore with the
+        FaceID weight order loaded into the pipeline). Each element is either:
+
+        - ``None``:
+            The corresponding FaceID slot does not require CLIP injection.
+
+        - ``ClipImg``:
+            A dataclass containing:
+            - `image`: a PIL.Image or list[PIL.Image] (reference images for this slot)
+            - `clip_strength`: float multiplier to apply to computed CLIP embeds
+            - `is_plusv2`: whether this slot is a PlusV2 variant (used to set
+                `projection_layer.shortcut = False`)
+
+        Downstream Usage
+        ----------------
+        Typical runner flow for FaceID Plus/PlusV2 is:
+
+        1. Load adapters via `pipe.load_ip_adapter(...)`.
+        2. Compute CLIP embeddings and inject into the corresponding projection layers:
+
+        - Build a list of images aligned with loaded adapter layers (Diffusers requires
+            list length == number of projection layers when using `ip_adapter_image`).
+        - Call:
+
+            ``embeds = pipe.prepare_ip_adapter_image_embeds(ip_adapter_image, None, device,
+                                                            num_images_per_prompt, do_cfg)``
+
+        - For each slot that returns `ClipImg`, take `embeds[j]`, multiply by
+            `clip_strength`, and assign:
+
+            ``pipe.unet.encoder_hid_proj.image_projection_layers[j].clip_embeds = embeds[j] * clip_strength``
+
+        - If `is_plusv2` is True:
+
+            ``pipe.unet.encoder_hid_proj.image_projection_layers[j].shortcut = False``
+
+        Important Invariants
+        --------------------
+        - The list order matches FaceID adapter slot order and must stay stable to
+        preserve correct association between:
+            weight_name[j] <-> masks[j] <-> clip_images_per_slot[j] <-> projection_layer[j]
+
+        - The images returned here are opened and converted to RGB at access time.
+        Callers should avoid repeatedly accessing this property in hot loops if they
+        want to reduce file I/O (cache at the runner level if needed).
+
+        Returns
+        -------
+        list[Optional[ClipImg]]
+            Per-slot CLIP reference images and metadata for FaceID Plus/PlusV2.
+
+        Raises
+        ------
+        TypeError
+            If internal clip image path entries are neither a string nor list of strings.
+        FileNotFoundError
+            If any of the stored clip image paths is missing (optional to enforce).
         """
-        out: List[Optional[Optional[ClipImg]]] = []
-        for p in self._clip_img_paths:
+        if self._clip_images_per_slot is not None:
+            return self._clip_images_per_slot
+
+        self._clip_images_per_slot: List[Optional[ClipImg]] = []
+        for spec, p in zip(self._specs, self._clip_img_paths):
             if p is None:
-                out.append(None)
+                self._clip_images_per_slot.append(None)
                 continue
             if isinstance(p[0], str):
-                out.append((Image.open(p[0]).convert("RGB"), p[1]))
+                # out.append((Image.open(p[0]).convert("RGB"), p[1]))
+                self._clip_images_per_slot.append(ClipImg(
+                    image=Image.open(p[0]).convert("RGB"),
+                    is_plusv2=p[1],
+                    clip_strength=spec.clip_strength,
+                ))
             elif isinstance(p[0], list):
-                out.append(([Image.open(x).convert("RGB")
-                           for x in p[0]], p[1]))
+                self._clip_images_per_slot.append(ClipImg(
+                    image=[Image.open(x).convert("RGB") for x in p[0]],
+                    is_plusv2=p[1],
+                    clip_strength=spec.clip_strength,
+                ))
             else:
                 raise TypeError(f"Invalid clip image entry: {type(p)}")
-        return out
+
+        return self._clip_images_per_slot
 
     @property
     def with_mask(self) -> bool:

@@ -176,8 +176,7 @@ def apply_faceid_clip(
     pipe: DiffusionPipeline | IPAdapterMixin,
     device: torch.device,
     dtype: torch.dtype,
-    num_images: int = 1,
-    clip_strength: float = 1.0,   # 0.0 = “disattiva” visivo senza crash
+    num_images: int = 1
 ):
     """
     Inject CLIP image embeddings into the hidden projection layers for
@@ -220,16 +219,15 @@ def apply_faceid_clip(
         CLIP embeddings to match the internal batch size. If you are not
         using batching or generating multiple images per prompt, using
         `num_images = 1` is correct and sufficient.
-
-    clip_strength:
-        Multiplier applied to computed CLIP embeds before injection.
-        Set to 0.0 to effectively neutralize the visual component.
     """
     if not face_bundle.has_face_id:
         return
 
-    entries = face_bundle.clip_images_per_slot  # list[Optional[(images, is_plusv2)]], len = n_face_adapters
-    if not entries:
+    # list[Optional[(images, is_plusv2)]], len = n_face_adapters
+    entries = face_bundle.clip_images_per_slot
+
+    # entries is aligned with FaceID slots; entries[j] is None for non-clip weights.
+    if not entries or all(e is None for e in entries):
         return
 
     layers = pipe.unet.encoder_hid_proj.image_projection_layers
@@ -250,7 +248,7 @@ def apply_faceid_clip(
         if entry is None:
             ip_adapter_images.append([blank])
         else:
-            images, _ = entry
+            images = entry.image
             img_list = images if isinstance(images, list) else [images]
             ip_adapter_images.append(img_list)
 
@@ -269,7 +267,8 @@ def apply_faceid_clip(
         if entry is None:
             continue
 
-        _images, is_plusv2 = entry
+        is_plusv2 = entry.is_plusv2
+        clip_strength = entry.clip_strength
         clip_embeds = clip_embeds_per_layer[j].to(device=device, dtype=dtype)
 
         if clip_strength != 1.0:

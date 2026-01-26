@@ -123,13 +123,15 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women') as dag:
     face_id_1 = out.face_id.add(
         model_id="h94/IP-Adapter-FaceID",
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=0.7,
+        scale=0.5,
+        # clip_strength=0.5,
         key="id_1",
     )
     face_id_2 = out.face_id.add(
         model_id="h94/IP-Adapter-FaceID",
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=0.7,
+        scale=0.5,
+        # clip_strength=0.5,
         key="id_2",
     )
 
