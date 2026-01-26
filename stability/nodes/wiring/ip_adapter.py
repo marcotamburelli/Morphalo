@@ -304,7 +304,7 @@ class IpAdapterBundle:
         self._validate(adapters=adapters)
 
         # In case there are masks it should be recorded.
-        if any(ad.has_mask for ad in self._specs):
+        if any(ad.has_mask for ad in adapters):
             self._with_mask = True
 
         for ad in adapters:

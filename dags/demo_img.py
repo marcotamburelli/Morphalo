@@ -101,7 +101,7 @@ with DAG('elven_worrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag
 
     source >> sketch >> help_img.t2i_adapter.add(
         'TencentARC/t2i-adapter-lineart-sdxl-1.0',
-        conditioning_scale=0.8,
+        conditioning_scale=0.5,
         key='sketch',
     )
 
@@ -114,6 +114,15 @@ with DAG('elven_worrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag
     prompt >> out.prompt()
     help_img >> out
 
+    # --- IP-Adapter: face (global or add face-only mask if you want) ---
+    face >> out.ip_adapter.add(
+        'h94/IP-Adapter',
+        subfolder='sdxl_models',
+        weight_name='ip-adapter-plus-face_sdxl_vit-h.safetensors',
+        scale=0.2,
+        key='face_2',
+    )
+
     # --- IP-Adapter: style
     ip_style = out.ip_adapter.add(
         'h94/IP-Adapter',
@@ -125,14 +134,6 @@ with DAG('elven_worrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag
     refs >> ip_style
     mask >> ip_style.mask()
 
-    # --- IP-Adapter: face (global or add face-only mask if you want) ---
-    # face >> out.ip_adapter.add(
-    #     'h94/IP-Adapter',
-    #     subfolder='sdxl_models',
-    #     weight_name='ip-adapter-plus-face_sdxl_vit-h.safetensors',
-    #     scale=0.2,
-    #     key='face_2',
-    # )
 
 # with DAG('demo_ip_adapter_1', out_dir=ROOT / 'outputs' / 'demo_ip_adapter_1') as dag:
 #     # sorgente “foto” da cui estrai la depth map

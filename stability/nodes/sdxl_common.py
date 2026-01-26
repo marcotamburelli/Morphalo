@@ -177,28 +177,37 @@ def apply_faceid_clip(
     device: torch.device,
     dtype: torch.dtype,
     num_images: int = 1,
+    clip_strength: float = 1.0,   # 0.0 = “disattiva” visivo senza crash
 ):
     """
     Inject CLIP image embeddings into the hidden projection layers for
     IP-Adapter FaceID Plus / PlusV2 models.
 
-    This function must be called AFTER `apply_face_id(...)` and BEFORE
-    invoking the pipeline (`pipe(...)`).
+    This function must be called AFTER FaceID weights are loaded via
+    `pipe.load_ip_adapter(...)` and BEFORE invoking the pipeline (`pipe(...)`).
+
+    Notes
+    -----
+    Diffusers computes CLIP embeddings for IP-Adapters through
+    `prepare_ip_adapter_image_embeds(ip_adapter_image=..., ip_adapter_image_embeds=None, ...)`.
+    When `ip_adapter_image_embeds` is None, `ip_adapter_image` MUST be a list whose
+    length matches the number of loaded IP-Adapters (i.e. the number of projection layers).
+
+    Therefore, when multiple FaceID adapters are loaded, we compute CLIP embeddings
+    in one call using a per-adapter list of images, then inject the resulting tensors
+    into the corresponding projection layers.
 
     Parameters
     ----------
     face_bundle:
-        Bundle of FaceID adapters. Only FaceID Plus / PlusV2 slots require
-        CLIP image embeddings; base FaceID slots are ignored here.
+        FaceID bundle. Only slots marked as `requires_clip=True` (Plus/PlusV2)
+        will be injected; other slots are ignored.
 
     pipe:
-        The Diffusers pipeline instance with IP-Adapters already loaded.
+        Diffusers pipeline with FaceID IP-Adapters already loaded.
 
-    device:
-        Torch device used by the pipeline (e.g. torch.device("cuda")).
-
-    dtype:
-        Torch dtype used by the pipeline (e.g. torch.float16).
+    device, dtype:
+        Torch device/dtype used by the pipeline.
 
     num_images:
         Number of images generated per prompt (equivalent to
@@ -211,31 +220,60 @@ def apply_faceid_clip(
         CLIP embeddings to match the internal batch size. If you are not
         using batching or generating multiple images per prompt, using
         `num_images = 1` is correct and sufficient.
+
+    clip_strength:
+        Multiplier applied to computed CLIP embeds before injection.
+        Set to 0.0 to effectively neutralize the visual component.
     """
     if not face_bundle.has_face_id:
         return
 
-    entries = face_bundle.clip_images_per_slot
+    entries = face_bundle.clip_images_per_slot  # list[Optional[(images, is_plusv2)]], len = n_face_adapters
     if not entries:
         return
 
     layers = pipe.unet.encoder_hid_proj.image_projection_layers
+    n_layers = len(layers)
 
-    if len(entries) != len(face_bundle.weight_names_arg):
+    if n_layers != len(face_bundle.weight_names_arg):
         raise RuntimeError(
-            f'FaceID clip entries mismatch: entries={len(entries)} but face weights={len(face_bundle.weight_names_arg)}.'
+            f"FaceID adapters/layers mismatch: layers={n_layers} but face weights={len(face_bundle.weight_names_arg)}."
         )
 
+    blank = Image.new("RGB", (224, 224), (0, 0, 0))
+
+    # Build per-adapter image list of length == n_layers.
+    # Even for non-clip slots we provide images to satisfy diffusers' length check.
+    # (Cost: extra encode; Benefit: perfect alignment + identical semantics to diffusers.)
+    ip_adapter_images: list = []
+    for j, entry in enumerate(entries):
+        if entry is None:
+            ip_adapter_images.append([blank])
+        else:
+            images, _ = entry
+            img_list = images if isinstance(images, list) else [images]
+            ip_adapter_images.append(img_list)
+
+    # Compute embeds for ALL adapters in one call (diffusers requirement).
+    # This returns a list: one tensor per adapter layer, already expanded for CFG and num_images.
+    clip_embeds_per_layer = pipe.prepare_ip_adapter_image_embeds(
+        ip_adapter_images,
+        None,
+        device,
+        num_images,
+        True,  # do_classifier_free_guidance; consistent with typical guidance_scale>1 usage
+    )
+
+    # Inject only where required (Plus/PlusV2)
     for j, entry in enumerate(entries):
         if entry is None:
             continue
 
-        images, is_plusv2 = entry
-        img_list = images if isinstance(images, list) else [images]
+        _images, is_plusv2 = entry
+        clip_embeds = clip_embeds_per_layer[j].to(device=device, dtype=dtype)
 
-        clip_embeds = pipe.prepare_ip_adapter_image_embeds(
-            [img_list], None, device, num_images, True
-        )[0].to(device=device, dtype=dtype)
+        if clip_strength != 1.0:
+            clip_embeds = clip_embeds * float(clip_strength)
 
         layer = layers[j]
         layer.clip_embeds = clip_embeds

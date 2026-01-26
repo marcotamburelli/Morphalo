@@ -144,7 +144,7 @@ class FaceIdBundle:
         self._validate(adapters)
 
         # In case there are masks it should be recorded.
-        if any(ad.has_mask for ad in self._specs):
+        if any(ad.has_mask for ad in adapters):
             self._with_mask = True
 
         for ad in adapters:
@@ -155,22 +155,22 @@ class FaceIdBundle:
                     f'Missing FaceID input for {in_id!r}. Did you wire the embeddings node into it?'
                 )
 
-            p = upstream.get('embeds') or upstream.get('path')
-            if not p:
+            emb_path = upstream.get('embeds') or upstream.get('path')
+            if not emb_path:
                 raise ValueError(
                     f"Upstream output for {in_id!r} must contain embeddings path in 'embeds' or 'path'."
                 )
-            if not isinstance(p, (str, list)):
+            if not isinstance(emb_path, (str, list)):
                 raise TypeError(
-                    f'Upstream output for {in_id!r} must be str or list[str]. Got: {type(p)}'
+                    f'Upstream output for {in_id!r} must be str or list[str]. Got: {type(emb_path)}'
                 )
 
             self._validate_scale_for_slot(
-                key=ad.key, scale=ad.scale, embeds_path=p)
+                key=ad.key, scale=ad.scale, embeds_path=emb_path)
 
             self._weight_names.append(ad.weight_name)
             self._scales.append(ad.scale)
-            self._embeds_paths.append(p)
+            self._embeds_paths.append(emb_path)
 
             # masks: mirror the ip_adapter bundle behavior
             if ad.has_mask:
