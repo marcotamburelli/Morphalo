@@ -2,16 +2,17 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import cv2
 
 from stability.dag import NodeRef
+from stability.nodes.common.config_resolve import SpecInput, resolve_spec
+from stability.nodes.common.paths import make_node_output_path
 from stability.nodes.ltx.preprocess.utils.drawing_utils import \
     compute_long_side_resize
 from stability.nodes.ltx.preprocess.utils.skeleton_extrtactor import (
     ModelPaths, SkeletonExtractor)
-from stability.nodes.utils import make_node_output_path, resolve_spec
 
 
 # -----------------------------
@@ -58,9 +59,13 @@ class VideoPoseMap(NodeRef):
     id : str, optional
         Unique node identifier within the DAG. If not provided, it is auto-generated
         by the enclosing DAG/NodeRef implementation.
-    spec : dict | str | pathlib.Path
-        Node configuration. The node resolves configuration using
-        ``resolve_spec(self.spec)`` and reads parameters at the top level.
+    spec : dict or str or pathlib.Path or sequence of (dict or str or pathlib.Path)
+        Node configuration specification.
+
+        The specification may be provided as an in-memory dictionary, as a path
+        to a HOCON configuration file, or as a sequence of such elements. When a
+        sequence is given, each element is resolved independently and merged from
+        left to right, with later elements overriding earlier ones.
 
     Configuration keys (spec)
     -------------------------
@@ -119,7 +124,7 @@ class VideoPoseMap(NodeRef):
     re-encoding the output with a higher-quality codec is recommended.
     """
 
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         super().__post_init__()

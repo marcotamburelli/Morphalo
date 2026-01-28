@@ -8,7 +8,7 @@ from transformers import CLIPVisionModelWithProjection
 
 from stability.cache.models import get_ip_image_encoder
 from stability.dag import AttachmentSink, NodeRef
-from stability.nodes.utils import infer_image_encoder_subfolder
+from stability.nodes.wiring.utils import infer_image_encoder_subfolder
 
 IpAdapterScale = Union[
     float,

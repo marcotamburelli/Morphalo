@@ -56,16 +56,16 @@ def run_dags(
             f'No DAGs registered while importing module: {module!r}')
 
     if dag is not None:
-        dags = [DagRegistry.get(dag)]
-        if not dags:
+        _d = DagRegistry.get(dag)
+
+        if _d is None:
             available = [d.name for d in DagRegistry.all()]
             raise typer.BadParameter(
                 f'DAG {dag!r} not found. Available: {available}')
+        else:
+            dags = [_d]
 
     for d in dags:
-        # out_dir = Path(out or d.out_dir)
-        # out_dir.mkdir(parents=True, exist_ok=True)
-
         DAGRunner(d).run()
 
 

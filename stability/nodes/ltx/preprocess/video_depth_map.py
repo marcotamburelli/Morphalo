@@ -2,15 +2,16 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import cv2
 import torch
 
 from stability.dag import NodeRef
+from stability.nodes.common.config_resolve import SpecInput, resolve_spec
+from stability.nodes.common.paths import make_node_output_path
 from stability.nodes.ltx.preprocess.utils.depth_extractor import \
     DepthVideoExtractor
-from stability.nodes.utils import make_node_output_path, resolve_spec
 
 _model_id: str = 'Intel/dpt-hybrid-midas'
 _device: str = 'cuda'
@@ -26,7 +27,7 @@ class VideoDepthMap(NodeRef):
     and writes a packed depth control video (mp4) plus a JSON sidecar.
     """
 
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         super().__post_init__()

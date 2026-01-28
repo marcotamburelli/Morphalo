@@ -11,7 +11,7 @@ from stability.nodes.txt2img import Txt2Img
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
 
-with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
+with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
     components1 = FileImage(
         id='style1_img',
         path='~/images/woman_armor.png'
@@ -49,7 +49,10 @@ with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
 
     out = Img2Img(
         id='out',
-        spec=CONF / 'jobs' / 'elf_princess_garden_i2i.conf'
+        spec=[
+            CONF / 'jobs' / 'elf_princess_garden_i2i.conf',
+            {'params': {'cfg': 5, 'strength': 0.45}}
+        ]
     )
 
     prompt >> out.prompt()
@@ -60,7 +63,7 @@ with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
         #    facial structure preserving more of  the original
         #    image style.
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=0.7,
+        scale=0.5,
         key="id",
     )
 
@@ -95,7 +98,10 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women') as dag:
 
     img1 = Img2Img(
         id='img1',
-        spec=CONF / 'jobs' / 'elf_princess_garden_i2i.conf'
+        spec=[
+            CONF / 'jobs' / 'elf_princess_garden_i2i.conf',
+            {'params': {'cfg': 8, 'strength': 0.7}}
+        ]
     )
 
     source >> img1
@@ -114,7 +120,10 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women') as dag:
     # Attempt to properly apply faces
     out = Img2Img(
         id='out',
-        spec=CONF / 'jobs' / 'elf_princess_garden_i2i.conf'
+        spec=[
+            CONF / 'jobs' / 'elf_princess_garden_i2i.conf',
+            {'params': {'cfg': 5, 'strength': 0.4}}
+        ]
     )
 
     prompt >> out.prompt()

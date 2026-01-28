@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 
 from stability.dag import NodeRef
-from stability.nodes.utils import resolve_spec
+from stability.nodes.common.config_resolve import resolve_spec
 
 
 @dataclass

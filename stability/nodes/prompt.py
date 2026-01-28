@@ -1,13 +1,11 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict
 
 from stability.cache.models import get_translator
 from stability.const import ENG
 from stability.dag import NodeRef
-from stability.nodes.utils import norm_prompt_pair, resolve_spec
+from stability.nodes.common.config_resolve import SpecInput, resolve_spec
+from stability.nodes.wiring.prompt import norm_prompt_pair
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
 
@@ -69,9 +67,14 @@ class Prompt(NodeRef):
 
     Attributes
     ----------
-    spec : dict[str, Any]
+    spec : dict or str or pathlib.Path or sequence of (dict or str or pathlib.Path)
         Configuration dictionary containing prompt definitions and optional
         language metadata. Relevant keys include:
+
+        The specification may be provided as an in-memory dictionary, as a path
+        to a HOCON configuration file, or as a sequence of such elements. When a
+        sequence is given, each element is resolved independently and merged from
+        left to right, with later elements overriding earlier ones.
 
         - ``prompt``
         - ``negative_prompt``
@@ -95,7 +98,7 @@ class Prompt(NodeRef):
     - The output format is intentionally minimal and stable to allow easy
       consumption by downstream generator nodes.
     """
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
 
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
         spec = resolve_spec(self.spec)

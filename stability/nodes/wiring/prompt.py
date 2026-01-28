@@ -1,10 +1,58 @@
-from __future__ import annotations
-
 from typing import Any, Dict, Optional
 
 from stability.cache.models import *
 from stability.dag import AttachmentSink, NodeRef
-from stability.nodes.utils import norm_prompt_pair
+
+
+def norm_prompt(value: Any, *, joiner: str = '\n') -> str:
+    """
+    Normalize a prompt that can be:
+      - str
+      - list[str]
+    """
+
+    if value is None:
+        return ''
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, list):
+        # filter Nones / non-str defensively
+        parts = [str(x).strip()
+                 for x in value if x is not None and str(x).strip()]
+        return joiner.join(parts).strip()
+
+    # be strict: better to fail early than silently stringify weird objects
+    raise TypeError(
+        f'Prompt must be str or list[str], got {type(value).__name__}')
+
+
+def norm_prompt_pair(value: Any, *, joiner: str = '\n') -> Tuple[str, str]:
+    """
+    Normalize a prompt that can be:
+      - str
+      - list[str]
+      - dict with keys: content/style (each str or list[str])
+
+    Returns (content, style).
+    """
+
+    if value is None:
+        return '', ''
+
+    # legacy / simple form: treat as content
+    if isinstance(value, (str, list)):
+        return norm_prompt(value, joiner=joiner), ''
+
+    # structured form
+    if isinstance(value, dict):
+        content = norm_prompt(value.get('content'), joiner=joiner)
+        style = norm_prompt(value.get('style'), joiner=joiner)
+        return content, style
+
+    raise TypeError(
+        f'Prompt must be str, list[str], or dict, got {type(value).__name__}')
 
 
 class PromptRegistry:

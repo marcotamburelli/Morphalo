@@ -8,8 +8,8 @@ from transformers import CLIPVisionModelWithProjection
 
 from stability.cache.models import get_ip_image_encoder
 from stability.dag import NodeRef
-from stability.nodes.utils import infer_image_encoder_subfolder
 from stability.nodes.wiring.ip_adapter import IpAdapterAttachmentSink
+from stability.nodes.wiring.utils import infer_image_encoder_subfolder
 
 # For FaceID, scale behaves like IP-Adapter scale:
 # float | List[float] | per-block dict (kept for future parity).
