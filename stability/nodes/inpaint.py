@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
-                       StableDiffusionXLImg2ImgPipeline)
+from diffusers import (StableDiffusionXLControlNetInpaintPipeline,
+                       StableDiffusionXLInpaintPipeline)
 from PIL import Image
 
 from stability.cache.models import get_sdxl_base_pipe
 from stability.core.config import *
-from stability.dag import NodeRef
+from stability.dag import AttachmentSink, NodeRef
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.common.cuda_stat import *
 from stability.nodes.common.env import setup_env
@@ -23,20 +23,21 @@ from stability.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
+class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
     """
-    SDXL image-to-image generation node with optional ControlNet and IP-Adapter/FaceID conditioning.
+    SDXL inpainting node with optional ControlNet and IP-Adapter/FaceID conditioning.
 
-    This node performs an image-to-image transformation using Stable Diffusion XL.
-    The init image is provided by the upstream node connected to the default input
-    channel (``input_id="default"``). Text prompts are resolved from the node
-    configuration and may optionally be overridden by an upstream prompt bundle
-    connected through the prompt channel (see Notes).
+    This node performs inpainting using Stable Diffusion XL. The init image is
+    provided by the upstream node connected to the default input channel
+    (``input_id="default"``). The inpainting mask is provided by an upstream node
+    connected to the mask input channel (``input_id="mask"``). Text prompts are
+    resolved from the node configuration and may optionally be overridden by an
+    upstream prompt bundle connected through the prompt channel (see Notes).
 
     If one or more ControlNet specifications are configured on this node, the
-    underlying pipeline switches to ``StableDiffusionXLControlNetImg2ImgPipeline``
+    underlying pipeline switches to ``StableDiffusionXLControlNetInpaintPipeline``
     and uses the attached ControlNet conditioning images. Otherwise, it uses the
-    standard ``StableDiffusionXLImg2ImgPipeline``. IP-Adapter / FaceID conditioning
+    standard ``StableDiffusionXLInpaintPipeline``. IP-Adapter / FaceID conditioning
     is enabled or disabled based on the resolved bundles. IP-Adapter and FaceID are
     mutually exclusive.
 
@@ -74,8 +75,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
         - ``params.cfg`` or ``params.guidance_scale`` : float, optional
             Classifier-free guidance scale (default: 6.0). ``cfg`` takes precedence.
         - ``params.strength`` : float, optional
-            Denoising strength controlling how strongly the init image is transformed
-            (default: 0.7).
+            Denoising strength controlling how strongly the masked region is
+            re-synthesized (default: 0.7).
         - ``params.width`` : int, optional
             Output width (default: 1024).
         - ``params.height`` : int, optional
@@ -90,7 +91,7 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
     ----------
     op : str
         Operator identifier derived from the concrete node class name (e.g.
-        ``"img2img"``).
+        ``"inpaint"``).
     controlnet : ControlNetRegistry
         Registry used to declare ControlNet conditioning inputs (via sinks),
         provided by ``ControlNetMixin``.
@@ -107,8 +108,13 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
     Inputs
     ------
     default : dict
-        Required. Upstream output dictionary containing the init image path. The node
-        expects either ``"image"`` or ``"path"`` to point to the image file.
+        Required. Upstream output dictionary containing the init image path. The
+        node expects either ``"image"`` or ``"path"`` to point to the image file.
+
+    mask : dict
+        Required. Upstream output dictionary containing the mask image path. The
+        node expects either ``"image"`` or ``"path"`` to point to the mask file.
+        Convention: white areas are repainted; black areas are preserved.
 
     prompt:default : dict, optional
         Optional upstream prompt bundle. If present, it overrides prompt fields from
@@ -124,7 +130,7 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
         Primary output dictionary with at least:
 
         - ``ok`` : bool
-        - ``node`` : str (e.g. ``"img2img"``)
+        - ``node`` : str (e.g. ``"inpaint"``)
         - ``id`` : str (node id)
         - ``image`` : str (path to the generated image)
         - ``metadata`` : str (path to a JSON sidecar with generation details)
@@ -136,15 +142,18 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
     -----
     - The init image is loaded from the upstream path, converted to RGB, and resized
     to ``(width, height)`` prior to generation.
+    - The mask image is loaded from the upstream path, converted to single-channel
+    (``"L"``), and resized to ``(width, height)``. White areas are repainted and
+    black areas preserved (mask polarity depends on mask authoring conventions).
     - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle is
     wired into ``prompt:default``, it takes precedence over the local ``spec``;
     otherwise the local ``spec`` is used.
     - ControlNet, IP-Adapter, and FaceID inputs are collected from DAG wiring
     through their respective registries and bundled via
     ``build_control_bundles``.
-    - When ControlNet is enabled, this node calls the img2img pipeline with
-    ``image=init_image`` and passes ControlNet conditioning via ``control_image``
-    (through ``build_pipe_kwargs(..., init_image_already_passed=True)``).
+    - When ControlNet is enabled, this node calls the inpaint pipeline with
+    ``image=init_image`` and ``control_image=<conditioning>`` (via
+    ``build_pipe_kwargs(..., init_image_already_passed=True)``).
     - IP-Adapter and FaceID are mutually exclusive in this node.
     """
 
@@ -153,19 +162,52 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-    def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        # HF env
-        setup_env()
+    def mask(self):
+        """
+        Declare the mask input sink for the inpainting operation.
 
+        This method exposes an :class:`AttachmentSink` that allows an upstream node
+        to provide the inpainting mask. The mask defines which regions of the init
+        image are subject to modification during generation.
+
+        The attached upstream output must contain an image path under either the
+        ``"image"`` or ``"path"`` key. The mask image is interpreted according to
+        Stable Diffusion XL inpainting conventions: white regions are repainted,
+        while black regions are preserved.
+
+        Returns
+        -------
+        AttachmentSink
+            A sink bound to this node with ``input_id="mask"``, used to wire an
+            upstream mask-producing node into the inpainting pipeline.
+
+        Notes
+        -----
+        - The mask is loaded at runtime, converted to single-channel (``"L"``),
+        and resized to match the resolved ``(width, height)`` of the generation.
+        - Mask polarity (white = repaint, black = keep) follows Diffusers SDXL
+        inpainting conventions; users are responsible for providing masks with
+        the correct polarity.
+        - This sink is required for successful execution of the ``Inpaint`` node.
+        """
+        return AttachmentSink(
+            id=f'inpaint_mask:{self.id}',
+            target=self,
+            input_id=f'mask',
+        )
+
+    def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        setup_env()
         ctx = resolve_common(self.spec)
 
         input = input or {}
 
-        # 1) init image comes from default input_id
+        # 1) init image (default)
         init_up = input.get('default')
         if init_up is None:
             raise ValueError(
-                'Img2Img requires an init image wired into the default input (src >> img2img).')
+                'Inpaint requires an init image wired into the default input (src >> inpaint).'
+            )
 
         init_path = init_up.get('image') or init_up.get('path')
         if not init_path:
@@ -176,7 +218,24 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             .convert('RGB') \
             .resize((ctx.width, ctx.height))
 
-        # --- resolve inputs from DAG wiring ---
+        # 2) mask image (mask)
+        mask_up = input.get('mask')
+        if mask_up is None:
+            raise ValueError(
+                'Inpaint requires a mask image wired into input_id="mask" (src >> inpaint.mask). '
+            )
+
+        mask_path = mask_up.get('image') or mask_up.get('path')
+        if not mask_path:
+            raise ValueError(
+                "Mask upstream output must contain 'image' (path).")
+
+        # keep mask as single channel for sanity; resize to match
+        mask_image = Image.open(mask_path) \
+            .convert('L') \
+            .resize((ctx.width, ctx.height))
+
+        # --- resolve conditioning bundles from DAG wiring ---
         cn_bundle, ip_bundle, face_bundle = self.build_control_bundles(
             input=input,
             device=ctx.model.device,
@@ -195,14 +254,14 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
                 'IP_Adapter and IP-Adapter-FaceID are mutually exclusive (chose one).'
             )
 
-        # pipeline load (two-path: direct or via base components)
+        # pipeline load (two-path: standard vs controlnet)
         if cn_bundle.has_controlnet:
-            pipe = StableDiffusionXLControlNetImg2ImgPipeline(
+            pipe = StableDiffusionXLControlNetInpaintPipeline(
                 **base.components,
                 controlnet=cn_bundle.controlnet_arg
             )
         else:
-            pipe = StableDiffusionXLImg2ImgPipeline(
+            pipe = StableDiffusionXLInpaintPipeline(
                 **base.components
             )
 
@@ -230,19 +289,20 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             init_image_already_passed=True,
         )
 
+        # sanity-check ip-adapter masks length if present
         if 'cross_attention_kwargs' in pipe_kwargs:
             l = len(ip_bundle.weight_names_arg) + \
                 len(face_bundle.weight_names_arg)
             masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']
             assert len(masks) == l
 
-        # IMPORTANT: Img2Img + ControlNet uses image=init and control_image=control :contentReference[oaicite:3]{index=3}
         result = pipe(
             prompt=prompt_bundle.prompt,
             prompt_2=prompt_bundle.prompt_2,
             negative_prompt=prompt_bundle.negative_prompt,
             negative_prompt_2=prompt_bundle.negative_prompt_2,
             image=init_image,
+            mask_image=mask_image,
             strength=ctx.strength,
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,

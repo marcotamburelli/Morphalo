@@ -104,7 +104,7 @@ class DAGRunner:
         validate_dag(self.__dag)
 
         # Detect initial nodes
-        node_to_execute = {
+        node_to_execute: Dict[str, NodeRef] = {
             node.id: node for node in self.__dag.nodes if
             all(edge.node_to != node.id for edge in self.__dag.edges)
         }
