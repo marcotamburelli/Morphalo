@@ -9,11 +9,11 @@ from PIL import Image
 
 from stability.cache.models import get_sdxl_base_pipe
 from stability.core.config import *
+from stability.core.paths import ensure_out_dir
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.common.cuda_stat import *
 from stability.nodes.common.env import setup_env
-from stability.nodes.common.paths import ensure_out_dir
 from stability.nodes.io import finalize_image_output, save_image
 from stability.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from stability.nodes.sdxl_resolve import resolve_common

@@ -9,9 +9,10 @@ import numpy as np
 from PIL import Image
 
 from stability.cache.models import get_controlnet_aux_annotator
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
-from stability.nodes.common.paths import make_node_output_path
+from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.preprocess.utils import *
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 
@@ -152,16 +153,16 @@ class ImgAuxMap(NodeRef):
     def _build_annotator(self, processor: str, device: str):
         if processor not in MODELS:
             raise ValueError(
-                f"Unknown processor={processor}. Allowed: {list(MODELS.keys())}")
+                f'Unknown processor={processor}. Allowed: {list(MODELS.keys())}')
 
-        cls = MODELS[processor]["class"]
-        is_ckpt = bool(MODELS[processor]["checkpoint"])
+        cls = MODELS[processor]['class']
+        is_ckpt = bool(MODELS[processor]['checkpoint'])
 
         # NOTE: dwpose in controlnet-aux is not hub-loadable in your env (no .from_pretrained)
-        if processor == "dwpose":
+        if processor == 'dwpose':
             raise ValueError(
-                "dwpose is not available out-of-the-box in controlnet-aux (no from_pretrained). "
-                "Use openpose_* for now, or install a dedicated DWPose backend later."
+                'dwpose is not available out-of-the-box in controlnet-aux (no from_pretrained). '
+                'Use openpose_* for now, or install a dedicated DWPose backend later.'
             )
 
         if is_ckpt:
@@ -173,34 +174,34 @@ class ImgAuxMap(NodeRef):
         t0 = time.perf_counter()
 
         input = input or {}
-        upstream = input.get("default")
+        upstream = input.get('default')
         if upstream is None:
             raise ValueError(
-                "ImgAuxMap requires an input image wired to the default input.")
+                'ImgAuxMap requires an input image wired to the default input.')
 
-        in_path = upstream.get("image") or upstream.get("path")
+        in_path = upstream.get('image') or upstream.get('path')
         if not in_path:
             raise ValueError(
-                "Upstream output does not contain an image path (image/path).")
+                'Upstream output does not contain an image path (image/path).')
 
         spec = resolve_spec(self.spec)
 
-        processor = spec.get("processor", "openpose_full")
+        processor = spec.get('processor', 'openpose_full')
         device = spec.get('device', 'cuda')
 
-        detect_long_side = int(spec.get("detect_long_side", 512))
-        out_w = spec.get("out_width", None)
-        out_h = spec.get("out_height", None)
-        pad_to_multiple_of = int(spec.get("pad_to_multiple_of", 64))
-        keep_aspect = bool(spec.get("keep_aspect", True))
+        detect_long_side = int(spec.get('detect_long_side', 512))
+        out_w = spec.get('out_width', None)
+        out_h = spec.get('out_height', None)
+        pad_to_multiple_of = int(spec.get('pad_to_multiple_of', 64))
+        keep_aspect = bool(spec.get('keep_aspect', True))
 
         # params: defaults + overrides
         params = dict(MODEL_PARAMS.get(processor, {}))
-        params.update(spec.get("params", {}) or {})
+        params.update(spec.get('params', {}) or {})
 
         frame_bgr = cv2.imread(str(in_path), cv2.IMREAD_COLOR)
         if frame_bgr is None:
-            raise FileNotFoundError(f"Unable to read image: {in_path}")
+            raise FileNotFoundError(f'Unable to read image: {in_path}')
 
         in_h, in_w = frame_bgr.shape[:2]
 
@@ -237,40 +238,41 @@ class ImgAuxMap(NodeRef):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = make_node_output_path(
-            out_dir=out_dir, node_id=self.id, ext="png")
+            out_dir=out_dir,
+            node_id=self.id,
+            ext='png',
+        )
         cv2.imwrite(str(out_path), out_bgr)
 
         dt = time.perf_counter() - t0
 
-        meta = {
-            "ok": True,
-            "node": self.op,
-            "id": self.id,
-            "input_image": str(in_path),
-            "image": str(out_path),
-            "input": {
-                "width": in_w,
-                "height": in_h,
+        out = {
+            'ok': True,
+            'node': self.op,
+            'id': self.id,
+            'input_image': str(in_path),
+            'image': str(out_path),
+            'input': {
+                'width': in_w,
+                'height': in_h,
             },
-            "params": {
-                "processor": processor,
-                "detect_long_side": detect_long_side,
-                "out_width": out_w,
-                "out_height": out_h,
-                "pad_to_multiple_of": pad_to_multiple_of,
-                "keep_aspect": keep_aspect,
-                "annotator_params": params,
+            'params': {
+                'processor': processor,
+                'detect_long_side': detect_long_side,
+                'out_width': out_w,
+                'out_height': out_h,
+                'pad_to_multiple_of': pad_to_multiple_of,
+                'keep_aspect': keep_aspect,
+                'annotator_params': params,
             },
-            "output": {
-                "width": target_w,
-                "height": target_h,
+            'output': {
+                'width': target_w,
+                'height': target_h,
             },
-            "timing": {"seconds": round(dt, 3)},
+            'timing': {'seconds': round(dt, 3)},
         }
 
-        meta_path = out_path.with_suffix(".json")
-        meta_path.write_text(json.dumps(
-            meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        meta["metadata"] = str(meta_path)
+        meta_path = write_json_sidecar(out_path, out)
+        out['metadata'] = str(meta_path)
 
-        return meta
+        return out

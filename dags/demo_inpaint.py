@@ -48,15 +48,27 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
 
     styles = FileImage(
         id='styles',
-        path='~/images/styles/common.png'
+        path=[
+            f'~/images/styles/female_armor/01.png',
+            f'~/images/styles/female_gandalf/01.png',
+            f'~/images/styles/garden/08.png',
+        ]
     )
-    style_1 = FileImage(
-        id='style_1',
-        path='~/images/styles/female_armor/mix.png'
-    )
-    style_2 = FileImage(
-        id='style_2',
-        path='~/images/styles/female_gandalf/mix.png'
+    # style_1 = FileImage(
+    #     id='style_1',
+    #     path='~/images/styles/female_armor/01.png'
+    # )
+    # style_2 = FileImage(
+    #     id='style_2',
+    #     path='~/images/styles/female_gandalf/01.png'
+    # )
+    mask_tmp = FileImage(
+        id='mask_tmp',
+        path=[
+            '~/images/woman_left.png',
+            '~/images/woman_right.png',
+            '~/images/woman_left_right_bg.png'
+        ]
     )
 
     mask_1 = FileImage(id='mask_1', path='~/images/woman_left.png')
@@ -79,7 +91,7 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
         id='img_tmp',
         spec=[
             CONF / 'jobs' / 'elf_princess_garden_i2i.conf',
-            {'params': {'cfg': 7, 'strength': 0.5}}
+            {'params': {'cfg': 7, 'strength': 0.55}}
         ]
     )
 
@@ -90,10 +102,11 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
         'h94/IP-Adapter',
         subfolder='sdxl_models',
         weight_name='ip-adapter_sdxl.bin',
-        scale=0.7,
+        scale=0.6,
         key='style'
     )
     styles >> adapter
+    mask_tmp >> adapter.mask()
 
     # Attempt to properly apply faces through inpaint
 
@@ -102,7 +115,7 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
         id='inpaint_style_1',
         spec=[
             CONF / 'jobs' / 'elven_warrior_txt2img.conf',
-            {'params': {'cfg': 7, 'strength': 0.55}}
+            {'params': {'cfg': 3.5, 'strength': 0.6}}
         ]
     )
 
@@ -110,21 +123,21 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
     mask_1 >> inpaint_style_1.mask()
     img_tmp >> inpaint_style_1
 
-    style_1 >> inpaint_style_1.ip_adapter.add(
-        'h94/IP-Adapter',
-        subfolder='sdxl_models',
-        weight_name='ip-adapter_sdxl.bin',
-        scale=0.7,
-        key='style_1'
-    )
+    # style_1 >> inpaint_style_1.ip_adapter.add(
+    #     'h94/IP-Adapter',
+    #     subfolder='sdxl_models',
+    #     weight_name='ip-adapter_sdxl.bin',
+    #     scale=0.4,
+    #     key='style_1'
+    # )
 
     inpaint_face_1 = Inpaint(
         id='inpaint_face_1',
         spec=[
             CONF / 'jobs' / 'elven_warrior_txt2img.conf',
             {
-                'params': {'cfg': 3, 'strength': 0.3},
-                'prompt': 'Elven princess, black hair, blue eyes'
+                'params': {'cfg': 3, 'strength': 0.4},
+                'prompt': 'Elven warrior with metal plate armor, black hair, blue eyes, pointed elf ears.'
             }
         ]
     )
@@ -135,8 +148,8 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
     face_1 >> inpaint_face_1.face_id.add(
         model_id="h94/IP-Adapter-FaceID",
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=1.0,
-        clip_strength=0.7,
+        scale=0.5,
+        # clip_strength=0.7,
         key="id",
     )
 
@@ -145,7 +158,7 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
         id='inpaint_style_2',
         spec=[
             CONF / 'jobs' / 'elven_warrior_txt2img.conf',
-            {'params': {'cfg': 7, 'strength': 0.5}}
+            {'params': {'cfg': 3.5, 'strength': 0.6}}
         ]
     )
 
@@ -153,21 +166,21 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
     mask_2 >> inpaint_style_2.mask()
     inpaint_face_1 >> inpaint_style_2
 
-    style_2 >> inpaint_style_2.ip_adapter.add(
-        'h94/IP-Adapter',
-        subfolder='sdxl_models',
-        weight_name='ip-adapter_sdxl.bin',
-        scale=0.7,
-        key='style_1'
-    )
+    # style_2 >> inpaint_style_2.ip_adapter.add(
+    #     'h94/IP-Adapter',
+    #     subfolder='sdxl_models',
+    #     weight_name='ip-adapter_sdxl.bin',
+    #     scale=0.5,
+    #     key='style_1'
+    # )
 
     inpaint_face_2 = Inpaint(
         id='out',
         spec=[
             CONF / 'jobs' / 'elven_warrior_txt2img.conf',
             {
-                'params': {'cfg': 3, 'strength': 0.3},
-                'prompt': 'Mage girl, silver hair, deep violet eyes, white and delicate eyebrows'
+                'params': {'cfg': 3, 'strength': 0.5},
+                'prompt': 'Young woman, silver hair, deep violet eyes, white and delicate eyebrows'
             }
         ]
     )
@@ -178,7 +191,7 @@ with DAG('2_women', out_dir=ROOT / 'outputs' / '2_women_inpaint') as dag:
     face_2 >> inpaint_face_2.face_id.add(
         model_id="h94/IP-Adapter-FaceID",
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=1.0,
-        clip_strength=0.7,
+        scale=0.7,
+        # clip_strength=0.7,
         key="id",
     )

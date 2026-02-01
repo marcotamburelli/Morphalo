@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional, Union
 
 import cv2
 
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
-from stability.nodes.common.paths import make_node_output_path
 from stability.nodes.ltx.preprocess.utils.canny_extractor import CannyExtractor
 from stability.nodes.ltx.video_utils import read_video_info
 

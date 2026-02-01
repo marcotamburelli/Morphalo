@@ -3,8 +3,8 @@ from typing import List, Optional, Union
 
 from PIL import Image
 
+from stability.core.paths import make_node_output_path
 from stability.nodes.common.io import write_json_sidecar
-from stability.nodes.common.paths import make_node_output_path
 from stability.nodes.wiring.controlnet import ControlNetSpec
 from stability.nodes.wiring.face_id import FaceIdSpec
 from stability.nodes.wiring.ip_adapter import IpAdapterSpec

@@ -1,5 +1,6 @@
 from typing import Dict, List, Optional
 
+from stability.core.paths import load_latest_output
 from stability.dag import *
 from stability.dag.validation import DagValidationError, validate_dag
 
@@ -115,7 +116,8 @@ class DAGRunner:
 
             for node in node_to_execute.values():
                 source_executions = [
-                    execution for execution in self._executions if execution.edge.node_to == node.id]
+                    execution for execution in self._executions if execution.edge.node_to == node.id
+                ]
 
                 if any(e.output is None for e in source_executions):
                     pending = {**pending, node.id: node}
@@ -142,3 +144,72 @@ class DAGRunner:
                             }
 
             node_to_execute = {**pending, **next_to_execute}
+
+    def run_node(self, target_id: str):
+        """
+        Execute a single node of the DAG using cached outputs from its upstream nodes.
+
+        This method runs only the specified target node, without re-executing the
+        entire DAG. Inputs for the target node are loaded from the filesystem by
+        retrieving the most recent JSON outputs produced by its immediate upstream
+        nodes.
+
+        The method is intended for CLI-driven or incremental workflows, where node
+        execution is side-effect based and outputs are materialized on disk rather
+        than returned to the caller.
+
+        Parameters
+        ----------
+        target_id : str
+            Identifier of the node to execute.
+
+        Raises
+        ------
+        ValueError
+            If ``target_id`` does not correspond to any node in the DAG.
+        RuntimeError
+            If one or more upstream nodes have no cached output available on disk.
+        RuntimeError
+            If the target node produces no output.
+
+        Notes
+        -----
+        - The DAG structure is validated before execution.
+        - Only *immediate* upstream dependencies of ``target_id`` are considered.
+        Transitive upstream nodes are assumed to have already produced cached
+        outputs.
+        - Cached outputs are loaded via :func:`load_latest_output`, which selects
+        the most recent JSON artifact in each upstream node's output directory.
+        - The execution relies entirely on filesystem side effects; no value is
+        returned to the caller.
+        """
+
+        # structural checks, incl. duplicate input_id
+        validate_dag(self.__dag)
+
+        upstream_executions = [
+            e for e in self._executions if e.edge.node_to == target_id]
+
+        # lookup target
+        target_node = next(
+            (n for n in self.__dag.nodes if n.id == target_id), None)
+        if target_node is None:
+            raise ValueError(f'Unknown node id: {target_id!r}')
+
+        # populate upstream outputs from cache
+        for e in upstream_executions:
+            e.output = load_latest_output(
+                out_dir=self.__dag.out_dir,
+                node_id=e.edge.node_from
+            )
+            if e.output is None:
+                raise RuntimeError(
+                    f'Missing cached output for upstream node {e.edge.node_from!r} '
+                    f'(needed by {target_id!r} on input {e.edge.input_id!r}).'
+                )
+
+        input_map = {ex.edge.input_id: ex.output for ex in upstream_executions}
+        out = target_node.run(self.__dag.out_dir, input=input_map)
+
+        if not out:
+            raise RuntimeError(f'No output for node {target_id!r}')

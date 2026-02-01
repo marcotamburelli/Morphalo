@@ -36,7 +36,12 @@ def run_dags(
         None,
         '--dag',
         help='Run only the DAG with this name'
-    )
+    ),
+    node: Optional[str] = typer.Option(
+        None,
+        '--node',
+        help='Execute only this node id (requires cached upstream outputs)'
+    ),
 ):
     """
     Import a module that declares one or more DAGs and execute them.
@@ -46,6 +51,10 @@ def run_dags(
 
     If `--dag` is provided, only the matching DAG is executed.
     Otherwise, all discovered DAGs are executed in definition order.
+
+    If `--node` is provided, only that node is executed (via DAGRunner.run_node),
+    using cached outputs from immediate upstream nodes. If multiple DAGs are
+    discovered, `--dag` must be specified to disambiguate.
     """
     DagRegistry.clear()
     importlib.import_module(module)
@@ -55,18 +64,28 @@ def run_dags(
         raise typer.BadParameter(
             f'No DAGs registered while importing module: {module!r}')
 
+    # If node is requested and multiple DAGs exist, require --dag to avoid ambiguity
+    if node is not None and dag is None and len(dags) > 1:
+        available = [d.name for d in dags]
+        raise typer.BadParameter(
+            f'--node requires --dag when multiple DAGs are present. Available: {available}'
+        )
+
     if dag is not None:
         _d = DagRegistry.get(dag)
-
         if _d is None:
-            available = [d.name for d in DagRegistry.all()]
+            available = [d.name for d in dags]
             raise typer.BadParameter(
-                f'DAG {dag!r} not found. Available: {available}')
-        else:
-            dags = [_d]
+                f'DAG {dag!r} not found. Available: {available}'
+            )
+        dags = [_d]
 
     for d in dags:
-        DAGRunner(d).run()
+        runner = DAGRunner(d)
+        if node is not None:
+            runner.run_node(node)
+        else:
+            runner.run()
 
 
 if __name__ == '__main__':

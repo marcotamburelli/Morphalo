@@ -98,8 +98,8 @@ class DAG:
         """
         self.name = name
         self.out_dir = out_dir
-        self.nodes = []
-        self.edges = []
+        self.nodes: List[NodeRef] = []
+        self.edges: List[Edge] = []
         self._id_counter = 0
 
     def next_id(self, prefix: str) -> str:

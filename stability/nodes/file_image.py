@@ -2,7 +2,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from stability.core.paths import load_json_dict, make_node_output_path
 from stability.dag import NodeRef
+from stability.nodes.common.io import write_json_sidecar
 
 
 @dataclass
@@ -44,6 +46,13 @@ class FileImage(NodeRef):
     op : str
         Operator identifier automatically derived from the concrete class name
         (for example ``'file_image'``).
+
+    Notes
+    -----
+    - The JSON sidecar produced by this node is used as a persistent cache.
+      If the node implementation, its configuration, or specification changes,
+      any previously generated sidecar files must be removed manually in order
+      to avoid reusing stale cached outputs.
     """
 
     path: Union[str, Path, List[Union[str, Path]]]
@@ -68,6 +77,15 @@ class FileImage(NodeRef):
             - 'id': node id
             - 'image': absolute path or list of paths to the image files
         """
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='json',
+            tag=self.op,
+        )
+        if out_path.exists():
+            return load_json_dict(out_path)
+
         if not isinstance(self.path, list):
             paths = [self.path]
         else:
@@ -83,9 +101,14 @@ class FileImage(NodeRef):
                 raise FileNotFoundError(
                     f"FileImage node '{self.id}': not a file: {p}")
 
-        return {
+        out = {
             'ok': True,
             'node': self.op,
             'id': self.id,
             'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0])
         }
+
+        meta_path = write_json_sidecar(out_path, out)
+        out['metadata'] = str(meta_path)
+
+        return out

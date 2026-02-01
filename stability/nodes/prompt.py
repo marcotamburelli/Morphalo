@@ -1,10 +1,13 @@
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict
 
 from stability.cache.models import get_translator
 from stability.const import ENG
+from stability.core.paths import load_json_dict, make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
+from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.wiring.prompt import norm_prompt_pair
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
@@ -91,6 +94,10 @@ class Prompt(NodeRef):
 
     Notes
     -----
+    - The JSON sidecar produced by this node is used as a persistent cache.
+      If the node implementation, its configuration, or specification changes,
+      any previously generated sidecar files must be removed manually in order
+      to avoid reusing stale cached outputs.
     - Translation is deterministic and cached per (model, source language,
       device) combination.
     - This node does not perform prompt optimization or rewriting beyond
@@ -101,6 +108,15 @@ class Prompt(NodeRef):
     spec: SpecInput = field(default_factory=dict)
 
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='json',
+            tag=self.op,
+        )
+        if out_path.exists():
+            return load_json_dict(out_path)
+
         spec = resolve_spec(self.spec)
 
         src_lang = spec.get('lang', ENG)
@@ -143,6 +159,7 @@ class Prompt(NodeRef):
         if negative_prompt_2:
             out['negative_prompt_2'] = negative_prompt_2
 
-        print(out)
+        meta_path = write_json_sidecar(out_path, out)
+        out['metadata'] = str(meta_path)
 
         return out

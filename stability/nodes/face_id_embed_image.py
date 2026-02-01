@@ -8,8 +8,10 @@ import numpy as np
 import torch
 from PIL import Image
 
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import resolve_spec
+from stability.nodes.common.io import write_json_sidecar
 
 
 @dataclass
@@ -171,9 +173,13 @@ class FaceIdEmbedImage(NodeRef):
         paths = [Path(str(p)).expanduser().resolve() for p in paths]
         for p in paths:
             if not p.exists():
-                raise FileNotFoundError(f"FaceIdEmbedImage node '{self.id}': file not found: {p}")
+                raise FileNotFoundError(
+                    f"FaceIdEmbedImage node '{self.id}': file not found: {p}"
+                )
             if not p.is_file():
-                raise FileNotFoundError(f"FaceIdEmbedImage node '{self.id}': not a file: {p}")
+                raise FileNotFoundError(
+                    f"FaceIdEmbedImage node '{self.id}': not a file: {p}"
+                )
 
         if isinstance(device, str) and device.startswith("cuda"):
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -195,7 +201,9 @@ class FaceIdEmbedImage(NodeRef):
 
             faces = app.get(bgr)
             if not faces:
-                raise ValueError(f"FaceIdEmbedImage node '{self.id}': no face detected in {p}")
+                raise ValueError(
+                    f"FaceIdEmbedImage node '{self.id}': no face detected in {p}"
+                )
 
             # normed_embedding: np.ndarray shape (D,)
             e = torch.from_numpy(faces[0].normed_embedding).to(torch.float32)
@@ -232,13 +240,15 @@ class FaceIdEmbedImage(NodeRef):
                 f"FaceIdEmbedImage node '{self.id}': invalid output_dtype={self.output_dtype!r}"
             )
 
-        out_dir = Path(str(output_dir)).expanduser().resolve() / "faceid"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"faceid_{self.id}.pt"
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='pt',
+        )
 
         torch.save(id_embeds.cpu(), out_path)
 
-        return {
+        out = {
             "ok": True,
             "node": self.op,
             "id": self.id,
@@ -251,3 +261,8 @@ class FaceIdEmbedImage(NodeRef):
             "shape": list(id_embeds.shape),
             "dtype": str(id_embeds.dtype).replace("torch.", ""),
         }
+
+        meta_path = write_json_sidecar(out_path, out)
+        out['metadata'] = str(meta_path)
+
+        return out

@@ -5,11 +5,11 @@ from typing import Any, Dict, Optional, Union
 
 from stability.cache.ltx_models import (get_ltx_condition,
                                         get_ltx_latent_upsample)
+from stability.core.paths import ensure_out_dir
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.common.cuda_stat import *
 from stability.nodes.common.env import setup_env
-from stability.nodes.common.paths import ensure_out_dir
 from stability.nodes.ltx.conditioning import apply_ic_lora
 from stability.nodes.ltx.io import finalize_video_output, save_video
 from stability.nodes.ltx.ltx_resolve import resolve_ltx_common

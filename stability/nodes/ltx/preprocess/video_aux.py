@@ -9,9 +9,9 @@ import numpy as np
 from PIL import Image
 
 from stability.cache.models import get_controlnet_aux_annotator
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
-from stability.nodes.common.paths import make_node_output_path
 from stability.nodes.ltx.video_utils import read_video_info
 from stability.nodes.preprocess.utils import *
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
