@@ -145,7 +145,7 @@ class DAGRunner:
 
             node_to_execute = {**pending, **next_to_execute}
 
-    def run_node(self, target_id: str):
+    def run_node(self, target_id: str, force_upstream: bool = False):
         """
         Execute a single node of the DAG using cached outputs from its upstream nodes.
 
@@ -162,13 +162,21 @@ class DAGRunner:
         ----------
         target_id : str
             Identifier of the node to execute.
+        force_upstream : bool, optional
+            If ``True``, missing upstream outputs trigger execution of upstream
+            nodes (recursively) in order to materialize the required inputs.
+            If ``False`` (default), the method fails if any required upstream
+            output is not already available on disk.
 
         Raises
         ------
         ValueError
             If ``target_id`` does not correspond to any node in the DAG.
         RuntimeError
-            If one or more upstream nodes have no cached output available on disk.
+            If one or more upstream nodes have no cached output available on disk
+            and ``force_upstream`` is ``False``.
+        RuntimeError
+            If an upstream node is executed but still produces no output.
         RuntimeError
             If the target node produces no output.
 
@@ -176,40 +184,75 @@ class DAGRunner:
         -----
         - The DAG structure is validated before execution.
         - Only *immediate* upstream dependencies of ``target_id`` are considered.
-        Transitive upstream nodes are assumed to have already produced cached
-        outputs.
+        Transitive upstream nodes are resolved on demand only when
+        ``force_upstream`` is enabled.
         - Cached outputs are loaded via :func:`load_latest_output`, which selects
         the most recent JSON artifact in each upstream node's output directory.
+        - When ``force_upstream`` is enabled, this method behaves similarly to a
+        make-like build: missing dependencies are executed before the target
+        node.
         - The execution relies entirely on filesystem side effects; no value is
         returned to the caller.
         """
 
-        # structural checks, incl. duplicate input_id
         validate_dag(self.__dag)
 
-        upstream_executions = [
-            e for e in self._executions if e.edge.node_to == target_id]
+        nodes_by_id = {n.id: n for n in self.__dag.nodes}
+        if target_id not in nodes_by_id:
+            raise ValueError(f"Unknown node id: {target_id!r}")
 
-        # lookup target
-        target_node = next(
-            (n for n in self.__dag.nodes if n.id == target_id), None)
-        if target_node is None:
-            raise ValueError(f'Unknown node id: {target_id!r}')
+        stack: set[str] = set()
 
-        # populate upstream outputs from cache
-        for e in upstream_executions:
-            e.output = load_latest_output(
-                out_dir=self.__dag.out_dir,
-                node_id=e.edge.node_from
-            )
-            if e.output is None:
+        def _load(node_from: str):
+            return load_latest_output(out_dir=self.__dag.out_dir, node_id=node_from)
+
+        def _ensure_upstream(ex: Execution) -> dict:
+            """
+            Ensure upstream output exists on disk; optionally build it.
+            """
+
+            node_from = ex.edge.node_from
+
+            out = _load(node_from)
+            if out is not None:
+                return out
+
+            if not force_upstream:
                 raise RuntimeError(
-                    f'Missing cached output for upstream node {e.edge.node_from!r} '
-                    f'(needed by {target_id!r} on input {e.edge.input_id!r}).'
+                    f"Missing cached output for upstream node {node_from!r} "
+                    f"(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r})."
                 )
 
-        input_map = {ex.edge.input_id: ex.output for ex in upstream_executions}
-        out = target_node.run(self.__dag.out_dir, input=input_map)
+            _run(node_from)  # build upstream (cycle guard is inside _run)
 
-        if not out:
-            raise RuntimeError(f'No output for node {target_id!r}')
+            out = _load(node_from)
+            if out is None:
+                raise RuntimeError(
+                    f"Upstream node {node_from!r} was executed but produced no cached output "
+                    f"(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r})."
+                )
+            return out
+
+        def _run(node_id: str) -> None:
+            if node_id in stack:
+                raise RuntimeError(
+                    f"Cycle detected while executing {node_id!r}")
+            stack.add(node_id)
+
+            upstream_executions = [
+                e for e in self._executions if e.edge.node_to == node_id]
+
+            # populate upstream outputs
+            for ex in upstream_executions:
+                ex.output = _ensure_upstream(ex)
+
+            input_map = {
+                ex.edge.input_id: ex.output for ex in upstream_executions}
+
+            out = nodes_by_id[node_id].run(self.__dag.out_dir, input=input_map)
+            if not out:
+                raise RuntimeError(f"No output for node {node_id!r}")
+
+            stack.remove(node_id)
+
+        _run(target_id)

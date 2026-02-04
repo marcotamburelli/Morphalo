@@ -21,7 +21,7 @@ with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
         id='out',
         spec=[
             CONF / 'jobs' / 'elven_warrior_txt2img.conf',
-            {'params': {'cfg': 7, 'strength': 0.5}}
+            {'params': {'cfg': 3, 'strength': 0.6}}
         ]
     )
 
@@ -32,8 +32,8 @@ with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
     face_emb >> out.face_id.add(
         model_id="h94/IP-Adapter-FaceID",
         weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-        scale=0.7,
-        clip_strength=0.5,
+        scale=0.5,
+        # clip_strength=0.5,
         key="id",
     )
 

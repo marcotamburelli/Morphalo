@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from stability.core.paths import load_json_dict, make_node_output_path
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.io import write_json_sidecar
 
@@ -45,15 +45,6 @@ class FileVideo(NodeRef):
     path: Union[str, Path]
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        out_path = make_node_output_path(
-            out_dir=Path(output_dir),
-            node_id=self.id,
-            ext='json',
-            tag=self.op,
-        )
-        if out_path.exists():
-            return load_json_dict(out_path)
-
         p = Path(str(self.path)).expanduser()
         p = p.resolve()
 
@@ -70,6 +61,12 @@ class FileVideo(NodeRef):
             'id': self.id,
             'video': str(p),
         }
+
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='json',
+        )
 
         meta_path = write_json_sidecar(out_path, out)
         out['metadata'] = str(meta_path)

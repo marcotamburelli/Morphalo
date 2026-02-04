@@ -10,7 +10,7 @@ from stability.nodes.txt2img import Txt2Img
 ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
 
-with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
+with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
     components = FileImage(id='style_img', path=[
         *[f'~/images/styles/female_armor/{i:02d}.png' for i in range(1, 9)],
         *[f'~/images/styles/garden/{i:02d}.png' for i in range(1, 9)],
@@ -55,7 +55,7 @@ with DAG('elven_worrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
         key='style'
     )
 
-with DAG('elven_worrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag:
+with DAG('elven_warrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag:
     # --- reference images ---
     refs = FileImage(
         id='armor_refs',
@@ -133,3 +133,79 @@ with DAG('elven_worrior_2', out_dir=ROOT / 'outputs' / 'elven_warrior_2') as dag
     )
     refs >> ip_style
     mask >> ip_style.mask()
+
+
+with DAG('elven_warrior_3', out_dir=ROOT / 'outputs' / 'elven_warrior_3') as dag:
+    source = FileImage(id='model_img', path='~/images/warrior_anime.png')
+
+    # prompt
+    prompt = Prompt(
+        id='elven_warrior',
+        spec=CONF / 'jobs' / 'elven_warrior_prompt.conf',
+    )
+
+    canny = ImgAuxMap(
+        id='canny',
+        spec={
+            'processor': 'canny',
+            'detect_long_side': 1024,
+        },
+    )
+    depth = ImgAuxMap(
+        id='depth_midas',
+        spec={
+            'processor': 'depth_midas',
+            'detect_long_side': 1024,
+        },
+    )
+
+    out = Txt2Img(
+        id='out',
+        spec=[
+            CONF / 'jobs' / 'elven_warrior_txt2img.conf',
+            {
+                'params': {
+                    'cfg': 3,
+                    'width': 1300,
+                    'height': 1300,
+                }
+            }
+        ]
+    )
+
+    prompt >> out.prompt()
+
+    source >> canny >> out.controlnet.add(
+        'diffusers/controlnet-canny-sdxl-1.0',
+        conditioning_scale=0.4,
+        key='canny',
+    )
+    source >> depth >> out.controlnet.add(
+        'diffusers/controlnet-depth-sdxl-1.0',
+        conditioning_scale=0.4,
+        key='depth',
+    )
+
+
+with DAG('elven_warrior_0', out_dir=ROOT / 'outputs' / 'elven_warrior_0') as dag:
+    # prompt
+    prompt = Prompt(
+        id='elven_warrior',
+        spec=CONF / 'jobs' / 'elven_warrior_prompt.conf',
+    )
+
+    out = Txt2Img(
+        id='out',
+        spec=[
+            CONF / 'jobs' / 'elven_warrior_txt2img.conf',
+            {
+                'params': {
+                    'cfg': 7,
+                    'width': 1296,
+                    'height': 1296,
+                }
+            }
+        ]
+    )
+
+    prompt >> out.prompt()

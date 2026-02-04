@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 from stability.cache.models import get_translator
 from stability.const import ENG
-from stability.core.paths import load_json_dict, make_node_output_path
+from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
@@ -108,15 +108,6 @@ class Prompt(NodeRef):
     spec: SpecInput = field(default_factory=dict)
 
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
-        out_path = make_node_output_path(
-            out_dir=Path(output_dir),
-            node_id=self.id,
-            ext='json',
-            tag=self.op,
-        )
-        if out_path.exists():
-            return load_json_dict(out_path)
-
         spec = resolve_spec(self.spec)
 
         src_lang = spec.get('lang', ENG)
@@ -158,6 +149,12 @@ class Prompt(NodeRef):
             out['prompt_2'] = prompt_2
         if negative_prompt_2:
             out['negative_prompt_2'] = negative_prompt_2
+
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='json',
+        )
 
         meta_path = write_json_sidecar(out_path, out)
         out['metadata'] = str(meta_path)

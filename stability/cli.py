@@ -42,6 +42,11 @@ def run_dags(
         '--node',
         help='Execute only this node id (requires cached upstream outputs)'
     ),
+    force_upstream: bool = typer.Option(
+        False,
+        '--force-upstream',
+        help='When used with --node, execute missing upstream nodes to materialize inputs'
+    ),
 ):
     """
     Import a module that declares one or more DAGs and execute them.
@@ -52,8 +57,9 @@ def run_dags(
     If `--dag` is provided, only the matching DAG is executed.
     Otherwise, all discovered DAGs are executed in definition order.
 
-    If `--node` is provided, only that node is executed (via DAGRunner.run_node),
-    using cached outputs from immediate upstream nodes. If multiple DAGs are
+    If `--node` is provided, only that node is executed (via DAGRunner.run_node).
+    By default, upstream outputs must already exist on disk. Use `--force-upstream`
+    to execute missing upstream nodes recursively. If multiple DAGs are
     discovered, `--dag` must be specified to disambiguate.
     """
     DagRegistry.clear()
@@ -83,7 +89,7 @@ def run_dags(
     for d in dags:
         runner = DAGRunner(d)
         if node is not None:
-            runner.run_node(node)
+            runner.run_node(node, force_upstream=force_upstream)
         else:
             runner.run()
 
