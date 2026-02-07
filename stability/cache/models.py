@@ -3,8 +3,8 @@ import os
 from typing import Any, Optional, Tuple
 
 import torch
-from diffusers import (AutoencoderKL, ControlNetModel,
-                       StableDiffusionXLPipeline, T2IAdapter)
+from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
+                       OmniGenPipeline, StableDiffusionXLPipeline, T2IAdapter)
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
                           DPTImageProcessor, pipeline)
 
@@ -201,7 +201,7 @@ def get_controlnet_aux_annotator(
         *,
         processor: str,
         cls: Any, device: str,
-        repo_id: str = "lllyasviel/Annotators"
+        repo_id: str = 'lllyasviel/Annotators'
 ):
     """
     Cache wrapper for controlnet-aux annotators that support .from_pretrained(repo_id).
@@ -221,3 +221,66 @@ def get_controlnet_aux_annotator(
 
     proc = cls.from_pretrained(repo_id).to(device)
     return ModelCache.put(key, proc)
+
+
+def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPipeline:
+    key = CacheKey(
+        kind='omnigen',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype)
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    omg = OmniGenPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype
+    ).to(device)
+
+    return ModelCache.put(key, omg)
+
+def get_qwen_image(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> DiffusionPipeline:
+    """
+    Load and cache a Qwen-Image Diffusers pipeline.
+
+    Parameters
+    ----------
+    model_id : str
+        Model identifier (e.g. "Qwen/Qwen-Image").
+    dtype : torch.dtype
+        Torch dtype for loading weights.
+    device_map : str
+        Accelerate device_map for dispatching modules. Typical values:
+        "balanced", "auto", "cuda", "cpu".
+
+    Returns
+    -------
+    DiffusionPipeline
+        Cached pipeline instance.
+    """
+    key = CacheKey(
+        kind='qwen_image',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    pipe = DiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map=device_map,
+    )
+
+    return ModelCache.put(key, pipe)

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from stability.dag import DAG
 from stability.nodes.file_image import FileImage
+from stability.nodes.foundation import OmniGen, QwenImage
 from stability.nodes.img2img import Img2Img
 from stability.nodes.preprocess import ImgAuxMap
 from stability.nodes.prompt import Prompt
@@ -187,25 +188,22 @@ with DAG('elven_warrior_3', out_dir=ROOT / 'outputs' / 'elven_warrior_3') as dag
     )
 
 
-with DAG('elven_warrior_0', out_dir=ROOT / 'outputs' / 'elven_warrior_0') as dag:
-    # prompt
+with DAG('foundation', out_dir=ROOT / 'outputs' / 'foundation') as dag:
     prompt = Prompt(
-        id='elven_warrior',
-        spec=CONF / 'jobs' / 'elven_warrior_prompt.conf',
+        id='prompt',
+        spec=CONF / 'jobs' / 'foundation_prompt.conf',
     )
 
-    out = Txt2Img(
+    out = QwenImage(
         id='out',
-        spec=[
-            CONF / 'jobs' / 'elven_warrior_txt2img.conf',
-            {
-                'params': {
-                    'cfg': 7,
-                    'width': 1296,
-                    'height': 1296,
-                }
+        spec={
+            'params': {
+                'steps': 40,
+                'true_cfg_scale': 4,
+                'width': 1024,
+                'height': 1024,
             }
-        ]
+        }
     )
 
     prompt >> out.prompt()

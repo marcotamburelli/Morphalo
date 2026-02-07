@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from stability.cache.models import get_translator
 from stability.const import ENG
@@ -8,18 +8,124 @@ from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
-from stability.nodes.wiring.prompt import norm_prompt_pair
+from stability.nodes.wiring.prompt import PromptValue, norm_prompt_pair
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
 
 
-def _translate(tr: Any, text: str) -> str:
-    if not text:
-        return text
+def _translate(
+        tr: Any,
+        batch: List[str],
+        *,
+        max_length: Optional[int] = None,
+        batch_size: int = 16
+) -> List[str]:
+    if not batch:
+        return []
 
-    out = tr(text)
+    kwargs = {"batch_size": batch_size}
+    if max_length is not None:
+        kwargs["max_length"] = max_length
 
-    return out[0]['translation_text']
+    outs = tr(batch, **kwargs)
+    return [o["translation_text"] for o in outs]
+
+
+def translate_prompt_value(
+    tr: Any,
+    value: PromptValue,
+    *,
+    max_length: Optional[int] = None,
+    batch_size: int = 16
+) -> PromptValue:
+    """
+    Translate a prompt value preserving its original structure.
+
+    Supported shapes:
+      - str
+      - list[str | None]
+      - dict with keys 'content'/'style' (each str | list[str] | None)
+
+    Empty or blank values are pruned.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        return _translate(
+            tr,
+            [value],
+            max_length=max_length,
+            batch_size=batch_size
+        )[0]
+
+    if isinstance(value, list):
+        clean_list = [
+            str(x).strip()
+            for x in value
+            if x is not None and str(x).strip()
+        ]
+
+        if not clean_list:
+            return []
+
+        return _translate(
+            tr,
+            clean_list,
+            max_length=max_length,
+            batch_size=batch_size
+        )
+
+    if isinstance(value, dict):
+        content = value.get('content', [])
+        style = value.get('style', [])
+
+        if isinstance(content, str):
+            content = [content]
+        if isinstance(style, str):
+            style = [style]
+
+        if not isinstance(content, list) or not isinstance(style, list):
+            raise TypeError(
+                "In case of dict, 'content' and 'style' must be str or list[str]. "
+                f"Got {type(content).__name__} and {type(style).__name__}."
+            )
+
+        content_clean = [
+            str(x).strip()
+            for x in content
+            if x is not None and str(x).strip()
+        ]
+        style_clean = [
+            str(x).strip()
+            for x in style
+            if x is not None and str(x).strip()
+        ]
+
+        batch = content_clean + style_clean
+        if not batch:
+            return {}
+
+        out_batch = _translate(
+            tr,
+            batch=batch,
+            max_length=max_length,
+            batch_size=batch_size
+        )
+
+        n = len(content_clean)
+        out_dict: Dict[str, Any] = {}
+
+        if content_clean:
+            out_dict["content"] = out_batch[:n]
+        if style_clean:
+            out_dict["style"] = out_batch[n:]
+
+        return out_dict
+
+    raise TypeError(
+        f'Prompt must be str, list[str], or dict, got {type(value).__name__}'
+    )
 
 
 @dataclass
@@ -86,6 +192,11 @@ class Prompt(NodeRef):
           https://github.com/facebookresearch/flores/blob/main/flores200/README.md 
         - ``translate_model`` (optional Hugging Face model id)
         - ``device`` (default 'cuda')
+        - ``translate_max_length`` (optional)
+          Maximum output length passed to the translation pipeline when translating
+          prompts to English. This parameter is forwarded at call time to avoid
+          truncation of long prompts and suppress related warnings. If not specified,
+          the default ``max_length`` of the translation model is used.
 
     Outputs
     -------
@@ -113,12 +224,13 @@ class Prompt(NodeRef):
         src_lang = spec.get('lang', ENG)
         model_id = spec.get('translate_model', DEFAULT_MODEL)
         device = spec.get('device', 'cuda')
+        max_length = spec.get('translate_max_length')
+        if max_length is not None:
+            max_length = int(max_length)
 
-        prompt, prompt_2 = norm_prompt_pair(spec.get('prompt'))
-        negative_prompt, negative_prompt_2 = norm_prompt_pair(
-            spec.get('negative_prompt'),
-            joiner=', '
-        )
+        # Read raw structured values first (may be str | list | dict)
+        raw_prompt = spec.get('prompt')
+        raw_negative = spec.get('negative_prompt')
 
         translated = False
 
@@ -129,11 +241,22 @@ class Prompt(NodeRef):
                 target_lang=ENG,
                 device=device
             )
-            prompt = _translate(tr, prompt)
-            prompt_2 = _translate(tr, prompt_2)
-            negative_prompt = _translate(tr, negative_prompt)
-            negative_prompt_2 = _translate(tr, negative_prompt_2)
+            raw_prompt = translate_prompt_value(
+                tr,
+                value=raw_prompt,
+                max_length=max_length
+            )
+            raw_negative = translate_prompt_value(
+                tr,
+                value=raw_negative,
+                max_length=max_length
+            )
+
             translated = True
+
+        # Normalize only after (optional) translation
+        prompt, prompt_2 = norm_prompt_pair(raw_prompt)
+        negative, negative_2 = norm_prompt_pair(raw_negative, joiner=', ')
 
         out: Dict[str, Any] = {
             'ok': True,
@@ -142,13 +265,14 @@ class Prompt(NodeRef):
             'translated': translated,
             'model': {'translate_model': model_id},
             'prompt': prompt,
-            'negative_prompt': negative_prompt,
+            'negative_prompt': negative,
+            **({} if max_length is None else {'translate_max_length': max_length}),
         }
 
         if prompt_2:
             out['prompt_2'] = prompt_2
-        if negative_prompt_2:
-            out['negative_prompt_2'] = negative_prompt_2
+        if negative_2:
+            out['negative_prompt_2'] = negative_2
 
         out_path = make_node_output_path(
             out_dir=Path(output_dir),

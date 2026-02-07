@@ -1,7 +1,20 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, TypeAlias, TypedDict, Union
 
 from stability.cache.models import *
 from stability.dag import AttachmentSink, NodeRef
+
+
+class PromptDict(TypedDict, total=False):
+    content: Union[str, List[str]]
+    style: Union[str, List[str]]
+
+
+PromptValue: TypeAlias = Union[
+    str,
+    List[str],
+    PromptDict,
+    None,
+]
 
 
 def norm_prompt(value: Any, *, joiner: str = '\n') -> str:
@@ -28,7 +41,7 @@ def norm_prompt(value: Any, *, joiner: str = '\n') -> str:
         f'Prompt must be str or list[str], got {type(value).__name__}')
 
 
-def norm_prompt_pair(value: Any, *, joiner: str = '\n') -> Tuple[str, str]:
+def norm_prompt_pair(value: PromptValue, *, joiner: str = '\n') -> Tuple[str, str]:
     """
     Normalize a prompt that can be:
       - str
