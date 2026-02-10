@@ -243,7 +243,7 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
         )
 
         base = get_sdxl_base_pipe(
-            model_path=ctx.model.model_path,
+            model_ref=ctx.model.model_ref,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
             vae_id=ctx.model.vae_id,
@@ -345,7 +345,8 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             ip_adapter_specs=self.ip_adapter.specs,
             face_id_specs=self.face_id.specs,
             model_info={
-                'path': ctx.model.model_path,
+                'source': ctx.model.model_ref.source,
+                'ref': ctx.model.model_ref.ref,
                 **({'vae_id': ctx.model.vae_id} if ctx.model.vae_id is not None else {}),
                 'dtype': str(ctx.model.dtype).replace('torch.', ''),
                 'device': ctx.model.device,

@@ -1,4 +1,5 @@
 from .omnigen import OmniGen
-from .qwen import QwenImage
+from .qwen_image import QwenImage
+from .qwen_image_edit import QwenImageEdit
 
-__all__ = ['OmniGen', 'QwenImage']
+__all__ = ['OmniGen', 'QwenImage', 'QwenImageEdit']

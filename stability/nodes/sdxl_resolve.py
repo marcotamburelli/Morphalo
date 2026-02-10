@@ -1,17 +1,44 @@
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 import torch
 
 from stability.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                    resolve_seed, resolve_spec)
 
+ModelSource = Literal['single_file', 'pretrained_id']
+
+
+@dataclass(frozen=True)
+class ResolvedModelRef:
+    source: ModelSource
+    ref: str  # expanded path OR hf repo id
+
+
+def resolve_model_ref(model: dict) -> ResolvedModelRef:
+    model_id = model.get('id')
+    model_path = model.get('path')
+
+    if model_id and model_path:
+        raise ValueError(
+            "spec.model: choose only one of 'id' or 'path', not both"
+        )
+
+    if model_id:
+        return ResolvedModelRef(source='pretrained_id', ref=str(model_id))
+
+    if model_path:
+        return ResolvedModelRef(source='single_file', ref=os.path.expanduser(str(model_path)))
+
+    raise ValueError("spec.model: one of 'id' or 'path' is required")
+
 
 @dataclass(frozen=True)
 class ModelConfig:
     device: str
     dtype: torch.dtype
-    model_path: str
+    model_ref: ResolvedModelRef
     vae_id: Optional[str]
 
 
@@ -47,9 +74,7 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
     device = model.get('device', 'cuda')
     dtype = resolve_dtype(model.get('dtype', 'bf16'))
 
-    model_path = model.get('path')
-    if not model_path:
-        raise ValueError('spec.model.path is required')
+    model_ref = resolve_model_ref(model)
 
     vae_id = spec.get('vae', {}).get('id') if isinstance(
         spec.get('vae'),
@@ -59,7 +84,7 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
     model_conf = ModelConfig(
         device=device,
         dtype=dtype,
-        model_path=model_path,
+        model_ref=model_ref,
         vae_id=vae_id,
     )
 

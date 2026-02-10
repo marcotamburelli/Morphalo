@@ -4,11 +4,13 @@ from typing import Any, Optional, Tuple
 
 import torch
 from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
-                       OmniGenPipeline, StableDiffusionXLPipeline, T2IAdapter)
+                       OmniGenPipeline, QwenImageEditPipeline,
+                       StableDiffusionXLPipeline, T2IAdapter)
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
                           DPTImageProcessor, pipeline)
 
 from stability.cache import CacheKey, ModelCache
+from stability.nodes.sdxl_resolve import ResolvedModelRef
 
 
 def dtype_key(dtype: torch.dtype) -> str:
@@ -18,18 +20,17 @@ def dtype_key(dtype: torch.dtype) -> str:
 
 def get_sdxl_base_pipe(
     *,
-    model_path: str,
+    model_ref: ResolvedModelRef,
     device: str,
     dtype: torch.dtype,
     vae_id: Optional[str] = None,
 ) -> StableDiffusionXLPipeline:
-    model_ref = os.path.expanduser(model_path)
 
     # include vae_id in the cache key to avoid mismatches
     extra = f'vae={vae_id}' if vae_id else 'vae=<default>'
     key = CacheKey(
-        kind='sdxl_base_pipe',
-        ref=model_ref,
+        kind=f'sdxl_base_pipe:{model_ref.source}',
+        ref=model_ref.ref,
         device=device,
         dtype=dtype_key(dtype),
         extra=extra
@@ -45,11 +46,24 @@ def get_sdxl_base_pipe(
         dtype=dtype
     ) if vae_id else None
 
-    pipe = StableDiffusionXLPipeline.from_single_file(
-        model_ref,
-        torch_dtype=dtype,
-        **({'vae': vae} if vae is not None else {}),
-    ).to(device)
+    pipe_kwargs = {'torch_dtype': dtype}
+    if vae is not None:
+        pipe_kwargs['vae'] = vae
+
+    if model_ref.source == 'single_file':
+        pipe = StableDiffusionXLPipeline.from_single_file(
+            model_ref.ref,
+            **pipe_kwargs,
+        ).to(device)
+    elif model_ref.source == 'pretrained_id':
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            model_ref.ref,
+            **pipe_kwargs,
+        ).to(device)
+    else:
+        raise ValueError(
+            f"Invalid 'model_ref.source': {model_ref.source}"
+        )
 
     return ModelCache.put(key, pipe)
 
@@ -242,6 +256,7 @@ def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPip
 
     return ModelCache.put(key, omg)
 
+
 def get_qwen_image(
     *,
     model_id: str,
@@ -282,5 +297,43 @@ def get_qwen_image(
         torch_dtype=dtype,
         device_map=device_map,
     )
+
+    return ModelCache.put(key, pipe)
+
+
+def get_qwen_image_edit_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> QwenImageEditPipeline:
+    """
+    Load and cache a Qwen-Image-Edit Diffusers pipeline.
+    """
+    key = CacheKey(
+        kind='qwen_image_edit',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    # Prefer the concrete pipeline when available
+    # try:
+    pipe = QwenImageEditPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map=device_map,
+    )
+    # except Exception:
+    #     # Fallback for older/newer diffusers where the class name may differ
+    #     pipe = DiffusionPipeline.from_pretrained(
+    #         model_id,
+    #         torch_dtype=dtype,
+    #         device_map=device_map,
+    #     )
 
     return ModelCache.put(key, pipe)

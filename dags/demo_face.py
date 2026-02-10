@@ -12,10 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]  # dags/ -> root
 CONF = ROOT / 'node_conf'
 
 with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
-    components1 = FileImage(
-        id='style1_img',
-        path='~/images/woman_armor.png'
-    )
+    # components1 = FileImage(
+    #     id='style1_img',
+    #     path='~/images/woman_armor.png'
+    # )
     face = FaceIdEmbedImage(id='face_img', path='~/images/elven_woman.png')
     source = FileImage(id='source_img', path='~/images/warrior_anime.png')
 
@@ -39,13 +39,13 @@ with DAG('elven_warrior', out_dir=ROOT / 'outputs' / 'elven_warrior') as dag:
         key='canny',
     )
 
-    components1 >> img1.ip_adapter.add(
-        'h94/IP-Adapter',
-        subfolder='sdxl_models',
-        weight_name='ip-adapter_sdxl_vit-h.bin',
-        scale=0.7,
-        key='style'
-    )
+    # components1 >> img1.ip_adapter.add(
+    #     'h94/IP-Adapter',
+    #     subfolder='sdxl_models',
+    #     weight_name='ip-adapter_sdxl_vit-h.bin',
+    #     scale=0.7,
+    #     key='style'
+    # )
 
     out = Img2Img(
         id='out',
