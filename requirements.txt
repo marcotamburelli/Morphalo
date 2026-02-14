@@ -15,3 +15,5 @@ scikit-image
 timm
 insightface
 onnxruntime
+ultralytics
+segment-anything-py

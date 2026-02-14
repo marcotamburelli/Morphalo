@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 
@@ -113,3 +114,85 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
             gen=gen,
         )
     )
+
+
+def resolve_image_paths(
+    *,
+    node_id: str,
+    path: Optional[Union[str, Path, List[Union[str, Path]]]],
+    input: Optional[Dict[str, Dict]],
+    input_key: str = 'default',
+) -> List[Path]:
+    """
+    Resolve one or more image filesystem paths.
+
+    Resolution order:
+      1) If `path` is provided (str/Path or list), use it.
+      2) Else, read from upstream `input[input_key]` taking `image` or `path`.
+         The upstream value may be a single path or a list of paths.
+
+    Returns a list of resolved existing file paths.
+    """
+    def _as_list(v) -> List[Union[str, Path]]:
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        return [v]
+
+    # 1) explicit path(s)
+    srcs = _as_list(path)
+
+    # 2) upstream path(s)
+    if not srcs:
+        if not input or input_key not in input:
+            raise ValueError(
+                f"'{node_id}': missing input '{input_key}'. Provide `path=` or wire an upstream image.")
+        up = input[input_key] or {}
+        src = up.get('image') or up.get('path')
+        srcs = _as_list(src)
+
+    if not srcs:
+        up_keys = list((input or {}).get(
+            input_key, {}).keys()) if input else []
+        raise ValueError(
+            f"'{node_id}': no image paths found. Expected `path=` or upstream '{input_key}' with 'image'/'path'. "
+            f"Got keys={up_keys}"
+        )
+
+    # normalize + validate
+    out: List[Path] = []
+    for s in srcs:
+        if not isinstance(s, (str, Path)):
+            raise ValueError(
+                f"'{node_id}': invalid path element type: {type(s).__name__} (value={s!r})"
+            )
+        p = Path(str(s)).expanduser().resolve()
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"'{node_id}': file not found: {p}")
+        out.append(p)
+
+    return out
+
+
+def resolve_single_image_path(
+    *,
+    node_id: str,
+    path: Optional[Union[str, Path, List[Union[str, Path]]]],
+    input: Optional[Dict[str, Dict]],
+    input_key: str = 'default',
+) -> Path:
+    paths = resolve_image_paths(
+        node_id=node_id,
+        path=path,
+        input=input,
+        input_key=input_key,
+    )
+
+    if len(paths) != 1:
+        raise ValueError(
+            f"'{node_id}': expected exactly 1 input image, got {len(paths)}. "
+            "Provide a single `path` or wire a single upstream image into 'default'."
+        )
+
+    return paths[0]

@@ -1,13 +1,15 @@
 
-import os
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
 from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
                        OmniGenPipeline, QwenImageEditPipeline,
                        StableDiffusionXLPipeline, T2IAdapter)
+from insightface.app import FaceAnalysis
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
                           DPTImageProcessor, pipeline)
+from ultralytics import YOLO as YOLOModel
 
 from stability.cache import CacheKey, ModelCache
 from stability.nodes.sdxl_resolve import ResolvedModelRef
@@ -321,19 +323,150 @@ def get_qwen_image_edit_pipe(
     if cached is not None:
         return cached
 
-    # Prefer the concrete pipeline when available
-    # try:
     pipe = QwenImageEditPipeline.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map=device_map,
     )
-    # except Exception:
-    #     # Fallback for older/newer diffusers where the class name may differ
-    #     pipe = DiffusionPipeline.from_pretrained(
-    #         model_id,
-    #         torch_dtype=dtype,
-    #         device_map=device_map,
-    #     )
 
     return ModelCache.put(key, pipe)
+
+
+def get_yolo(*, model_name: str, device: str) -> YOLOModel:
+
+    key = CacheKey(
+        kind='yolo',
+        ref=model_name,
+        device=device,
+        dtype='na'
+    )
+
+    cached = ModelCache.get(key)
+
+    if cached is not None:
+        return cached
+
+    models_home = Path.home() / 'models'
+    model_path = models_home / 'yolo' / model_name
+
+    m = YOLOModel(model_path)
+
+    return ModelCache.put(key, m)
+
+
+def get_sam(
+    *,
+    checkpoint: str,
+    model_type: str,
+    device: str,
+) -> torch.nn.Module:
+    from segment_anything import sam_model_registry
+
+    key = CacheKey(
+        kind='sam',
+        ref=f'{model_type}:{checkpoint}',
+        device=device,
+        dtype='na'
+    )
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    sam = sam_model_registry[model_type](checkpoint=checkpoint)
+    sam.to(device=device)
+    sam.eval()
+
+    return ModelCache.put(key, sam)
+
+
+def get_insightface(
+    *,
+    model_name: str,
+    det_size: Tuple[int, int],
+    device: str,
+) -> FaceAnalysis:
+    key = CacheKey(
+        kind='insightface',
+        ref=f'{model_name}:{int(det_size[0])}x{int(det_size[1])}',
+        device=device,
+        dtype='na'
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    if isinstance(device, str) and device.startswith('cuda'):
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        # ctx_id: -1 for CPU, 0..N for GPU index
+        ctx_id = 0
+        if ':' in device:
+            try:
+                ctx_id = int(device.split(':', 1)[1])
+            except Exception:
+                ctx_id = 0
+    else:
+        providers = ['CPUExecutionProvider']
+        ctx_id = -1
+
+    app = FaceAnalysis(
+        name=model_name,
+        providers=providers
+    )
+    app.prepare(
+        ctx_id=ctx_id,
+        det_size=(int(det_size[0]), int(det_size[1]))
+    )
+
+    return ModelCache.put(key, app)
+
+
+def get_mediapipe_face_landmarker(
+    *,
+    model_asset_path: str,
+    device: str,
+):
+    """
+    Cached MediaPipe FaceLandmarker (Tasks API).
+
+    Note:
+    - Despite the historical function name, this loads a FaceLandmarker model
+      (e.g. face_landmarker.task). It's used to get face landmarks (and derive a
+      bbox from them), not FaceDetector.
+    - `device` is kept for cache-key consistency with the rest of the project.
+    """
+
+    from pathlib import Path
+
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+
+    model_path = Path(str(model_asset_path)).expanduser().resolve()
+    if not model_path.exists() or not model_path.is_file():
+        raise FileNotFoundError(f"MediaPipe model not found: {model_path}")
+
+    key = CacheKey(
+        kind="mediapipe_face_landmarker",
+        ref=str(model_path),
+        device=str(device),
+        dtype="na",
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_faces=1,
+        # Keep these off unless you explicitly need them:
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+    )
+
+    landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+    return ModelCache.put(key, landmarker)

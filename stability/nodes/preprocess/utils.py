@@ -15,6 +15,7 @@ def resize_long_side_rgb(rgb: np.ndarray, long_side: int) -> np.ndarray:
         return rgb
     nh, nw = int(round(h * scale)), int(round(w * scale))
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+
     return cv2.resize(rgb, (nw, nh), interpolation=interp)
 
 
@@ -42,4 +43,74 @@ def fit_to_target_rgb(
     x0 = (out_w - nw) // 2
     y0 = (out_h - nh) // 2
     canvas[y0:y0+nh, x0:x0+nw] = resized
+
     return canvas
+
+
+def postprocess_mask(
+    mask: np.ndarray,
+    *,
+    dilate_radius: int = 0,
+    close_radius: int = 0,
+    smoothing_radius: int = 0,
+) -> np.ndarray:
+    """
+    Post-process a binary/soft mask to make it suitable for inpainting and diffusion.
+
+    Steps (optional, in order):
+      1. Morphological closing (fills holes, connects thin gaps)
+      2. Dilation (expand mask outward)
+      3. Gaussian smoothing (soft edges)
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Input mask. Accepted formats:
+          - bool mask
+          - float mask 0..1
+          - uint8 mask 0..255
+
+    dilate_radius : int
+        Radius in pixels used to expand the mask outward.
+
+    close_radius : int
+        Radius in pixels used for morphological closing (fill holes).
+
+    smoothing_radius : int
+        Radius in pixels used for Gaussian blur (edge feathering).
+
+    Returns
+    -------
+    np.ndarray
+        Soft mask uint8 in range 0..255.
+    """
+
+    if mask.ndim != 2:
+        raise ValueError("Mask must be HxW")
+
+    # normalize to uint8 0..255
+    if mask.dtype == bool:
+        m = mask.astype(np.uint8) * 255
+    elif np.issubdtype(mask.dtype, np.floating):
+        m = np.clip(mask * 255, 0, 255).astype(np.uint8)
+    else:
+        m = mask.astype(np.uint8)
+
+    # --- closing (fills holes) ---
+    if close_radius > 0:
+        k = 2 * close_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+
+    # --- dilation (expand mask) ---
+    if dilate_radius > 0:
+        k = 2 * dilate_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        m = cv2.dilate(m, kernel, iterations=1)
+
+    # --- smoothing / feather ---
+    if smoothing_radius > 0:
+        k = 2 * smoothing_radius + 1
+        m = cv2.GaussianBlur(m, (k, k), sigmaX=0, sigmaY=0)
+
+    return np.clip(m, 0, 255).astype(np.uint8)

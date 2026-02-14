@@ -2,201 +2,197 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from PIL import Image
 
+from stability.cache.models import get_insightface
 from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
-from stability.nodes.common.config_resolve import resolve_spec
+from stability.nodes.common.config_resolve import resolve_dtype, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
+from stability.nodes.sdxl_resolve import resolve_image_paths
+
+
+@dataclass
+class Config:
+    device: str
+    model_name: str
+    det_size: Tuple[int, int]
+    agg: str
+    paired: bool
+    output_dtype: torch.dtype
+
+
+def _read_cfg(spec: dict, node_id: str) -> Config:
+    model = spec.get('model', {})
+    params = spec.get('params', {})
+
+    # Model
+    model_name = str(model.get('model_name', 'buffalo_l'))
+    device = str(model.get('device', 'cpu'))
+
+    det_size = model.get('det_size', (640, 640))
+    if isinstance(det_size, (list, tuple)) and len(det_size) == 2:
+        det_size = (int(det_size[0]), int(det_size[1]))
+    else:
+        raise ValueError(
+            f"'{node_id}': invalid det_size={det_size!r} (expected [w,h] or (w,h))")
+
+    # Params
+    agg = str(params.get('agg', 'mean'))
+    if agg not in ('mean', 'first'):
+        raise ValueError(
+            f"'{node_id}': invalid agg={agg!r} (expected 'mean' or 'first')")
+
+    paired = bool(params.get('paired', True))
+
+    output_dtype = resolve_dtype(params.get('output_dtype') or 'float16')
+
+    return Config(
+        device=device,
+        model_name=model_name,
+        det_size=det_size,
+        agg=agg,
+        paired=paired,
+        output_dtype=output_dtype,
+    )
 
 
 @dataclass
 class FaceIdEmbedImage(NodeRef):
     """
-    Extract and serialize FaceID embeddings from one or more reference images.
+    Extract and serialize FaceID identity embeddings from one or more reference images.
 
-    This preprocessing node loads one or more images, detects a face using
-    InsightFace, extracts normalized identity embeddings, optionally aggregates
-    them, and serializes the result in a tensor format compatible with
-    Diffusers IP-Adapter FaceID pipelines.
+    This preprocessing node resolves one or more input image paths (either from the
+    explicit ``path`` attribute or from the upstream ``input['default']`` payload),
+    detects faces using InsightFace, extracts normalized identity embeddings
+    (``normed_embedding``), optionally aggregates them, and saves the resulting
+    tensor to disk in a format compatible with Diffusers IP-Adapter FaceID pipelines.
 
-    The produced tensor can be directly consumed as
-    ``ip_adapter_image_embeds`` for FaceID, FaceID Plus, and FaceID PlusV2
-    adapters.
+    The saved tensor can be passed as ``ip_adapter_image_embeds`` for FaceID,
+    FaceID Plus, and FaceID PlusV2 adapters.
 
-    Notes
-    -----
-    - Only the first detected face per image is used.
-    - Face embeddings are extracted using InsightFace ``normed_embedding``,
-      which encodes identity information and is largely invariant to pose
-      and lighting.
-    - When ``paired=True``, the output tensor includes a zero "negative"
-      embedding followed by the positive embedding, matching the canonical
-      Hugging Face FaceID examples.
-    - The visual (CLIP-based) component required by FaceID Plus / PlusV2 is
-      *not* computed here; original image paths are forwarded for downstream
-      CLIP embedding injection.
+    Input resolution
+    ----------------
+    Image paths are resolved in the following order:
 
-    Parameters
-    ----------
-    path : str or pathlib.Path or list of (str or pathlib.Path)
-        Path(s) to one or more reference images containing a face.
-        If multiple images are provided, they are aggregated according
-        to ``agg``.
+    1) If ``path`` is provided:
+    - it may be a single path (str/Path) or a list of paths.
 
-    spec : dict or str or pathlib.Path, optional
-        Optional node specification. Only the ``device`` key is used here
-        (e.g. ``"cpu"`` or ``"cuda"``) to configure InsightFace providers.
+    2) Otherwise, the node reads the upstream default input:
+    - ``input['default']['image']`` or ``input['default']['path']``.
+    - the upstream value may be a single path or a list of paths.
 
-    model_name : str, default="buffalo_l"
-        InsightFace model identifier used for face detection and embedding
-        extraction.
+    Only filesystem paths are supported here (the node does not accept in-memory
+    arrays/tensors as inputs).
 
-    det_size : tuple of int, default=(640, 640)
-        Detection resolution passed to InsightFace. Larger values may improve
-        detection robustness at the cost of performance.
+    Face selection
+    --------------
+    If multiple faces are detected in an image, the node selects the largest face
+    (by bounding-box area) before computing the embedding.
 
-    agg : {"mean", "first"}, default="mean"
-        Aggregation strategy when multiple reference images are provided:
+    Aggregation
+    -----------
+    When multiple reference images are provided, embeddings are aggregated according
+    to ``params.agg``:
 
-        - ``"mean"``: average all extracted embeddings (recommended).
-        - ``"first"``: use only the first image.
+    - ``'mean'``: average embeddings across images (recommended).
+    - ``'first'``: use the first image only.
 
-    paired : bool, default=True
-        Whether to produce paired embeddings in the format
-        ``[negative, positive]``. When enabled, the output tensor has
-        shape ``(2, 1, D)`` and is suitable for FaceID adapters expecting
-        explicit negative conditioning.
+    Paired output
+    -------------
+    If ``params.paired`` is true, the output tensor contains a zero "negative"
+    embedding followed by the positive embedding, matching common Hugging Face
+    FaceID examples:
 
-    output_dtype : {"float16", "float32"}, default="float16"
-        Data type used when saving the embedding tensor to disk.
+    - paired:  ``(2, 1, D)``  where index 0 is negative, index 1 is positive
+    - unpaired: ``(1, 1, D)``
 
-    Attributes
-    ----------
-    None
+    Configuration (spec)
+    --------------------
+    This node is configured exclusively via ``spec`` (inline dict or resolved spec
+    file). Expected keys:
+
+    - ``model`` (dict):
+        - ``model_name`` (str): InsightFace model name (default ``'buffalo_l'``).
+        - ``det_size`` (list[int,int] | tuple[int,int]): detection resolution
+          passed to InsightFace ``prepare`` (default ``(640, 640)``).
+        - ``device`` (str):
+          Device selector used to configure InsightFace providers (e.g. ``'cpu'``,
+          ``'cuda'``, ``'cuda:0'``). Actual provider initialization is handled by
+          the global model cache.
+
+    - ``params`` (dict):
+        - ``agg`` (str): ``'mean'`` or ``'first'`` (default ``'mean'``).
+        - ``paired`` (bool): whether to emit paired embeddings (default ``True``).
+        - ``output_dtype`` (str): dtype string resolved by ``resolve_dtype``
+        (e.g. ``'float16'``, ``'float32'``, ``'bf16'``). Default ``'float16'``.
+
+    Caching
+    -------
+    InsightFace ``FaceAnalysis`` is obtained via ``get_insightface(...)`` and is
+    cached by (model_name, device, det_size). Only the per-image detection call is
+    performed per run.
 
     Returns
     -------
-    dict
-        Output dictionary with the following keys:
+    dict with keys:
 
-        - ``ok`` : bool  
-          Always ``True`` if execution succeeds.
+    - ``ok`` (bool): True if execution succeeds.
+    - ``node`` (str): operator name.
+    - ``id`` (str): node identifier.
+    - ``model`` (dict): resolved model settings (model_name, device, det_size).
+    - ``embeds`` (str): path to the saved ``.pt`` tensor.
+    - ``image`` (str | list[str]): original input image path(s).
+    - ``n_images`` (int): number of processed images.
+    - ``agg`` (str): aggregation strategy used.
+    - ``paired`` (bool): paired output flag.
+    - ``shape`` (list[int]): saved tensor shape.
+    - ``dtype`` (str): saved tensor dtype (torch dtype name without 'torch.').
+    - ``metadata`` (str): path to the JSON sidecar.
 
-        - ``node`` : str  
-          Node operator name.
-
-        - ``id`` : str  
-          Node identifier.
-
-        - ``embeds`` : str  
-          Path to the saved ``.pt`` file containing the FaceID embeddings.
-
-        - ``image`` : str or list of str  
-          Original image path(s), forwarded for downstream CLIP-based
-          FaceID Plus / PlusV2 processing.
-
-        - ``n_images`` : int  
-          Number of input images processed.
-
-        - ``agg`` : str  
-          Aggregation strategy used.
-
-        - ``paired`` : bool  
-          Whether paired embeddings were produced.
-
-        - ``model`` : str  
-          InsightFace model name.
-
-        - ``shape`` : list of int  
-          Shape of the saved tensor, typically:
-
-              - ``(2, 1, D)`` if ``paired=True``
-              - ``(1, 1, D)`` if ``paired=False``
-
-        - ``dtype`` : str  
-          Torch dtype of the saved tensor.
-
-    Tensor Shape Conventions
-    ------------------------
-    The saved embedding tensor follows the convention expected by Diffusers:
-
-    - Paired embeddings:
-        ``(2, N, D)``
-        where index 0 is the negative embedding and index 1 is the positive one.
-
-    - Unpaired embeddings:
-        ``(1, N, D)``
-
-    In this node, after aggregation, ``N`` is typically ``1``.
-
-    See Also
-    --------
-    diffusers.loaders.IPAdapterMixin
-    insightface.app.FaceAnalysis
+    Notes
+    -----
+    - The visual (CLIP-based) component used by FaceID Plus / PlusV2 is not computed
+    here; image paths are forwarded for downstream CLIP embedding injection.
+    - ``det_size`` controls the resolution used during face detection (not the
+    embedding dimensionality). Larger values may improve detection robustness but
+    cost performance.
     """
 
-    path: Union[str, Path, List[Union[str, Path]]]
+    path: Union[str, Path, List[Union[str, Path]]] = None
     spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
 
-    # insightface settings
-    model_name: str = "buffalo_l"
-    det_size: tuple[int, int] = (640, 640)
-
-    # aggregation across multiple images: "mean" or "first"
-    agg: str = "mean"
-
-    # create paired embeds (neg + pos) as in HF examples
-    paired: bool = True
-
-    # output dtype for saved tensor
-    output_dtype: str = "float16"  # "float16" | "float32"
-
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        spec = resolve_spec(self.spec)
-        device = spec.get("device", "cpu")
-
         # Local imports to avoid hard dependency if node unused
         import cv2
-        from insightface.app import FaceAnalysis
 
-        # normalize paths
-        if not isinstance(self.path, list):
-            paths = [self.path]
-        else:
-            paths = self.path
+        spec = resolve_spec(self.spec)
 
-        paths = [Path(str(p)).expanduser().resolve() for p in paths]
-        for p in paths:
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"FaceIdEmbedImage node '{self.id}': file not found: {p}"
-                )
-            if not p.is_file():
-                raise FileNotFoundError(
-                    f"FaceIdEmbedImage node '{self.id}': not a file: {p}"
-                )
+        node_id = self.id
+        cfg = _read_cfg(spec, node_id=node_id)
 
-        if isinstance(device, str) and device.startswith("cuda"):
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            providers = ["CPUExecutionProvider"]
+        paths = paths = resolve_image_paths(
+            node_id=self.id,
+            path=self.path,
+            input=input
+        )
 
-        # setup insightface
-        app = FaceAnalysis(name=self.model_name, providers=providers)
-        # For CPU providers, ctx_id should be -1; for CUDA it's typically 0.
-        ctx_id = 0 if ("CUDAExecutionProvider" in providers) else -1
-        app.prepare(ctx_id=ctx_id, det_size=self.det_size)
+        app = get_insightface(
+            model_name=cfg.model_name,
+            det_size=cfg.det_size,
+            device=cfg.device,
+        )
 
         embs: List[torch.Tensor] = []
 
         for p in paths:
-            pil = Image.open(p).convert("RGB")
-            rgb = np.asarray(pil)
+            with Image.open(p) as pil:
+                rgb = np.asarray(pil.convert('RGB'))
+
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
             faces = app.get(bgr)
@@ -205,17 +201,15 @@ class FaceIdEmbedImage(NodeRef):
                     f"FaceIdEmbedImage node '{self.id}': no face detected in {p}"
                 )
 
-            # normed_embedding: np.ndarray shape (D,)
-            e = torch.from_numpy(faces[0].normed_embedding).to(torch.float32)
+            face = max(
+                faces,
+                key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+            )
+            e = torch.from_numpy(face.normed_embedding).to(torch.float32)
             embs.append(e)
 
-        if self.agg not in ("mean", "first"):
-            raise ValueError(
-                f"FaceIdEmbedImage node '{self.id}': invalid agg={self.agg!r} (use 'mean' or 'first')"
-            )
-
         # Aggregate into a single positive embedding vector (D,)
-        if self.agg == "first" or len(embs) == 1:
+        if cfg.agg == 'first' or len(embs) == 1:
             pos_vec = embs[0]
         else:
             pos_vec = torch.stack(embs, dim=0).mean(dim=0)
@@ -224,21 +218,13 @@ class FaceIdEmbedImage(NodeRef):
         # (batch_like_dim=1, n_refs=1, embed_dim=D)
         pos = pos_vec.view(1, 1, -1)  # (1, 1, D)
 
-        if self.paired:
+        if cfg.paired:
             neg = torch.zeros_like(pos)        # (1, 1, D)
             id_embeds = torch.cat([neg, pos], dim=0)  # (2, 1, D)
         else:
             id_embeds = pos  # (1, 1, D)
 
-        # dtype
-        if self.output_dtype == "float16":
-            id_embeds = id_embeds.to(torch.float16)
-        elif self.output_dtype == "float32":
-            id_embeds = id_embeds.to(torch.float32)
-        else:
-            raise ValueError(
-                f"FaceIdEmbedImage node '{self.id}': invalid output_dtype={self.output_dtype!r}"
-            )
+        id_embeds = id_embeds.to(cfg.output_dtype)
 
         out_path = make_node_output_path(
             out_dir=Path(output_dir),
@@ -249,17 +235,21 @@ class FaceIdEmbedImage(NodeRef):
         torch.save(id_embeds.cpu(), out_path)
 
         out = {
-            "ok": True,
-            "node": self.op,
-            "id": self.id,
-            "embeds": str(out_path),
-            "image": [str(p) for p in paths] if len(paths) > 1 else str(paths[0]),
-            "n_images": len(paths),
-            "agg": self.agg,
-            "paired": self.paired,
-            "model": self.model_name,
-            "shape": list(id_embeds.shape),
-            "dtype": str(id_embeds.dtype).replace("torch.", ""),
+            'ok': True,
+            'node': self.op,
+            'id': node_id,
+            'model': {
+                'model_name': cfg.model_name,
+                'device': cfg.device,
+                'det_size': list(cfg.det_size),
+            },
+            'embeds': str(out_path),
+            'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0]),
+            'n_images': len(paths),
+            'agg': cfg.agg,
+            'paired': cfg.paired,
+            'shape': list(id_embeds.shape),
+            'dtype': str(id_embeds.dtype).replace('torch.', ''),
         }
 
         meta_path = write_json_sidecar(out_path, out)
