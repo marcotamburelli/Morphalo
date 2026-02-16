@@ -63,6 +63,68 @@ class DAGRunner:
         self._executions = [Execution(edge=edge)
                             for edge in self.__dag.edges]
 
+    def _execute_downstream(self, node_to_execute: Dict[str, NodeRef], use_cache: bool = False):
+        prev_pending_ids: Optional[frozenset[str]] = None
+
+        while node_to_execute:
+            pending: Dict[str, NodeRef] = {}
+            next_to_execute: Dict[str, NodeRef] = {}
+
+            for node in node_to_execute.values():
+                source_executions = [
+                    execution for execution in self._executions
+                    if execution.edge.node_to == node.id
+                ]
+
+                is_pending = False
+                has_next = False
+
+                # Fill executions from memory or cache
+                for execution in source_executions:
+                    output = execution.output
+                    if use_cache and output is None:
+                        output = load_latest_output(
+                            out_dir=self.__dag.out_dir,
+                            node_id=execution.edge.node_from
+                        )
+
+                    if output is None:
+                        is_pending = True
+                        break
+                    execution.output = output
+
+                if is_pending:
+                    pending[node.id] = node
+                    continue
+
+                input = {
+                    execution.edge.input_id: execution.output
+                    for execution in source_executions
+                }
+
+                out = node.run(self.__dag.out_dir, input=input)
+                if not out:
+                    raise DagValidationError(f"No output for node '{node.id}'")
+
+                for execution in self._executions:
+                    if execution.edge.node_from == node.id:
+                        execution.output = out
+                        has_next = True
+                        # enqueue downstream
+                        for n in self.__dag.nodes:
+                            if n.id == execution.edge.node_to and n.id not in node_to_execute:
+                                next_to_execute[n.id] = n
+
+            pending_ids = frozenset(pending.keys())
+            # Check to avoid potential loops (TODO Ensure it is really needed)
+            if not has_next and pending_ids and pending_ids == prev_pending_ids:
+                raise RuntimeError(
+                    f"Execution stalled. Missing cached upstream outputs for: {sorted(pending_ids)}"
+                )
+            prev_pending_ids = pending_ids
+
+            node_to_execute = {**pending, **next_to_execute}
+
     def run(self):
         """
         Executes the DAG.
@@ -109,41 +171,7 @@ class DAGRunner:
             node.id: node for node in self.__dag.nodes if
             all(edge.node_to != node.id for edge in self.__dag.edges)
         }
-
-        while node_to_execute:
-            pending: Dict[str, NodeRef] = {}
-            next_to_execute: Dict[str, NodeRef] = {}
-
-            for node in node_to_execute.values():
-                source_executions = [
-                    execution for execution in self._executions if execution.edge.node_to == node.id
-                ]
-
-                if any(e.output is None for e in source_executions):
-                    pending = {**pending, node.id: node}
-                else:
-                    input = {
-                        execution.edge.input_id: execution.output for execution in source_executions
-                    }
-                    out = node.run(self.__dag.out_dir, input=input)
-
-                    if not out:
-                        raise DagValidationError(
-                            f"No output for node '{node.id}'"
-                        )
-
-                    for execution in self._executions:
-                        if execution.edge.node_from == node.id:
-                            execution.output = out
-                            next_to_execute = {
-                                **next_to_execute,
-                                **{
-                                    n.id: n for n in self.__dag.nodes
-                                    if n.id == execution.edge.node_to and n.id not in node_to_execute
-                                }
-                            }
-
-            node_to_execute = {**pending, **next_to_execute}
+        self._execute_downstream(node_to_execute)
 
     def run_node(self, target_id: str, force_upstream: bool = False):
         """
@@ -240,7 +268,8 @@ class DAGRunner:
             stack.add(node_id)
 
             upstream_executions = [
-                e for e in self._executions if e.edge.node_to == node_id]
+                e for e in self._executions if e.edge.node_to == node_id
+            ]
 
             # populate upstream outputs
             for ex in upstream_executions:
@@ -256,3 +285,109 @@ class DAGRunner:
             stack.remove(node_id)
 
         _run(target_id)
+
+    def run_node_downstream(self, target_id: str, force_upstream: bool = False):
+        """
+        Execute a node and re-evaluate the downstream subgraph rooted at that node.
+
+        This method performs a partial DAG execution starting from ``target_id`` by
+        computing the set of nodes reachable downstream (the *downstream closure*)
+        and executing all nodes in that subgraph in dependency order.
+
+        Execution is side-effect based: node outputs are expected to be materialized
+        to disk (JSON sidecars), and upstream inputs for nodes can be resolved either
+        from in-memory propagated outputs (within this run) or from cached outputs on
+        disk, as implemented by :meth:`_execute_downstream`.
+
+        The method supports two modes:
+
+        - ``force_upstream=False`` (default):
+        Only nodes in the downstream closure of ``target_id`` are eligible for
+        execution. Any *lateral* dependency (an upstream node outside the closure)
+        must already have a cached output available on disk; otherwise execution
+        will stall or fail when inputs cannot be resolved.
+
+        - ``force_upstream=True``:
+        In addition to the downstream closure, the method expands the execution set
+        with upstream dependencies of the closure that do not have cached outputs.
+        This make-like behavior materializes missing prerequisites so that the
+        downstream re-execution can proceed.
+
+        Parameters
+        ----------
+        target_id : str
+            Identifier of the node that defines the root of the downstream subgraph
+            to re-execute.
+        force_upstream : bool, optional
+            If ``True``, include in the execution set any upstream dependencies
+            of the downstream closure that are missing cached outputs on disk.
+            If ``False``, dependencies outside the downstream closure are expected
+            to be already cached.
+
+        Raises
+        ------
+        DagValidationError
+            If the DAG is invalid (e.g., cyclic, invalid edges) or if a node produces
+            no output during execution.
+        RuntimeError
+            If execution cannot make progress because required inputs cannot be
+            resolved (e.g., missing cached outputs for lateral dependencies when
+            ``force_upstream`` is ``False``).
+
+        Notes
+        -----
+        - The DAG is validated before any execution.
+        - The downstream closure is computed via a DFS/BFS over the adjacency list
+        built from DAG edges.
+        - Cached status is determined by the presence of a latest JSON artifact
+        retrievable via :func:`load_latest_output`.
+        - When ``force_upstream`` is enabled, only *uncached* upstream nodes are
+        added; cached upstream nodes remain external and will be read from disk
+        as needed.
+        - This method does not return a value; it relies on filesystem side effects
+        and in-memory propagation through :meth:`_execute_downstream`.
+        """
+        validate_dag(self.__dag)
+
+        # building adjacency lists
+        down: dict[str, list[str]] = {}
+        up: dict[str, list[str]] = {}
+        for e in self.__dag.edges:
+            down.setdefault(e.node_from, []).append(e.node_to)
+            up.setdefault(e.node_to, []).append(e.node_from)
+
+        down_closure = {target_id}
+
+        stack = list(down.get(target_id, []))
+
+        while stack:
+            n = stack.pop()
+
+            if n in down_closure:
+                continue
+
+            down_closure.add(n)
+            stack.extend(down.get(n, []))
+
+        R = set(down_closure)
+
+        if force_upstream:
+            cached = {
+                n.id for n in self.__dag.nodes
+                if load_latest_output(self.__dag.out_dir, n.id) is not None
+            }
+
+            # expand with uncached upstream
+            q = list(down_closure)
+            while q:
+                r = q.pop()
+                for u in up.get(r, []):
+                    if u in cached or u in R:
+                        continue
+                    R.add(u)
+                    q.append(u)
+
+        node_to_execute = {
+            n.id: n for n in self.__dag.nodes if n.id in R
+        }
+        self._execute_downstream(node_to_execute, use_cache=True)

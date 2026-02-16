@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import numpy as np
 from PIL import Image
@@ -15,11 +15,7 @@ from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.preprocess.utils import postprocess_mask
 from stability.nodes.sdxl_resolve import resolve_single_image_path
 
-"""
-Note: per far funzionare bene il crop della testa bisogna prendere il crop del soggetto e ritagliare solo un intorno sufficentemente ampio della faccia.
-
-problema: il crop non prende l'immagine ripulita dal contorno, ma crean una immgine nel box che ha preso.
-"""
+CropMode = Literal['bbox', 'trim', 'full_frame']
 
 
 @dataclass
@@ -29,6 +25,7 @@ class Config:
     sam_checkpoint: str
     sam_model_type: Optional[str]
     mode: str
+    crop_mode: CropMode
     conf: float
     box_margin: float
     multimask: bool
@@ -59,6 +56,14 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     mode = str(params.get('mode', 'default'))
     if mode not in ('default', 'mask', 'negative-mask'):
         raise ValueError(f"'{node_id}': Invalid mode={mode!r}")
+
+    # It should apply only when mode='default'
+    crop_mode = str(params.get('crop_mode', 'trim'))
+    if crop_mode not in ('bbox', 'trim', 'full_frame'):
+        raise ValueError(
+            f"'{node_id}': invalid crop_mode={crop_mode!r} "
+            "(expected 'bbox', 'trim', or 'full_frame')"
+        )
 
     conf = float(params.get('conf', 0.35))
     box_margin = float(params.get('box_margin', 0.12))
@@ -103,6 +108,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         sam_checkpoint=str(sam_checkpoint),
         sam_model_type=None if sam_model_type is None else str(sam_model_type),
         mode=mode,
+        crop_mode=crop_mode,
         conf=conf,
         box_margin=box_margin,
         multimask=multimask,
@@ -297,109 +303,164 @@ def _infer_sam_model_type(ckpt: Path, sam_model_type: Optional[str]) -> str:
 @dataclass
 class SubjectCrop(NodeRef):
     """
-    Subject-aware cropper and mask generator using YOLO, MediaPipe and
-    Segment Anything (SAM).
+    Subject-aware cutout and inpaint-mask generator using YOLO / MediaPipe / SAM.
 
-    This node extracts either a full person, a face, or a head region from an
-    input image and optionally produces a corresponding segmentation mask.
+    ``SubjectCrop`` detects a region of interest (person / face / head) and produces
+    either:
 
-    The pipeline combines:
+    - an RGBA cutout (``mode='default'``), or
+    - a full-frame inpaint mask aligned to the input image (``mode='mask'`` or
+      ``mode='negative-mask'``).
 
-    - YOLO (COCO class 0) for person bounding-box detection
-    - MediaPipe Face Landmarker for face localization
-    - Segment Anything (SAM) for box-guided segmentation
+    The node is intended to support workflows such as:
 
-    Depending on the selected ``target``, the workflow differs:
+    - extracting subjects for compositing (e.g. with ``ImageStack``),
+    - producing robust inpaint masks for SDXL pipelines,
+    - extracting head regions (hair-friendly) for FaceID / IP-Adapter refinement,
+    - “refine a small face” by cropping → upscaling/refining → reinserting at the
+      original coordinates.
 
-    * ``target="person"``
-        - Detect largest person via YOLO
-        - Expand bounding box
-        - Segment using SAM
-        - Crop to person bounding box
+    Pipeline
+    --------
+    The node combines:
 
-    * ``target="face"``
-        - Detect face via MediaPipe landmarks
-        - Use face bounding box directly
-        - Segment using SAM inside that box
-        - Crop to face bounding box
+    - YOLO (COCO class 0) to locate the largest person when ``target`` is
+      ``'person'`` or ``'head'``.
+    - MediaPipe Face Landmarker to localize face landmarks when ``target`` is
+      ``'face'`` or ``'head'``.
+    - Segment Anything (SAM) to obtain a segmentation mask guided by a bounding box.
 
-    * ``target="head"``
-        - Detect person via YOLO
-        - Detect face via MediaPipe
-        - Build a square head bounding box centered on the face
-          (with upward bias to preserve hair)
-        - Segment full person via SAM
-        - Crop mask and image to head bounding box
+    Targets
+    -------
+    ``target='person'``
+        - YOLO finds the largest person bounding box.
+        - The box is optionally expanded by ``box_margin``.
+        - SAM segments inside that box.
 
-    The square head box is computed as::
+    ``target='face'``
+        - MediaPipe derives a face bounding box from landmarks.
+        - SAM segments using that face box.
 
-        radius = 0.75 * face_size * expansion
+    ``target='head'``
+        - YOLO finds the person box (used for SAM segmentation).
+        - MediaPipe derives the face box.
+        - A *square head crop box* is computed from the face box (hair-friendly)
+          using ``expansion`` and an upward bias.
+        - SAM is still run on the (expanded) person box for robustness, while the
+          final crop region is the derived head box.
 
-    and vertically shifted upward to prioritize hair coverage.
+    Head crop geometry
+    ------------------
+    Let ``face_size = max(face_w, face_h)`` from the landmark-derived face box.
+
+    The head crop box is defined as a square centered on the face, shifted upward
+    to preserve hair:
+
+    - vertical shift: ``cy -= 0.15 * face_size``
+    - radius: ``radius = 0.75 * face_size * expansion``
 
     Parameters
     ----------
     id : str, optional
-        Unique node identifier inside the DAG.
+        Node identifier within the DAG.
 
     path : str or Path, optional
-        Path to the input image. If omitted, the image is resolved from
-        upstream node input (``input["default"]["image"]`` or ``["path"]``).
+        Input image path. If omitted, the node resolves the upstream default input
+        (``input['default']['image']`` or ``input['default']['path']``).
 
     spec : dict or str or Path, optional
-        Node specification dictionary or configuration file.
+        Node specification (inline dict or path to a config file), resolved via
+        ``resolve_spec``.
 
         Expected structure:
 
         ``model`` : dict
             ``sam_checkpoint`` : str
-                Path to SAM checkpoint file.
-            ``sam_model_type`` : str, optional
-                One of ``{"vit_h", "vit_l", "vit_b"}``.
-                If omitted, inferred from checkpoint filename.
+                Path to the SAM checkpoint. Required.
+            ``sam_model_type`` : {'vit_h', 'vit_l', 'vit_b'}, optional
+                SAM backbone type. If omitted, inferred from the checkpoint filename.
+            ``device`` : str, optional
+                Inference device (e.g. ``'cuda'``, ``'cuda:0'``, ``'cpu'``).
+                Default: ``'cuda'``.
             ``yolo_model`` : str, optional
-                YOLO weights (required for ``"person"`` and ``"head"``).
+                YOLO weights. Required for ``target='person'`` and ``target='head'``.
             ``face_landmarker_task`` : str, optional
-                MediaPipe FaceLandmarker ``.task`` file
-                (required for ``"face"`` and ``"head"``).
-            ``device`` : str
-                Torch device (e.g. ``"cuda"``, ``"cuda:0"``, ``"cpu"``).
+                MediaPipe FaceLandmarker ``.task`` path. Required for
+                ``target='face'`` and ``target='head'``.
 
         ``params`` : dict
-            ``target`` : {"person", "face", "head"}
-                Region to extract.
-            ``mode`` : {"default", "mask", "negative-mask"}
-                Output format.
-            ``conf`` : float
-                YOLO confidence threshold.
-            ``box_margin`` : float
-                Expansion ratio for person bounding box.
-            ``expansion`` : float
-                Head expansion multiplier (for ``"head"``).
-                Values > 1 enlarge the square head region.
-            ``multimask`` : bool
-                Enable SAM multimask output.
-            ``dilate_radius`` : int
-                Mask dilation radius (mask modes only).
-            ``close_radius`` : int
-                Morphological closing radius (mask modes only).
-            ``smoothing_radius`` : int
-                Gaussian smoothing radius (mask modes only).
+            ``target`` : {'person', 'face', 'head'}, optional
+                Region to extract. Default: ``'person'``.
+
+            ``mode`` : {'default', 'mask', 'negative-mask'}, optional
+                Output type:
+                - ``'default'``: RGBA cutout.
+                - ``'mask'``: full-frame 8-bit mask (white = selected region).
+                - ``'negative-mask'``: inverted full-frame mask (white = background).
+                Default: ``'default'``.
+
+            ``crop_mode`` : {'bbox', 'trim', 'full_frame'}, optional
+                Applies only when ``mode='default'`` and controls *spatial layout*
+                of the RGBA cutout:
+
+                - ``'bbox'``:
+                    Output is the rectangular crop inside the selected bounding box,
+                    including the original background; alpha is fully opaque
+                    (255 everywhere).
+                    Use this when you want a classic “crop” suitable for further
+                    img2img without transparency.
+
+                - ``'trim'``:
+                    Output is the rectangular crop inside the bounding box, but alpha
+                    comes from SAM; background becomes transparent outside the mask.
+                    Use this for cutouts to be composited elsewhere.
+
+                - ``'full_frame'``:
+                    Same cutout as ``'trim'`` but placed back into a full-size RGBA
+                    canvas of the original image dimensions, preserving the original
+                    coordinates. This is ideal for downstream compositing nodes that
+                    expect full-frame alignment.
+
+                Default: ``'trim'``.
+
+            ``conf`` : float, optional
+                YOLO confidence threshold (only used when YOLO runs).
+                Typical range: 0.2–0.6. Default: 0.35.
+
+            ``box_margin`` : float, optional
+                Symmetric expansion ratio applied to the YOLO person bounding box
+                before SAM, expressed as a fraction of bbox size.
+                Typical range: 0.05–0.20. Default: 0.12.
+
+            ``multimask`` : bool, optional
+                If True, SAM returns multiple candidate masks and the node selects
+                one via a heuristic (bbox-center inclusion, reasonable coverage,
+                and SAM score). Default: True.
+
+            ``expansion`` : float, optional
+                Head square expansion multiplier for ``target='head'``.
+                Default: 1.0.
+
+            ``dilate_radius`` : int, optional
+                Mask dilation radius in pixels (mask modes only).
+                Useful to avoid edge artifacts in inpainting. Default: 0.
+
+            ``close_radius`` : int, optional
+                Morphological closing radius in pixels (mask modes only).
+                Fills small holes and gaps. Default: 0.
+
+            ``smoothing_radius`` : int, optional
+                Gaussian smoothing radius in pixels (mask modes only).
+                Produces softer mask edges. Default: 0.
 
         ``debug`` : dict
-            ``save_debug`` : bool
-                If True, saves an image with detected bounding box overlay.
+            ``save_debug`` : bool, optional
+                If True, saves a debug image with the SAM bbox overlay. Default: False.
 
-    Attributes
-    ----------
-    op : str
-        Operator identifier derived from the concrete node class name (e.g.
-        ``"img2img"``).
-
-    Output
+    Returns
     -------
     dict
-        Output metadata dictionary containing:
+        Output metadata dictionary (also written as a JSON sidecar) with:
 
         ``ok`` : bool
             Success flag.
@@ -407,36 +468,38 @@ class SubjectCrop(NodeRef):
             Operator name.
         ``id`` : str
             Node identifier.
+        ``input_image`` : str
+            Source image path.
+        ``mode`` : str
+            Output mode.
         ``image`` : str
-            Path to generated image or mask.
+            Output file path (RGBA cutout or mask).
         ``bbox_xyxy`` : list[int]
-            Person bounding box used for SAM.
+            Bounding box used to run SAM (typically person bbox; for face mode,
+            the face bbox).
+        ``crop`` : dict
+            Crop metadata useful for reinsertion/compositing:
+
+            ``anchor_xy`` : list[int]
+                Center of the *selected crop box* in absolute coordinates of the
+                original image.
+            ``bbox_size`` : list[int]
+                Width/height of the crop box in pixels: ``[b_width, b_height]``.
+            ``crop_mode`` : str
+                The resolved crop mode.
+
         ``metadata`` : str
-            Path to JSON sidecar.
-
-    Output Modes
-    ------------
-    ``"default"``
-        Saves an RGBA cutout. Alpha channel corresponds to the
-        SAM-derived mask cropped to the selected region.
-
-    ``"mask"``
-        Saves an 8-bit grayscale full-frame mask aligned to the
-        original image dimensions.
-
-    ``"negative-mask"``
-        Same as ``"mask"``, but inverted (white = background).
+            JSON sidecar path.
 
     Notes
     -----
-    - SAM segmentation is always performed using the person bounding box
-      (when available) to maximize robustness.
-    - The head region is computed geometrically from the detected face
-      and is not segmented independently.
-    - Mask outputs preserve original image spatial coordinates.
+    - Mask outputs are always full-frame and aligned to the original image size.
+    - For ``target='head'``, SAM segmentation uses the person box for robustness,
+      while the crop region is the derived head square.
     - Heavy models (YOLO, SAM) are retrieved via the global model cache.
-    - The JSON sidecar acts as a persistent cache; delete it if the
-      implementation or configuration changes.
+      The SAM predictor is created per-run because it stores per-image state.
+    - If you change code or spec and need fresh outputs, delete the existing
+      sidecar JSON to avoid reusing cached results.
     """
 
     # Either pass a path explicitly, or wire an upstream image into default input.
@@ -647,15 +710,37 @@ class SubjectCrop(NodeRef):
             ext='png',
         )
 
+        b_width = int(crop_x2 - crop_x1)
+        b_height = int(crop_y2 - crop_y1)
+        anchor_x = int((crop_x1 + crop_x2) // 2)
+        anchor_y = int((crop_y1 + crop_y2) // 2)
+
         if cfg.mode == 'default':
-            # RGB crop aligned with selected crop region (person / face / head)
             crop_rgb = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2, :]
 
-            # Alpha from mask (same spatial region)
-            alpha = crop_mask.astype(np.uint8) * 255
+            if cfg.crop_mode == 'bbox':
+                # background incluso → alpha pieno
+                alpha = np.full((b_height, b_width), 255, dtype=np.uint8)
+                crop_rgba = np.dstack([crop_rgb, alpha])
+                Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
-            rgba = np.dstack([crop_rgb, alpha])
-            Image.fromarray(rgba, mode='RGBA').save(out_path)
+            else:
+                # 'trim' e 'full_frame' → alpha dalla mask
+                alpha = (crop_mask.astype(np.uint8) * 255)
+                crop_rgba = np.dstack([crop_rgb, alpha])
+
+                if cfg.crop_mode == 'trim':
+                    Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
+
+                elif cfg.crop_mode == 'full_frame':
+                    full_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                    full_rgba[crop_y1:crop_y2, crop_x1:crop_x2, :] = crop_rgba
+                    Image.fromarray(full_rgba, mode='RGBA').save(out_path)
+
+                else:
+                    raise ValueError(
+                        f'{self.id}: invalid crop_mode={cfg.crop_mode!r}')
+
         else:
             # build full-frame mask (same size as source image)
             full_mask = np.zeros((h, w), dtype=np.uint8)
@@ -703,15 +788,21 @@ class SubjectCrop(NodeRef):
                 'device': cfg.device,
             },
             'params': {
-                'conf': float(cfg.conf),
-                'box_margin': float(cfg.box_margin),
-                'multimask': bool(cfg.multimask),
+                'target': cfg.target,
+                'mode': cfg.mode,
+                'crop_mode': cfg.crop_mode,
+                'conf': cfg.conf,
+                'box_margin': cfg.box_margin,
+                'multimask': cfg.multimask,
                 'dilate_radius': cfg.dilate_radius,
                 'close_radius': cfg.close_radius,
-                'target': cfg.target,
                 'expansion': cfg.expansion,
                 'smoothing_radius': cfg.smoothing_radius,
             },
+            'crop': {
+                'anchor_xy': [anchor_x, anchor_y],
+                'bbox_size': [b_width, b_height],
+            }
         }
         if dbg_path is not None:
             out['debug_bbox'] = str(dbg_path)
