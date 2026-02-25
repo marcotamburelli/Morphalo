@@ -24,7 +24,17 @@ ClipImgPath = Tuple[Union[str, List[str]], bool]
 
 @dataclass
 class ClipImg:
-    image: Union[Image.Image, List[Image.Image]]
+    """
+    Container for CLIP reference images used by FaceID Plus / PlusV2.
+
+    Notes
+    -----
+    We intentionally normalize `image` to a list of PIL images. This avoids
+    type-dependent branching and makes multi-reference semantics explicit.
+    Aggregation (e.g., mean of CLIP embeddings) should be implemented at the
+    injection site (runner / adapter), not here.
+    """
+    image: List[Image.Image]
     clip_strength: float = 1.0
     is_plusv2: bool = False
 
@@ -172,7 +182,7 @@ class FaceIdRegistry:
         self._specs.append(spec)
 
         return IpAdapterAttachmentSink(
-            id=f'face_id:{key}',
+            name=f'face_id:{key}',
             target=self._owner,
             input_id=f'face_id:{key}',
             key=key,
@@ -605,21 +615,36 @@ class FaceIdBundle:
             if p is None:
                 self._clip_images_per_slot.append(None)
                 continue
-            if isinstance(p[0], str):
-                # out.append((Image.open(p[0]).convert("RGB"), p[1]))
-                self._clip_images_per_slot.append(ClipImg(
-                    image=Image.open(p[0]).convert("RGB"),
-                    is_plusv2=p[1],
-                    clip_strength=spec.clip_strength,
-                ))
-            elif isinstance(p[0], list):
-                self._clip_images_per_slot.append(ClipImg(
-                    image=[Image.open(x).convert("RGB") for x in p[0]],
-                    is_plusv2=p[1],
-                    clip_strength=spec.clip_strength,
-                ))
+
+            # `p` is expected to be a pair like:
+            #   (path: str | list[str], is_plusv2: bool)
+            # Normalize to list[str] -> list[PIL.Image].
+            paths = p[0]
+            if isinstance(paths, str):
+                paths_list = [paths]
+            elif isinstance(paths, list):
+                if not paths:
+                    raise ValueError(
+                        'Invalid FaceID CLIP image entry: empty path list.'
+                    )
+                if not all(isinstance(x, str) for x in paths):
+                    bad = {type(x) for x in paths if not isinstance(x, str)}
+                    raise TypeError(
+                        'Invalid FaceID CLIP image entry: expected list[str]. '
+                        f'Found non-str elements of types: {sorted([t.__name__ for t in bad])}'
+                    )
+                paths_list = paths
             else:
-                raise TypeError(f"Invalid clip image entry: {type(p)}")
+                raise TypeError(
+                    'Invalid FaceID CLIP image entry: expected str or list[str], '
+                    f'got {type(paths)}'
+                )
+
+            self._clip_images_per_slot.append(ClipImg(
+                image=[Image.open(x).convert('RGB') for x in paths_list],
+                is_plusv2=p[1],
+                clip_strength=spec.clip_strength,
+            ))
 
         return self._clip_images_per_slot
 

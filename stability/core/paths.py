@@ -69,7 +69,7 @@ def make_node_output_path(
 _TS_RE = re.compile(r'^(?P<ts>\d{4}-\d{2}-\d{2}_\d{6})')
 
 
-def load_latest_output(*, out_dir: Path, node_id: str) -> Optional[Dict[str, Any]]:
+def load_latest_output(out_dir: Path, node_id: str) -> Optional[Dict[str, Any]]:
     """
     Load the most recent node output JSON from `out_dir/node_id`.
 

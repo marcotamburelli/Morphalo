@@ -3,6 +3,7 @@ from .file_image import FileImage
 from .img2img import Img2Img
 from .inpaint import Inpaint
 from .prompt import Prompt
+from .tap import Tap
 from .txt2img import Txt2Img
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     'Img2Img',
     'Inpaint',
     'Prompt',
+    'Tap',
     'Txt2Img',
 ]

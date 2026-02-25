@@ -111,7 +111,7 @@ class OmniGenImageRegistry:
         self._specs.append(OmniGenImageSpec(key=key))
 
         return AttachmentSink(
-            id=f'omnigen:image:{key}',
+            name=f'omnigen:image:{key}',
             target=self._owner,
             input_id=f'omnigen:image:{key}',
         )

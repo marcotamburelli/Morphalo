@@ -136,7 +136,7 @@ class PromptRegistry:
             sink_id = f'sink:prompt:{self._owner.id}:{self._counter}'
 
         return AttachmentSink(
-            id=sink_id,
+            name=sink_id,
             target=self._owner,
             input_id=PromptRegistry.INPUT_ID
         )

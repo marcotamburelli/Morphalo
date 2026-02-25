@@ -11,7 +11,7 @@ from PIL import Image
 from stability.cache.models import get_insightface
 from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
-from stability.nodes.common.config_resolve import resolve_dtype, resolve_spec
+from stability.nodes.common.config_resolve import SpecInput, resolve_dtype, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.sdxl_resolve import resolve_image_paths
 
@@ -164,7 +164,7 @@ class FaceIdEmbedImage(NodeRef):
     """
 
     path: Union[str, Path, List[Union[str, Path]]] = None
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # Local imports to avoid hard dependency if node unused
@@ -175,7 +175,7 @@ class FaceIdEmbedImage(NodeRef):
         node_id = self.id
         cfg = _read_cfg(spec, node_id=node_id)
 
-        paths = paths = resolve_image_paths(
+        paths = resolve_image_paths(
             node_id=self.id,
             path=self.path,
             input=input
@@ -212,7 +212,10 @@ class FaceIdEmbedImage(NodeRef):
         if cfg.agg == 'first' or len(embs) == 1:
             pos_vec = embs[0]
         else:
+            eps = 1e-8
+
             pos_vec = torch.stack(embs, dim=0).mean(dim=0)
+            pos_vec = pos_vec / (pos_vec.norm(p=2) + eps)
 
         # Normalize to 3D tensor: (1, N, D) where N=1 after aggregation
         # (batch_like_dim=1, n_refs=1, embed_dim=D)

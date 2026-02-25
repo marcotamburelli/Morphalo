@@ -17,3 +17,4 @@ insightface
 onnxruntime
 ultralytics
 segment-anything-py
+pytest

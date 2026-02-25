@@ -191,7 +191,7 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
         - This sink is required for successful execution of the ``Inpaint`` node.
         """
         return AttachmentSink(
-            id=f'inpaint_mask:{self.id}',
+            name=f'inpaint_mask:{self.id}',
             target=self,
             input_id=f'mask',
         )

@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from stability.core.paths import make_node_output_path
 from stability.dag import AttachmentSink, NodeRef
-from stability.nodes.common.config_resolve import resolve_spec
+from stability.nodes.common.config_resolve import SpecInput, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
 
 Pos = Union[Tuple[int, int], str]
@@ -23,6 +23,7 @@ class LayerSpec:
     resize: ResizeMode = None
     blend: BlendMode = 'alpha'
     feather: int = 0           # px gaussian blur on alpha
+    corner_radius: Optional[int] = None
 
 
 @dataclass
@@ -259,7 +260,7 @@ class ImageLayerAttachmentSink(AttachmentSink):
         """
 
         return AttachmentSink(
-            id=f'imagestack_transform:{self.target.id}:{self.idx}',
+            name=f'imagestack_transform:{self.target.id}:{self.idx}',
             target=self.target,
             input_id=f'transform:{self.idx}',
         )
@@ -444,7 +445,7 @@ class ImageStack(NodeRef):
     - The node is deterministic and contains no stochastic components.
     """
 
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
     _layers: Dict[int, LayerSpec] = field(
         default_factory=dict,
         init=False,
@@ -459,6 +460,7 @@ class ImageStack(NodeRef):
         resize: ResizeMode = None,
         blend: BlendMode = 'alpha',
         feather: int = 0,
+        corner_radius: Optional[int] = None,
     ) -> ImageLayerAttachmentSink:
         """
         Declare an input image layer.
@@ -539,6 +541,33 @@ class ImageStack(NodeRef):
 
             Default: ``0``.
 
+        corner_radius : int or None, optional
+            Corner rounding radius (in pixels) used when generating the
+            synthetic alpha mask for fully opaque layers (e.g. layers
+            originating from ``crop_mode='bbox'``).
+
+            This parameter only affects the fallback mask that is constructed
+            when the layer alpha channel is completely opaque. In that case,
+            a filled rectangle (optionally rounded) is created and then blurred
+            to produce a soft edge.
+
+            - ``None``:
+                Automatic mode. The corner radius is derived heuristically
+                from the ``feather`` radius to preserve backward-compatible
+                behavior.
+            - ``0``:
+                Disable corner rounding. A standard rectangle is used before
+                applying Gaussian blur.
+            - ``> 0``:
+                Explicit corner radius in pixels. The value is clamped at
+                runtime to avoid geometrically invalid rounding.
+
+            This parameter does not affect layers that already contain a
+            non-uniform alpha channel (e.g. segmentation masks). In those
+            cases, only Gaussian blur is applied to the existing alpha.
+
+            Default: ``None``.
+
         Returns
         -------
         AttachmentSink
@@ -615,11 +644,13 @@ class ImageStack(NodeRef):
             resize=resize,
             blend=blend,
             feather=int(feather),
+            corner_radius=corner_radius if corner_radius is None else int(
+                corner_radius),
         )
 
         return ImageLayerAttachmentSink(
             idx=idx,
-            id=f'imagestack_image:{self.id}:{idx}',
+            name=f'imagestack_image:{self.id}:{idx}',
             target=self,
             input_id=f'image:{idx}',
         )
@@ -655,7 +686,8 @@ class ImageStack(NodeRef):
             path = up.get('image') or up.get('path')
             if not path:
                 raise ValueError(
-                    f"{self.id}: upstream for idx={idx} must contain 'image' or 'path'")
+                    f"{self.id}: upstream for idx={idx} must contain 'image' or 'path'"
+                )
 
             with Image.open(path) as im:
                 layer = im.convert('RGBA')
@@ -717,15 +749,28 @@ class ImageStack(NodeRef):
                     x1, y1 = lw - inset - 1, lh - inset - 1
 
                     # Corner rounding radius (in pixels).
-                    # Heuristic: tie it to feather radius, but clamp to avoid over-rounding.
-                    corner = max(1, int(round(rad * 3)))
-                    corner = min(corner, max(1, (min(lw, lh) // 2) - 1))
+                    # - None: backward compatible heuristic based on feather radius
+                    # - 0: no rounding
+                    # - >0: explicit
+                    if layer_spec.corner_radius is None:
+                        corner = max(1, int(round(rad * 3)))
+                    else:
+                        corner = int(layer_spec.corner_radius)
+
+                    # Clamp to avoid impossible / over-rounding geometries
+                    max_corner = max(0, (min(lw, lh) // 2) - 1)
+                    if corner < 0:
+                        corner = 0
+                    if corner > max_corner:
+                        corner = max_corner
 
                     if (x1 - x0) > 1 and (y1 - y0) > 1:
                         # Prefer rounded corners so the gradient doesn't look "boxy".
-                        if hasattr(draw, 'rounded_rectangle'):
+                        # If corner == 0, draw a normal rectangle (no rounding).
+                        if corner > 0 and hasattr(draw, 'rounded_rectangle'):
                             draw.rounded_rectangle(
-                                [x0, y0, x1, y1], radius=corner, fill=255)
+                                [x0, y0, x1, y1], radius=corner, fill=255
+                            )
                         else:
                             # Pillow too old: fallback to normal rectangle.
                             draw.rectangle([x0, y0, x1, y1], fill=255)

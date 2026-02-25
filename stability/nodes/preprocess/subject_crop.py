@@ -10,7 +10,7 @@ from stability.cache.models import (get_mediapipe_face_landmarker, get_sam,
                                     get_yolo)
 from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
-from stability.nodes.common.config_resolve import resolve_spec
+from stability.nodes.common.config_resolve import SpecInput, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.preprocess.utils import postprocess_mask
 from stability.nodes.sdxl_resolve import resolve_single_image_path
@@ -506,7 +506,7 @@ class SubjectCrop(NodeRef):
     path: Optional[Union[str, Path]] = None
 
     # Optional node spec (device, etc.)
-    spec: Union[Dict[str, Any], str, Path] = field(default_factory=dict)
+    spec: SpecInput = field(default_factory=dict)
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # Local imports to avoid hard deps if node unused

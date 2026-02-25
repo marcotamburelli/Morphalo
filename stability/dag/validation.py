@@ -1,4 +1,6 @@
-from stability.dag import DAG
+from typing import List
+
+from stability.dag import DAG, Edge, NodeRef
 
 
 class DagValidationError(RuntimeError):

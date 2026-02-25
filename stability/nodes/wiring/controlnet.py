@@ -103,7 +103,7 @@ class ControlNetRegistry:
         ))
 
         return AttachmentSink(
-            id=f'controlnet:{key}',
+            name=f'controlnet:{key}',
             target=self._owner,
             input_id=f'controlnet:{key}',
         )

@@ -129,7 +129,7 @@ class ICLoRaRegistry:
         )
 
         return AttachmentSink(
-            id=f'ic_lora:{key}',
+            name=f'ic_lora:{key}',
             target=self._owner,
             input_id=f'ic_lora:{key}'
         )

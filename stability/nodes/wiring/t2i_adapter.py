@@ -52,7 +52,7 @@ class T2IAdapterRegistry:
         ))
 
         return AttachmentSink(
-            id=f't2i-adapter:{key}',
+            name=f't2i-adapter:{key}',
             target=self._owner,
             input_id=f't2i-adapter:{key}',
         )

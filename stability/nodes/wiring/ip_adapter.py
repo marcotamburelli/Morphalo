@@ -67,7 +67,7 @@ class IpAdapterAttachmentSink(AttachmentSink):
         In typical usage, an upstream source node (e.g. :class:`FileImage`) provides
         a list of mask images and ``idx`` refers to the position within that list::
 
-            masks = FileImage(id='masks', path=[mask0, mask1])
+            masks = FileImage(name='masks', path=[mask0, mask1])
             ip = node.ip_adapter.add(..., key='face')
 
             masks >> ip.mask_for(0)   # attaches mask0
@@ -87,7 +87,7 @@ class IpAdapterAttachmentSink(AttachmentSink):
         self.spec.has_mask = True
 
         return AttachmentSink(
-            id=f'ip_adapter_mask:{self.key}[{idx}]',
+            name=f'ip_adapter_mask:{self.key}[{idx}]',
             target=self.target,
             input_id=f'ip_adapter_mask:{self.key}[{idx}]',
         )
@@ -96,7 +96,7 @@ class IpAdapterAttachmentSink(AttachmentSink):
         self.spec.has_mask = True
 
         return AttachmentSink(
-            id=f'ip_adapter_mask:{self.key}',
+            name=f'ip_adapter_mask:{self.key}',
             target=self.target,
             input_id=f'ip_adapter_mask:{self.key}',
         )
@@ -259,7 +259,7 @@ class IpAdapterRegistry:
         self._specs.append(spec)
 
         return IpAdapterAttachmentSink(
-            id=f"ip_adapter:{key}",
+            name=f"ip_adapter:{key}",
             target=self._owner,
             input_id=f"ip_adapter:{key}",
             key=key,

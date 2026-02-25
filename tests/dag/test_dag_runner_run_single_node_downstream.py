@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+import pytest
+
+import stability.dag.runner as runner_mod
+from stability.dag import DAG
+from stability.dag.runner import Execution, SingleNodeRunner
+from tests.dag.nodes import MergeNode, PassNode, SourceNode
+
+
+@dataclass
+class CacheWritingSource(SourceNode):
+    """
+    Source node that writes its output into an in-memory cache.
+
+    This emulates a node persisting its outputs (e.g. JSON artifacts)
+    so that "cached" status can be controlled without filesystem I/O.
+    """
+
+    cache: Dict[str, Dict[str, Any]] = None
+
+    def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict[str, Any]:
+        out = super().run(output_dir, input=input)
+        assert self.cache is not None
+        self.cache[self.id] = out
+        return out
+
+
+def _build_executions(dag: DAG) -> list[Execution]:
+    """
+    Build one Execution record per DAG edge.
+    """
+    return [Execution(edge=e) for e in dag.edges]
+
+
+def _patch_load_latest_output(monkeypatch: pytest.MonkeyPatch, cache: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Monkeypatch runner.load_latest_output to use an in-memory cache.
+
+    The production code calls:
+        load_latest_output(out_dir=..., node_id=...)
+    so we mirror that signature.
+    """
+
+    def _fake_load_latest_output(out_dir: str, node_id: str) -> Optional[Dict[str, Any]]:
+        return cache.get(node_id)
+
+    monkeypatch.setattr(runner_mod, 'load_latest_output',
+                        _fake_load_latest_output)
+
+
+def test_run_downstream_executes_only_downstream_closure_and_pulls_uncached_upstream(tmp_path, monkeypatch):
+    """
+    Graph
+    -----
+    A -> B -> C
+    A -> D -> E
+
+    Target
+    ------
+    run_downstream(B, force_upstream=True)
+
+    Expected execution set R
+    ------------------------
+    Downstream closure of B is {B, C}.
+    With force_upstream=True and empty cache, upstream expansion should add A.
+
+    Therefore R should be {A, B, C} and NOT include {D, E}.
+
+    Assertions
+    ----------
+    - A, B, C run exactly once
+    - D, E are not executed
+    - B receives input from A (default)
+    - C receives input from B (default)
+    """
+    cache: Dict[str, Dict[str, Any]] = {}
+    _patch_load_latest_output(monkeypatch, cache)
+
+    with DAG('downstream_simple', out_dir=tmp_path) as dag:
+        a = CacheWritingSource(name='A', value=1, cache=cache)
+        b = PassNode(name='B')
+        c = PassNode(name='C')
+        d = PassNode(name='D')
+        e = PassNode(name='E')
+
+        a >> b >> c
+        a >> d >> e
+
+    runner = SingleNodeRunner(
+        node_id=b.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=True,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    runner.run_downstream()
+
+    assert a.calls == 1
+    assert b.calls == 1
+    assert c.calls == 1
+
+    assert d.calls == 0
+    assert e.calls == 0
+
+    assert b.last_input is not None
+    assert b.last_input['default']['value'] == 1
+    assert b.last_input['default']['from'] == a.id
+
+    assert c.last_input is not None
+    assert c.last_input['default']['value'] == 1
+    assert c.last_input['default']['from'] == b.id
+
+
+def test_run_downstream_intricate_graph_executes_correct_subgraph(tmp_path, monkeypatch):
+    """
+    Intricate graph with fan-in, attachment sinks, and side branches.
+
+    Graph
+    -----
+      S1 -> P1 -----
+                  \
+                   -> M -> E -> P3 -> P4
+                  /
+      S2 -> P2 --(attachment)
+
+    Side branches (must NOT execute when targeting P2)
+    --------------------------------------------------
+      S1 -> X1 -> X2
+      S2 -> Y1
+
+    Target
+    ------
+    run_downstream(P2, force_upstream=True)
+
+    Expected behavior
+    -----------------
+    Downstream closure of P2 is {P2, M, E, P3, P4}.
+    With force_upstream=True and empty cache, upstream expansion should include:
+      - S2 (upstream of P2)
+      - P1 and S1 (because M depends also on P1)
+
+    Therefore R should include: {S1, P1, S2, P2, M, E, P3, P4}
+    and exclude: {X1, X2, Y1}
+
+    Assertions
+    ----------
+    - All nodes in R run exactly once
+    - Side branch nodes do not run
+    - Merge node receives both 'default' and 'attachment'
+    - Merge output contains both values keyed by input_id
+    - Extract node converts merged payload into a standard 'value' payload
+    - P3 and P4 run and receive the propagated value
+    """
+    from tests.dag.nodes import ExtractNode
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    _patch_load_latest_output(monkeypatch, cache)
+
+    with DAG('downstream_intricate', out_dir=tmp_path) as dag:
+        s1 = CacheWritingSource(name='S1', value=10, cache=cache)
+        p1 = PassNode(name='P1')
+        s1 >> p1
+
+        s2 = CacheWritingSource(name='S2', value=20, cache=cache)
+        p2 = PassNode(name='P2')
+        s2 >> p2
+
+        m = MergeNode(name='M')
+        p1 >> m  # default input_id
+        p2 >> m.sink(name='P2_to_M', input_id='attachment')
+
+        # Adapter: MergeNode emits {'merged': ...}, PassNode expects {'value': ...}
+        e = ExtractNode(name='E', key='attachment')
+
+        p3 = PassNode(name='P3')
+        p4 = PassNode(name='P4')
+        m >> e >> p3 >> p4
+
+        # Side branches (should not execute)
+        x1 = PassNode(name='X1')
+        x2 = PassNode(name='X2')
+        s1 >> x1 >> x2
+
+        y1 = PassNode(name='Y1')
+        s2 >> y1
+
+    runner = SingleNodeRunner(
+        node_id=p2.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=True,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    runner.run_downstream()
+
+    # Nodes expected to execute
+    assert s1.calls == 1
+    assert p1.calls == 1
+    assert s2.calls == 1
+    assert p2.calls == 1
+    assert m.calls == 1
+    assert e.calls == 1
+    assert p3.calls == 1
+    assert p4.calls == 1
+
+    # Nodes expected NOT to execute
+    assert x1.calls == 0
+    assert x2.calls == 0
+    assert y1.calls == 0
+
+    # Merge correctness
+    assert m.last_input is not None
+    assert set(m.last_input.keys()) == {'default', 'attachment'}
+    assert m.last_input['default']['value'] == 10
+    assert m.last_input['attachment']['value'] == 20
+    assert m.outputs[-1]['merged'] == {'default': 10, 'attachment': 20}
+
+    # Extract correctness: pick the 'attachment' branch value (20)
+    assert e.last_input is not None
+    assert e

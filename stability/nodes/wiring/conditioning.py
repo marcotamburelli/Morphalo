@@ -1,3 +1,4 @@
+from typing import List, Optional, Sequence, Union
 
 import torch
 from diffusers import DiffusionPipeline
@@ -6,6 +7,80 @@ from PIL import Image
 
 from stability.nodes.wiring.face_id import FaceIdBundle
 from stability.nodes.wiring.ip_adapter import IpAdapterBundle
+
+
+def _as_image_list(x: Union[Image.Image, Sequence[Image.Image]]) -> List[Image.Image]:
+    """Normalize a slot image payload to a list of PIL images."""
+    if isinstance(x, Image.Image):
+        return [x]
+    return list(x)
+
+
+def _aggregate_slot_clip_embeds(
+    pipe,
+    *,
+    slot_index: int,
+    slot_images: Union[Image.Image, Sequence[Image.Image]],
+    base_images: List[Optional[Image.Image]],
+    device: torch.device,
+    num_images_per_prompt: int,
+    do_cfg: bool,
+) -> torch.Tensor:
+    """
+    Compute and aggregate CLIP embeds for a single FaceID Plus/PlusV2 slot.
+
+    This uses Diffusers `pipe.prepare_ip_adapter_image_embeds(...)` to ensure
+    correct preprocessing, CFG duplication, and num_images_per_prompt expansion.
+
+    Parameters
+    ----------
+    pipe
+        A diffusers pipeline instance that implements `prepare_ip_adapter_image_embeds`
+        and has FaceID Plus/PlusV2 adapters loaded.
+    slot_index
+        Index of the FaceID slot (aligned with adapter/projection layer order).
+    slot_images
+        One PIL image or a sequence of PIL images to be aggregated for this slot.
+    base_images
+        A list of images aligned with all slots, used as the baseline input to
+        `prepare_ip_adapter_image_embeds`. For the current slot, this function will
+        temporarily replace `base_images[slot_index]` with each reference image.
+    device
+        Torch device where embeddings should be placed.
+    num_images_per_prompt
+        Diffusers generation parameter (images per prompt).
+    do_cfg
+        Whether classifier-free guidance is enabled.
+
+    Returns
+    -------
+    torch.Tensor
+        Aggregated CLIP embeds for the slot, already multiplied by `strength`.
+        The returned tensor matches Diffusers batch expansion for CFG and
+        num_images_per_prompt.
+    """
+    imgs = _as_image_list(slot_images)
+    if len(imgs) == 1:
+        tmp = list(base_images)
+        tmp[slot_index] = imgs[0]
+        embeds = pipe.prepare_ip_adapter_image_embeds(
+            tmp, None, device, num_images_per_prompt, do_cfg
+        )
+        return embeds[slot_index]
+
+    # Accumulate per-reference embeds and average.
+    acc = None
+    for im in imgs:
+        tmp = list(base_images)
+        tmp[slot_index] = im
+        embeds = pipe.prepare_ip_adapter_image_embeds(
+            tmp, None, device, num_images_per_prompt, do_cfg
+        )
+        e = embeds[slot_index]
+        acc = e if acc is None else (acc + e)
+
+    out = acc / float(len(imgs))
+    return out
 
 
 def apply_ip_adapter(
@@ -116,27 +191,55 @@ def apply_faceid_clip(
 
     blank = Image.new("RGB", (224, 224), (0, 0, 0))
 
-    # Build per-adapter image list of length == n_layers.
-    # Even for non-clip slots we provide images to satisfy diffusers' length check.
-    # (Cost: extra encode; Benefit: perfect alignment + identical semantics to diffusers.)
-    ip_adapter_images: list = []
+    # Build a baseline image list of length == n_layers (ONE image per slot).
+    #
+    # IMPORTANT:
+    # Passing nested lists (list[list[PIL.Image]]) may trigger "multi-reference" code paths
+    # in diffusers and lead to shape drift / batch mismatches. We keep the diffusers call
+    # strictly on a flat list of images, and explicitly aggregate multi-image slots by
+    # averaging the resulting CLIP embeddings.
+    # Keep previous semantics; consider making this explicit later.
+    do_cfg = True
+
+    base_images: List[Image.Image] = []
     for j, entry in enumerate(entries):
         if entry is None:
-            ip_adapter_images.append([blank])
-        else:
-            images = entry.image
-            img_list = images if isinstance(images, list) else [images]
-            ip_adapter_images.append(img_list)
+            base_images.append(blank)
+            continue
 
-    # Compute embeds for ALL adapters in one call (diffusers requirement).
-    # This returns a list: one tensor per adapter layer, already expanded for CFG and num_images.
+        # ClipImg.image is normalized to List[Image.Image]
+        imgs = entry.image
+        if not imgs:
+            raise ValueError(f'FaceID CLIP slot {j} has an empty image list.')
+        base_images.append(imgs[0])
+
+    # Compute baseline embeds for ALL adapters in one call.
     clip_embeds_per_layer = pipe.prepare_ip_adapter_image_embeds(
-        ip_adapter_images,
+        base_images,
         None,
         device,
         num_images,
-        True,  # do_classifier_free_guidance; consistent with typical guidance_scale>1 usage
+        do_cfg,
     )
+
+    # Aggregate multi-image slots (Plus/PlusV2 refinement) by averaging CLIP embeds.
+    for j, entry in enumerate(entries):
+        if entry is None:
+            continue
+
+        imgs = entry.image
+        if len(imgs) <= 1:
+            continue
+
+        clip_embeds_per_layer[j] = _aggregate_slot_clip_embeds(
+            pipe,
+            slot_index=j,
+            slot_images=imgs,
+            base_images=base_images,
+            device=device,
+            num_images_per_prompt=num_images,
+            do_cfg=do_cfg,
+        )
 
     # Inject only where required (Plus/PlusV2)
     for j, entry in enumerate(entries):
