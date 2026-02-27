@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+from typing import Literal, Optional
+
 from stability.dag import NodeGroup
 from stability.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.preprocess import ImageStack, SubjectCrop
+
+FineRegion = Literal['face', 'eyes', 'left-eye', 'right-eye', 'head']
 
 
 def refine_face_group(
     name: str,
     *,
     refine_spec: SpecInput,
-    stack_spec: SpecInput,
+    stack_spec: SpecInput = {},
     face_id_scale: float,
     face_id_clip_strength: float = 1.0,
-    layer_position: str = 'center',
     layer_feather: int = 30,
     layer_corner_radius: int = 50,
 ) -> NodeGroup:
@@ -31,6 +34,9 @@ def refine_face_group(
         - path-based input (if wired/produced upstream)
         - direct path configuration (depending on FaceIdEmbedImage behavior)
 
+    - 'in_prompt' (Tap)
+        Prompt payload to feed into the internal Img2Img prompt sink.
+
     The group's single output node is the ImageStack ('merge'), so the group can
     be wired as a unit via `group >> downstream`.
 
@@ -46,8 +52,6 @@ def refine_face_group(
         IP-Adapter FaceID scale.
     face_id_clip_strength : float, optional
         FaceID CLIP conditioning strength.
-    layer_position : str, optional
-        Overlay position for the refined head layer.
     layer_feather : int, optional
         Feather applied when compositing the refined layer.
     layer_corner_radius : int, optional
@@ -66,6 +70,7 @@ def refine_face_group(
 
         img_node  >> group('in_image')
         face_node >> group('in_face_image')
+        prompt    >> g('in_prompt')
         group >> downstream
     """
 
@@ -74,6 +79,7 @@ def refine_face_group(
         # Ports (entry nodes)
         # -------------------
         tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt')
         face_embed = FaceIdEmbedImage(name='in_face_image')
 
         # -------------------
@@ -102,7 +108,7 @@ def refine_face_group(
         )
 
         face_id_sink = refine_face.face_id.add(
-            model_name='h94/IP-Adapter-FaceID',
+            model_id='h94/IP-Adapter-FaceID',
             weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
             scale=face_id_scale,
             clip_strength=face_id_clip_strength,
@@ -110,7 +116,7 @@ def refine_face_group(
         )
 
         stack = ImageStack(
-            name='merge',
+            name='out',
             spec=stack_spec,
         )
 
@@ -133,18 +139,19 @@ def refine_face_group(
         # 4) Overlay refined head using crop metadata
         layer1 = stack.image(
             1,
-            position=layer_position,
+            position='center',
             feather=layer_feather,
             corner_radius=layer_corner_radius,
         )
 
+        tap_prompt >> refine_face.prompt()
         refine_face >> layer1
 
         # Use crop metadata (anchor + bbox size) to place and scale the layer
         crop_face >> layer1.transform()
 
         # Expose ports by registering the entry nodes
-        g.register_ports(tap_image, face_embed)
+        g.register_ports(tap_image, face_embed, tap_prompt)
 
     return g
 
@@ -304,81 +311,104 @@ def fine_face_details_group(
     name: str,
     *,
     inpaint_spec: SpecInput,
-    face_id_scale: float,
+    face_id_scale: Optional[float] = None,
     face_id_clip_strength: float = 1.0,
+    region: FineRegion = 'face',
     mask_dilate_radius: int = -5,
     mask_close_radius: int = 10,
     mask_smoothing_radius: int = 10,
     mask_expansion: float | None = None,
 ) -> NodeGroup:
     """
-    Create a reusable NodeGroup for subtle facial detail consolidation.
+    Create a reusable NodeGroup for subtle local detail consolidation.
 
     This macro implements the pattern:
 
-    - image -> face mask (SubjectCrop target='face', mode='mask')
+    - image -> region mask (SubjectCrop target=<region>, mode='mask')
     - image -> Inpaint (low strength)
     - prompt (details) -> Inpaint.prompt()
-    - face image -> FaceIdEmbedImage -> FaceID adapter sink
-    - (optional) face mask -> face_id.mask()
+    - (optional) face image -> FaceIdEmbedImage -> FaceID adapter sink
 
     The intent is to perform small local edits (eye color, eyebrows, micro skin
-    details) while keeping identity stable via FaceID anchoring.
+    details). When ``region='face'``, identity is stabilized via FaceID anchoring.
+    For eye-only regions, FaceID is typically unnecessary and may over-constrain
+    edits.
 
     IMPORTANT
     ---------
-    This macro assumes the face already present in the input image is consistent
-    with the FaceID reference. If the input face differs significantly, the
-    result may become unstable or inconsistent (it is not a "face swap" macro).
+    When ``region='face'``, this macro assumes the face already present in the
+    input image is consistent with the FaceID reference. If the input face
+    differs significantly, the result may become unstable (it is not a face swap).
 
     Ports
     -----
     - 'in_image' (Tap)
         The base image to be edited.
-    - 'in_face_image' (FaceIdEmbedImage)
-        The reference image used to compute FaceID embedding.
     - 'in_prompt' (Tap)
-        Prompt payload used for facial micro-details.
-
-    Output
-    ------
-    The group output node is the internal Inpaint node ('out').
+        Prompt payload used for local micro-details.
+    - 'in_face_image' (FaceIdEmbedImage), only when ``region='face'``
+        Reference image used to compute FaceID embedding.
 
     Parameters
     ----------
     name : str
-        NodeGroup name (scope prefix).
+        NodeGroup name (scope prefix). This is used to namespace internal node ids.
+
     inpaint_spec : SpecInput
-        Spec for the internal Inpaint node (you typically set low strength here).
-    face_id_scale : float
-        FaceID adapter scale. For this macro you usually want it relatively high
-        to stabilize identity while inpaint does local edits.
+        Spec for the internal :class:`Inpaint` node. You typically set low
+        strength / conservative denoise here for subtle edits.
+
+    face_id_scale : float or None, optional
+        FaceID adapter scale used to stabilize identity. This is only used when
+        ``region='face'`` (i.e. when FaceID wiring is enabled).
+
+        - If ``region='face'``, this parameter is **required** (must not be None).
+        - If ``region!='face'``, this parameter is ignored.
+
+        Higher values enforce stronger identity preservation, but may also reduce
+        the model's freedom to apply local edits.
+
     face_id_clip_strength : float, optional
-        CLIP conditioning strength for FaceID adapter. Often 0..0.2 works well
-        for detail consolidation.
+        CLIP conditioning strength for the FaceID adapter. Only used when
+        ``region='face'``. Typical useful range for subtle consolidation is
+        0.0–0.2; higher values may over-constrain the edit. Default: 1.0.
+
+    region : {'face', 'eyes', 'left-eye', 'right-eye', 'head'}, optional
+        Region mask used to constrain inpainting via :class:`SubjectCrop`.
+
+        - ``'face'``: full face region. Enables FaceID anchoring (requires
+          ``face_id_scale``) and exposes the ``in_face_image`` port.
+        - ``'eyes'``: both eyes combined. FaceID anchoring is disabled.
+        - ``'left-eye'`` / ``'right-eye'``: single-eye masking. Recommended for
+          heterochromia (run two passes to avoid color harmonization). FaceID
+          anchoring is disabled.
+        - ``'head'``: head region (hair-friendly) if supported by your
+          :class:`SubjectCrop` configuration. FaceID anchoring is disabled.
+
+        Default: ``'face'``.
+
     mask_dilate_radius : int, optional
-        Dilation radius for the mask. Negative values shrink the region.
+        Dilation radius (pixels) applied to the generated mask before it is used
+        for inpainting. Positive values expand the masked region; negative values
+        shrink it. Default: -5.
+
     mask_close_radius : int, optional
-        Closing radius for the mask.
+        Morphological closing radius (pixels) applied to the mask. This helps
+        fill small holes and connect thin gaps. Default: 10.
+
     mask_smoothing_radius : int, optional
-        Smoothing radius for the mask.
+        Gaussian smoothing radius (pixels) applied to the mask edges. This
+        produces softer transitions and reduces inpaint seams. Default: 10.
+
     mask_expansion : float or None, optional
-        Optional expansion factor passed to SubjectCrop for targets that support it
-        (e.g. 'head'). When None, the parameter is omitted.
+        Optional expansion factor forwarded to :class:`SubjectCrop` for targets
+        that benefit from a slightly looser crop/mask (commonly ``'eyes'`` and
+        ``'head'``). When None, the parameter is omitted. Default: None.
 
     Returns
     -------
     NodeGroup
         The constructed group.
-
-    Notes
-    -----
-    External wiring example:
-
-        img_node  >> g('in_image')
-        face_node >> g('in_face_image')
-        prompt    >> g('in_prompt')
-        g >> downstream
     """
 
     with NodeGroup(name) as g:
@@ -387,13 +417,19 @@ def fine_face_details_group(
         # -------------------
         tap_image = Tap(name='in_image')
         tap_prompt = Tap(name='in_prompt')
-        face_embed = FaceIdEmbedImage(name='in_face_image')
+
+        # Create FaceID port only when stabilizing the whole face.
+        use_face_id = (region == 'face')
+        if use_face_id and face_id_scale is None:
+            raise ValueError(
+                f'{name}: face_id_scale is required when region="face"'
+            )
 
         # -------------------
         # Internal nodes
         # -------------------
         mask_params = {
-            'target': 'face',
+            'target': region,
             'mode': 'mask',
             'dilate_radius': mask_dilate_radius,
             'close_radius': mask_close_radius,
@@ -402,12 +438,15 @@ def fine_face_details_group(
         if mask_expansion is not None:
             mask_params['expansion'] = mask_expansion
 
-        face_mask = SubjectCrop(
-            name='face_mask',
+        region_mask = SubjectCrop(
+            name='region_mask',
             spec={
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+                    # 'yolo_model' is only needed when region == 'head' and your SubjectCrop uses YOLO for it.
+                    # Add it if your SubjectCrop config requires it for head mode.
+                    # 'yolo_model': 'yolov8n.pt',
                 },
                 'params': mask_params,
             },
@@ -418,34 +457,37 @@ def fine_face_details_group(
             spec=inpaint_spec,
         )
 
-        face_id_sink = out.face_id.add(
-            model_id='h94/IP-Adapter-FaceID',
-            weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
-            scale=face_id_scale,
-            clip_strength=face_id_clip_strength,
-            key='face_id',
-        )
-
         # -------------------
         # Wiring
         # -------------------
 
         # Base image to both mask generation and inpaint input
-        tap_image >> face_mask
+        tap_image >> region_mask
         tap_image >> out
 
         # Mask constrains inpaint to the face region
-        face_mask >> out.mask()
+        region_mask >> out.mask()
 
         # Prompt drives the micro-detail edit
         tap_prompt >> out.prompt()
 
-        # Face embedding anchors identity during inpaint
-        face_embed >> face_id_sink
-
         # -------------------
         # Register selectable ports
         # -------------------
-        g.register_ports(tap_image, face_embed, tap_prompt)
+        if use_face_id:
+            face_embed = FaceIdEmbedImage(name='in_face_image')
+            face_id_sink = out.face_id.add(
+                model_id='h94/IP-Adapter-FaceID',
+                weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
+                scale=float(face_id_scale),
+                clip_strength=face_id_clip_strength,
+                key='face_id',
+            )
+            # Face embedding anchors identity during inpaint
+            face_embed >> face_id_sink
+
+            g.register_ports(tap_image, face_embed, tap_prompt)
+        else:
+            g.register_ports(tap_image, tap_prompt)
 
     return g

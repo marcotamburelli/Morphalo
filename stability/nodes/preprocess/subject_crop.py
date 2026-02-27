@@ -1,7 +1,7 @@
-from dataclasses import dataclass, field
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -74,9 +74,9 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     smoothing_radius = int(params.get('smoothing_radius', 0))
 
     target = str(params.get('target', 'person'))
-    if target not in ('person', 'face', 'head'):
+    if target not in ('person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'):
         raise ValueError(
-            f"'{node_id}': invalid target={target!r} (expected 'person', 'face', or 'head')"
+            f"'{node_id}': invalid target={target!r} (expected 'person', 'face', 'head', 'eyes', 'left-eye', or 'right-eye')"
         )
 
     expansion = float(params.get('expansion', 1.0))
@@ -93,7 +93,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     if target in ('person', 'head'):
         yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
 
-    if target in ('face', 'head'):
+    if target in ('face', 'head', 'eyes', 'left-eye', 'right-eye'):
         # MediaPipe is used for face/head
         face_landmarker_task = model.get('face_landmarker_task')
         if not face_landmarker_task:
@@ -205,6 +205,217 @@ def _mp_largest_face_bbox_xyxy(
     _, x1, y1, x2, y2 = max(candidates, key=lambda t: t[0])
 
     return x1, y1, x2, y2
+
+
+def _mp_eye_bbox_xyxy(
+    img_rgb: np.ndarray,
+    face_landmarker_task,
+    *,
+    which: str,
+    expansion: float = 1.2,
+) -> tuple[int, int, int, int]:
+    """
+    Derive an eye bounding box from MediaPipe face landmarks.
+
+    This computes a bounding box for either the left eye, right eye, or both
+    eyes combined, using landmark indices from the MediaPipe FaceMesh topology.
+
+    Parameters
+    ----------
+    img_rgb : np.ndarray
+        Input image in RGB format (H, W, 3), dtype uint8.
+    face_landmarker_task : Any
+        MediaPipe FaceLandmarker instance created by
+        ``get_mediapipe_face_landmarker``.
+    which : {'left', 'right', 'both'}
+        Eye selection:
+        - 'left': subject's left eye
+        - 'right': subject's right eye
+        - 'both': combined region covering both eyes
+    expansion : float, optional
+        Symmetric expansion factor applied to the derived bounding box.
+        Values slightly above 1.0 help include eyelids and avoid hard borders.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Bounding box coordinates (x1, y1, x2, y2), end-exclusive.
+
+    Notes
+    -----
+    - 'left' and 'right' refer to the subject perspective (not the viewer).
+    - The landmark ranges used here are a pragmatic choice for stable cropping.
+      If you need tighter control (e.g., iris-only), use iris landmarks and/or
+      a dedicated segmentation step.
+    """
+    import mediapipe as mp
+
+    h, w = img_rgb.shape[:2]
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=img_rgb
+    )
+
+    result = face_landmarker_task.detect(mp_image)
+    face_landmarks_list = result.face_landmarks or []
+    if not face_landmarks_list:
+        raise RuntimeError('MediaPipe found no face landmarks.')
+
+    landmarks = face_landmarks_list[0]
+
+    # MediaPipe FaceMesh landmark ranges (inclusive start, exclusive end)
+    left_eye_ids = list(range(33, 133))
+    right_eye_ids = list(range(362, 463))
+
+    if which == 'left':
+        ids = left_eye_ids
+    elif which == 'right':
+        ids = right_eye_ids
+    elif which == 'both':
+        ids = left_eye_ids + right_eye_ids
+    else:
+        raise ValueError(
+            f'Invalid which={which!r} (expected left, right, or both)'
+        )
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    for idx in ids:
+        lm = landmarks[idx]
+        xs.append(float(lm.x))
+        ys.append(float(lm.y))
+
+    x1 = max(0, int(round(min(xs) * w)))
+    y1 = max(0, int(round(min(ys) * h)))
+    x2 = min(w, int(round(max(xs) * w)))
+    y2 = min(h, int(round(max(ys) * h)))
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid eye bbox derived from landmarks.')
+
+    # Expand around center for softer inpaint borders
+    bw = float(x2 - x1)
+    bh = float(y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    bw *= float(expansion)
+    bh *= float(expansion)
+
+    ex1 = int(math.floor(cx - bw / 2.0))
+    ex2 = int(math.ceil(cx + bw / 2.0))
+    ey1 = int(math.floor(cy - bh / 2.0))
+    ey2 = int(math.ceil(cy + bh / 2.0))
+
+    ex1 = max(0, ex1)
+    ey1 = max(0, ey1)
+    ex2 = min(w, ex2)
+    ey2 = min(h, ey2)
+
+    if ex2 <= ex1 or ey2 <= ey1:
+        raise RuntimeError('Invalid expanded eye bbox.')
+
+    return ex1, ey1, ex2, ey2
+
+
+def _mp_eye_mask_from_landmarks(
+    img_rgb: np.ndarray,
+    face_landmarker_task,
+    *,
+    which: str,
+    expansion: float,
+) -> np.ndarray:
+    """
+    Build a full-frame boolean eye mask from MediaPipe face landmarks.
+
+    This is used as an alternative to SAM for eye targets, because small,
+    disjoint regions (two eyes) can be hard for box-guided SAM to segment
+    reliably.
+
+    Parameters
+    ----------
+    img_rgb : np.ndarray
+        RGB image (H, W, 3), dtype uint8.
+    face_landmarker_task : Any
+        MediaPipe FaceLandmarker instance.
+    which : {'left', 'right', 'both'}
+        Which eye(s) to include.
+    expansion : float
+        Expansion factor. Values > 1.0 will slightly dilate the mask to include
+        eyelids and avoid hard borders.
+
+    Returns
+    -------
+    np.ndarray
+        Full-frame boolean mask (H, W) where True indicates the selected eye region.
+    """
+    import cv2
+    import mediapipe as mp
+
+    h, w = img_rgb.shape[:2]
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=img_rgb
+    )
+
+    result = face_landmarker_task.detect(mp_image)
+    face_landmarks_list = result.face_landmarks or []
+    if not face_landmarks_list:
+        raise RuntimeError('MediaPipe found no face landmarks.')
+
+    # Use the first face for now (consistent with existing behavior).
+    landmarks = face_landmarks_list[0]
+
+    # Use canonical FaceMesh eye connection sets (no hard-coded indices).
+    left_ids = [
+        33, 7, 163, 144, 145, 153, 154, 155,
+        133, 173, 157, 158, 159, 160, 161, 246,
+    ]
+    right_ids = [
+        362, 382, 381, 380, 374, 373, 390, 249,
+        263, 466, 388, 387, 386, 385, 384, 398,
+    ]
+
+    def _points(ids: Sequence[int]) -> np.ndarray:
+        pts = []
+        for i in ids:
+            lm = landmarks[int(i)]
+            x = int(round(float(lm.x) * w))
+            y = int(round(float(lm.y) * h))
+            x = max(0, min(w - 1, x))
+            y = max(0, min(h - 1, y))
+            pts.append([x, y])
+        return np.asarray(pts, dtype=np.int32)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    if which in ('left', 'both'):
+        pts = _points(left_ids)
+        if pts.size > 0:
+            hull = cv2.convexHull(pts)
+            cv2.fillConvexPoly(mask, hull, 255)
+
+    if which in ('right', 'both'):
+        pts = _points(right_ids)
+        if pts.size > 0:
+            hull = cv2.convexHull(pts)
+            cv2.fillConvexPoly(mask, hull, 255)
+
+    # Optional dilation driven by expansion. Keep it conservative.
+    exp = float(expansion)
+    if exp > 1.0:
+        # Convert expansion factor to a small pixel radius.
+        # Example: 1.2 -> ~2 px, 1.5 -> ~4 px (capped).
+        radius = int(round(min(8.0, max(0.0, (exp - 1.0) * 10.0))))
+        if radius > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+            mask = cv2.dilate(mask, k, iterations=1)
+
+    return (mask > 0)
 
 
 def _expand_clip_bbox(x1: int, y1: int, x2: int, y2: int, w: int, h: int, margin: float) -> tuple[int, int, int, int]:
@@ -327,7 +538,7 @@ class SubjectCrop(NodeRef):
     - YOLO (COCO class 0) to locate the largest person when ``target`` is
       ``'person'`` or ``'head'``.
     - MediaPipe Face Landmarker to localize face landmarks when ``target`` is
-      ``'face'`` or ``'head'``.
+      ``'face'``, ``'eyes'``, ``'left-eye'``, ``'right-eye'`` or ``'head'``.
     - Segment Anything (SAM) to obtain a segmentation mask guided by a bounding box.
 
     Targets
@@ -348,6 +559,31 @@ class SubjectCrop(NodeRef):
           using ``expansion`` and an upward bias.
         - SAM is still run on the (expanded) person box for robustness, while the
           final crop region is the derived head box.
+
+    ``target='eyes'``
+        - MediaPipe derives face landmarks.
+        - A bounding box enclosing both eyes is computed from landmark
+          clusters corresponding to the left and right orbital regions.
+        - The box is optionally expanded via ``expansion`` to include
+          eyelids and avoid hard inpaint borders.
+        - Landmark-derived mask (SAM skipped).
+        - The final crop region corresponds to the combined eyes area.
+
+    ``target='left-eye'``
+        - MediaPipe derives face landmarks.
+        - A bounding box is computed from landmark indices corresponding
+          to the subject's left eye (subject perspective, not viewer).
+        - The box is optionally expanded via ``expansion``.
+        - Landmark-derived mask (SAM skipped).
+        - The final crop region isolates only the left eye.
+
+    ``target='right-eye'``
+        - MediaPipe derives face landmarks.
+        - A bounding box is computed from landmark indices corresponding
+          to the subject's right eye (subject perspective, not viewer).
+        - The box is optionally expanded via ``expansion``.
+        - Landmark-derived mask (SAM skipped).
+        - The final crop region isolates only the right eye.
 
     Head crop geometry
     ------------------
@@ -386,10 +622,12 @@ class SubjectCrop(NodeRef):
                 YOLO weights. Required for ``target='person'`` and ``target='head'``.
             ``face_landmarker_task`` : str, optional
                 MediaPipe FaceLandmarker ``.task`` path. Required for
-                ``target='face'`` and ``target='head'``.
+                ``target='face'``, ``target='eyes'``, ``target='left-eye'``,
+                ``target='right-eye'`` and ``target='head'``.
 
         ``params`` : dict
-            ``target`` : {'person', 'face', 'head'}, optional
+            ``target`` : {'person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'},
+             optional
                 Region to extract. Default: ``'person'``.
 
             ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -496,6 +734,8 @@ class SubjectCrop(NodeRef):
     - Mask outputs are always full-frame and aligned to the original image size.
     - For ``target='head'``, SAM segmentation uses the person box for robustness,
       while the crop region is the derived head square.
+    - 'left-eye' and 'right-eye' refer to the subject perspective.
+      In mirrored images this may appear inverted to the viewer.
     - Heavy models (YOLO, SAM) are retrieved via the global model cache.
       The SAM predictor is created per-run because it stores per-image state.
     - If you change code or spec and need fresh outputs, delete the existing
@@ -542,6 +782,9 @@ class SubjectCrop(NodeRef):
         h, w = img_bgr.shape[:2]
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+        eye_which: Optional[str] = None
+        eye_mask: Optional[np.ndarray] = None
+
         if cfg.target == 'person':
             # -----------------------------
             # YOLO: find largest 'person' bbox (COCO class 0)
@@ -566,6 +809,33 @@ class SubjectCrop(NodeRef):
                 img_rgb=img_rgb,
                 face_landmarker_task=landmarker,
                 # face_min_score=cfg.face_min_score,
+            )
+
+        elif cfg.target in ('eyes', 'left-eye', 'right-eye'):
+            landmarker = get_mediapipe_face_landmarker(
+                model_asset_path=cfg.face_landmarker_task,
+                device=cfg.device,
+            )
+
+            eye_which = {
+                'eyes': 'both',
+                'left-eye': 'left',
+                'right-eye': 'right',
+            }[cfg.target]
+
+            # Use bbox only for crop geometry; mask comes from landmarks.
+            bx1, by1, bx2, by2 = _mp_eye_bbox_xyxy(
+                img_rgb=img_rgb,
+                face_landmarker_task=landmarker,
+                which=eye_which,
+                expansion=max(1.0, float(cfg.expansion)),
+            )
+
+            eye_mask = _mp_eye_mask_from_landmarks(
+                img_rgb=img_rgb,
+                face_landmarker_task=landmarker,
+                which=eye_which,
+                expansion=max(1.0, float(cfg.expansion)),
             )
 
         elif cfg.target == 'head':
@@ -597,80 +867,78 @@ class SubjectCrop(NodeRef):
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
 
-        if cfg.box_margin > 0:
+        if cfg.box_margin > 0 and cfg.target not in ('eyes', 'left-eye', 'right-eye'):
             bx1, by1, bx2, by2 = _expand_clip_bbox(
                 bx1, by1, bx2, by2, w, h, cfg.box_margin
             )
 
         # -----------------------------
-        # SAM: box-guided segmentation
+        # Mask generation
         # -----------------------------
-        ckpt = Path(str(cfg.sam_checkpoint)).expanduser().resolve()
-        if not ckpt.exists() or not ckpt.is_file():
-            raise FileNotFoundError(
-                f"SubjectCrop node '{node_id}': SAM checkpoint not found: {ckpt}")
+        if cfg.target in ('eyes', 'left-eye', 'right-eye'):
+            # Eye targets: use landmark-derived mask (skip SAM).
+            if eye_mask is None:
+                raise RuntimeError(
+                    f"SubjectCrop node '{node_id}': eye_mask not computed."
+                )
+            mask = eye_mask
+            ckpt = Path(str(cfg.sam_checkpoint)).expanduser().resolve()
+            model_type = _infer_sam_model_type(ckpt, cfg.sam_model_type)
+        else:
+            # Default path: SAM box-guided segmentation
+            ckpt = Path(str(cfg.sam_checkpoint)).expanduser().resolve()
+            if not ckpt.exists() or not ckpt.is_file():
+                raise FileNotFoundError(
+                    f"SubjectCrop node '{node_id}': SAM checkpoint not found: {ckpt}")
 
-        model_type = _infer_sam_model_type(ckpt, cfg.sam_model_type)
+            model_type = _infer_sam_model_type(ckpt, cfg.sam_model_type)
 
-        sam = get_sam(
-            checkpoint=str(ckpt),
-            model_type=model_type,
-            device=cfg.device
-        )
-
-        predictor = SamPredictor(sam)
-        predictor.set_image(np.ascontiguousarray(img_rgb))
-
-        box = np.array([bx1, by1, bx2, by2], dtype=np.float32)
-
-        with torch.inference_mode():
-            masks, scores, _ = predictor.predict(
-                box=box[None, :],
-                multimask_output=bool(cfg.multimask),
+            sam = get_sam(
+                checkpoint=str(ckpt),
+                model_type=model_type,
+                device=cfg.device
             )
 
-        if masks is None or len(masks) == 0:
-            raise RuntimeError(
-                f"SubjectCrop node '{node_id}': SAM returned no masks.")
+            predictor = SamPredictor(sam)
+            predictor.set_image(np.ascontiguousarray(img_rgb))
 
-        # Pick the best mask in a robust way:
-        # SAM multimask can sometimes return a "background" mask as the top score.
-        # We prefer a mask that contains the bbox center and has a reasonable coverage.
-        cx = int((bx1 + bx2) // 2)
-        cy = int((by1 + by2) // 2)
+            box = np.array([bx1, by1, bx2, by2], dtype=np.float32)
 
-        best_i = 0
-        best_key = None
+            with torch.inference_mode():
+                masks, scores, _ = predictor.predict(
+                    box=box[None, :],
+                    multimask_output=bool(cfg.multimask),
+                )
 
-        for i in range(len(masks)):
-            mi = masks[i].astype(bool)
+            if masks is None or len(masks) == 0:
+                raise RuntimeError(
+                    f"SubjectCrop node '{node_id}': SAM returned no masks.")
 
-            # Fraction of bbox covered by the mask (0..1)
-            frac = float(mi[by1:by2, bx1:bx2].mean())
+            # Pick the best mask in a robust way:
+            cx = int((bx1 + bx2) // 2)
+            cy = int((by1 + by2) // 2)
 
-            # Center of bbox should belong to the subject most of the time
-            center_in = bool(mi[cy, cx])
+            best_i = 0
+            best_key = None
 
-            # Reject masks that are too tiny or almost the whole bbox
-            ok_area = (0.05 <= frac <= 0.95)
+            for i in range(len(masks)):
+                mi = masks[i].astype(bool)
 
-            score_i = float(scores[i]) if scores is not None else 0.0
+                frac = float(mi[by1:by2, bx1:bx2].mean())
+                center_in = bool(mi[cy, cx])
+                ok_area = (0.05 <= frac <= 0.95)
+                score_i = float(scores[i]) if scores is not None else 0.0
 
-            # Priority order:
-            # 1) contains center, 2) reasonable area, 3) higher score,
-            # 4) prefer coverage near ~0.35 (heuristic)
-            key = (center_in, ok_area, score_i, -abs(frac - 0.35))
+                key = (center_in, ok_area, score_i, -abs(frac - 0.35))
 
-            if best_key is None or key > best_key:
-                best_key = key
-                best_i = i
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_i = i
 
-        mask = masks[int(best_i)].astype(bool)  # HxW
+            mask = masks[int(best_i)].astype(bool)  # HxW
 
-        # Final safety: if bbox center is not inside the mask, invert it
-        if not mask[cy, cx]:
-            mask = ~mask
-
+            if not mask[cy, cx]:
+                mask = ~mask
         # --------------------------------------------------
         # Select crop region depending on target
         # --------------------------------------------------
@@ -694,15 +962,23 @@ class SubjectCrop(NodeRef):
         )
 
         if num > 1:
-            ccx = cm.shape[1] // 2
-            ccy = cm.shape[0] // 2
-            target = labels[ccy, ccx]
+            if cfg.target in ('eyes', 'left-eye', 'right-eye'):
+                # Keep all components in the crop.
+                # For 'eyes' this preserves both eyes (two disjoint blobs).
+                # For 'left-eye'/'right-eye' the crop box is expected to isolate a single eye.
+                crop_mask = (labels != 0)
 
-            if target == 0:
-                areas = stats[1:, cv2.CC_STAT_AREA]
-                target = 1 + int(np.argmax(areas))
+            else:
+                # Keep a single component for other targets.
+                ccx = cm.shape[1] // 2
+                ccy = cm.shape[0] // 2
+                target = labels[ccy, ccx]
 
-            crop_mask = (labels == target)
+                if target == 0:
+                    areas = stats[1:, cv2.CC_STAT_AREA]
+                    target = 1 + int(np.argmax(areas))
+
+                crop_mask = (labels == target)
 
         out_path = make_node_output_path(
             out_dir=out_dir,
