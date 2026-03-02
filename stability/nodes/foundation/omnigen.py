@@ -90,7 +90,7 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
             Number of denoising steps (default: 30).
         - ``params.guidance_scale`` : float, optional
             Text guidance scale (default: 2.0).
-        - ``params.img_guidance_scale`` : float, optional
+        - ``params.img_guidance_scale`` : float
             Image guidance scale for multimodal conditioning (default: 1.6).
         - ``params.img_size_as_out`` : bool, optional
             If True, keep the output resolution equal to the input image size when
@@ -183,7 +183,7 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
         width = int(params.get('width', 1024))
         steps = int(params.get('steps', 30))
         guidance_scale = float(params.get('guidance_scale', 2.0))
-        img_guidance_scale = params.get('img_guidance_scale', None)
+        img_guidance_scale = params.get('img_guidance_scale', 1.6)
         img_size_as_out = bool(params.get('img_size_as_out', False))
 
         # --- seed ---

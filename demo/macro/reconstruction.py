@@ -1,8 +1,7 @@
 from stability.dag import NodeGroup
-from stability.nodes import Tap
+from stability.nodes import Img2Img, Tap, Txt2Img
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.preprocess import ImgAuxMap
-from stability.nodes.txt2img import Txt2Img
 
 
 def reconstruct_from_geometry_group(
@@ -150,5 +149,155 @@ def reconstruct_from_geometry_group(
         # Register ports
         # -------------------
         g.register_ports(tap_image, tap_prompt)
+
+    return g
+
+
+def reconstruct_from_geometry_img2img_group(
+    name: str,
+    *,
+    img2img_spec: SpecInput,
+    canny_conditioning_scale: float,
+    depth_conditioning_scale: float,
+    adapter_scale: float,
+    canny_detect_long_side: int = 1024,
+    depth_detect_long_side: int = 1024,
+) -> NodeGroup:
+    """
+    Reconstruct a more realistic image from geometric cues while preserving the source via Img2Img.
+
+    This NodeGroup implements a geometry-driven Img2Img pattern:
+
+    - A source image is used both as:
+      - the Img2Img starting point (content/color/overall composition prior), and
+      - the extractor source for geometric guidance signals:
+        - Canny edges (fine 2D contours)
+        - Depth map (coarse 3D structure)
+    - These signals are fed into an Img2Img node through two ControlNet branches.
+    - A style image is fed into Img2Img through an IP-Adapter branch.
+    - A prompt (wired from outside the group) controls semantic content,
+      style and realism, while ControlNet constrains geometry.
+
+    Ports
+    -----
+    - 'in_image' (Tap)
+        Source image used as Img2Img init and as the source for canny/depth maps.
+    - 'in_prompt' (Tap)
+        Prompt payload wired to Img2Img.prompt().
+    - 'in_style' (Tap)
+        Style reference image wired to the IP-Adapter sink.
+
+    Parameters
+    ----------
+    name : str
+        Group name (scope prefix) used for hierarchical node ids.
+
+    img2img_spec : SpecInput
+        Img2Img specification passed to the internal Img2Img node. This should
+        include your model/pipeline configuration (e.g. SDXL), scheduler, and
+        generation parameters (strength, cfg, steps, resolution, etc.).
+
+    canny_conditioning_scale : float
+        ControlNet conditioning strength for the Canny branch.
+
+    depth_conditioning_scale : float
+        ControlNet conditioning strength for the Depth branch.
+
+    adapter_scale : float
+        IP-Adapter scale controlling how strongly the output borrows style cues
+        from the provided style image. Higher values yield stronger style transfer
+        but may harm identity/details.
+
+    canny_detect_long_side : int, optional
+        Target long-side resolution used by the Canny preprocessor.
+
+    depth_detect_long_side : int, optional
+        Target long-side resolution used by the depth preprocessor.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed group. The group output is the internal Img2Img node
+        ('out'), producing the generated image.
+
+    Notes
+    -----
+    - This macro uses the same input image for Img2Img init and for extracting
+      ControlNet conditioning maps, ensuring maximal geometric consistency.
+    - FaceID or head/face refinement is expected to be composed downstream using
+      dedicated macros.
+    """
+
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt')
+        tap_style_image = Tap(name='in_style')
+
+        # -------------------
+        # Geometry extraction
+        # -------------------
+        canny = ImgAuxMap(
+            name='canny',
+            spec={
+                'processor': 'canny',
+                'detect_long_side': canny_detect_long_side,
+            },
+        )
+        depth = ImgAuxMap(
+            name='depth_midas',
+            spec={
+                'processor': 'depth_midas',
+                'detect_long_side': depth_detect_long_side,
+            },
+        )
+
+        # -------------------
+        # Img2Img with ControlNets + IP-Adapter
+        # -------------------
+        out = Img2Img(
+            name='out',
+            spec=img2img_spec,
+        )
+
+        canny_sink = out.controlnet.add(
+            'diffusers/controlnet-canny-sdxl-1.0',
+            conditioning_scale=canny_conditioning_scale,
+            key='canny',
+        )
+        depth_sink = out.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale,
+            key='depth',
+        )
+
+        style_sink = out.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name='ip-adapter_sdxl_vit-h.bin',
+            scale=adapter_scale,
+            key='style',
+        )
+
+        # -------------------
+        # Wiring
+        # -------------------
+        # Same image is used as Img2Img init and as source for aux maps.
+        tap_image >> out
+        tap_image >> canny >> canny_sink
+        tap_image >> depth >> depth_sink
+
+        # Prompt drives the semantic target and realism.
+        tap_prompt >> out.prompt()
+
+        # Style reference guides appearance through IP-Adapter.
+        tap_style_image >> style_sink
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(tap_image, tap_prompt, tap_style_image)
 
     return g
