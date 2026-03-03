@@ -57,8 +57,27 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
         Expected keys include:
 
         **Model / runtime**
-        - ``model.path`` : str (required)
-            Local path or identifier for the SDXL base model to load.
+        Exactly one of the following keys must be provided under ``spec.model``:
+
+        - ``model.id`` : str
+            Identifier of a pretrained model (e.g. a Hugging Face repository ID).
+            The model will be loaded via the Diffusers "from_pretrained" mechanism.
+            If not already cached locally, it will be downloaded on first use.
+
+        - ``model.path`` : str
+            Path to a local model file or directory.
+            This is typically used for:
+            - Single-file checkpoints (e.g. ``.safetensors``)
+            - Fully downloaded model directories
+            - Custom or fine-tuned local models
+
+            The path is expanded via ``os.path.expanduser`` and must exist locally.
+
+        Providing both ``model.id`` and ``model.path`` is an error.
+        Providing neither is also an error.
+
+        Additional runtime options:
+
         - ``model.device`` : str, optional
             Device to run on (default: ``"cuda"``).
         - ``model.dtype`` : str, optional
