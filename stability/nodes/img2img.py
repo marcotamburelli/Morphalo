@@ -255,7 +255,7 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']
             assert len(masks) == l
 
-        # IMPORTANT: Img2Img + ControlNet uses image=init and control_image=control :contentReference[oaicite:3]{index=3}
+        # IMPORTANT: Img2Img + ControlNet uses image=init and control_image=control
         result = pipe(
             prompt=prompt_bundle.prompt,
             prompt_2=prompt_bundle.prompt_2,

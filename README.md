@@ -1,16 +1,16 @@
 # Stability
 
-Stability is a **local-first** playground for building **reproducible image/video generation workflows** as **DAGs** (Directed Acyclic Graphs).
+Stability is a **local-first playground** for building **reproducible image and video generation workflows** as **DAGs (Directed Acyclic Graphs)**.
 
 The core idea is simple:
 
 - You describe a pipeline as a graph of nodes (e.g. `Prompt` → `Txt2Img` → `Img2Img` → `Inpaint`).
-- Each node materializes its output to disk (JSON sidecars + images), so runs are **inspectable** and **restartable**.
-- A small runner executes the graph deterministically.
+- Each node materializes its output to disk (JSON sidecars + images), making runs **inspectable** and **restartable**.
+- A lightweight runner executes the graph deterministically.
 
-Under the hood, Stability focuses on “wiring” together modern diffusion tooling (Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter) plus useful preprocessors (aux maps, subject crop, etc.) in a way that is **composable** and **easy to iterate**.
+Under the hood, Stability focuses on wiring together modern diffusion tooling (Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter) along with useful preprocessors (aux maps, subject crop, etc.) in a way that is **composable**, **reproducible**, and **easy to iterate on**.
 
-> Status: this repo is intended for personal/local use first. Expect breaking changes.
+> **Status:** this repository is primarily intended for personal/local use for now. Expect breaking changes.
 
 ## Why this exists
 
@@ -24,8 +24,9 @@ As pipelines grow more complex, they often turn into:
 
 Stability was created to address these issues while preserving the **fast iteration workflow** typical of experimental diffusion projects.
 
-At its core, Stability is a **Python interface built on top of Diffusers** that allows complex image generation workflows to be expressed as
-**explicit DAGs (Directed Acyclic Graphs)**.
+At its core, Stability is a **Python interface built on top of Diffusers** that allows complex image generation workflows to be expressed as **explicit DAGs (Directed Acyclic Graphs)**.
+
+In practice, this makes Stability a **programmable pipeline engine for generative workflows**.
 
 This approach introduces a few key improvements:
 
@@ -392,7 +393,7 @@ with DAG('hello_txt2img', out_dir=ROOT / 'outputs' / 'hello_txt2img') as dag:
 Run it:
 
 ```bash
-./run_dag.sh dags.hello_txt2img --dag hello_txt2img
+./bin/run_dag.sh dags.hello_txt2img --dag hello_txt2img
 ```
 
 Outputs are written under `outputs/hello_txt2img/` (image file + JSON metadata per node).
