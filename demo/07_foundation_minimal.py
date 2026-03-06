@@ -41,15 +41,11 @@ with DAG(
         name='prompt',
         spec={
             'lang': 'eng_Latn',
-            'prompt': {
-                'content': [
-                    'A cinematic portrait of a silver-haired mage with violet eyes.',
-                    'Natural skin texture, cinematic lighting, sharp focus.',
-                ],
-                'style': [
-                    '35mm film look, shallow depth of field, subtle grain.',
-                ],
-            },
+            'prompt': [
+                'A cinematic portrait of a silver-haired mage with violet eyes.',
+                'Natural skin texture, cinematic lighting, sharp focus.',
+                '35mm film look, shallow depth of field, subtle grain.',
+            ],
             'negative_prompt': [
                 'blurry',
                 'low quality',

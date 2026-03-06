@@ -159,7 +159,7 @@ def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: 
 
     # alpha composite requires same size, so make a temp patch
     patch = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-    patch.paste(layer_crop, (ix0, iy0), layer_crop)
+    patch.alpha_composite(layer_crop, (ix0, iy0))
     canvas.alpha_composite(patch)
 
 
@@ -461,6 +461,9 @@ class ImageStack(NodeRef):
         blend: BlendMode = 'alpha',
         feather: int = 0,
         corner_radius: Optional[int] = None,
+        edge_bleed: bool = False,
+        edge_bleed_strength: float = 1.0,
+        edge_bleed_gamma: float = 1.0,
     ) -> ImageLayerAttachmentSink:
         """
         Declare an input image layer.
@@ -638,6 +641,9 @@ class ImageStack(NodeRef):
                 'Each layer index must be unique.'
             )
 
+        corner_radius = corner_radius if corner_radius is None \
+            else int(corner_radius)
+
         self._layers[idx] = LayerSpec(
             idx=idx,
             position=position,
@@ -728,6 +734,8 @@ class ImageStack(NodeRef):
                 layer, resize, cfg.width, cfg.height
             )
 
+            synthetic_alpha = False
+
             # feather (alpha handling)
             if layer_spec.feather and layer_spec.feather > 0:
                 rad = int(layer_spec.feather)
@@ -798,8 +806,7 @@ class ImageStack(NodeRef):
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        out_path = make_node_output_path(
-            out_dir=out_dir, node_id=self.id, ext='png')
+        out_path = make_node_output_path(out_dir=out_dir, node_id=self.id)
 
         if cfg.out_mode == 'RGB':
             canvas.convert('RGB').save(out_path)
