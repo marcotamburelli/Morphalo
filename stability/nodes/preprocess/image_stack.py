@@ -203,6 +203,83 @@ def _apply_resize(img: Image.Image, resize: ResizeMode, canvas_w: int, canvas_h:
     return img.resize((nw, nh), resample=Image.LANCZOS)
 
 
+def _jagged_cut_and_feather(
+    mask_l: Image.Image,
+    *,
+    feather: int,
+    jagged: int,
+    jagged_blur: int = 24,
+    seed: Optional[int] = None,
+) -> Image.Image:
+    """
+    Create an irregular (jagged) cutout boundary and then feather it.
+
+    Steps:
+    1) Compute inside distance transform from a binary mask.
+    2) Apply a smooth noise field to locally erode/dilate the boundary.
+    3) Convert the resulting distance field into a soft alpha ramp (feather).
+
+    Parameters
+    ----------
+    mask_l : PIL.Image.Image
+        Binary-like mask in mode 'L' (0 background, 255 foreground).
+    feather : int
+        Feather width in pixels.
+    jagged : int
+        Irregular boundary amplitude in pixels. 0 disables jagged cut.
+    jagged_blur : int, optional
+        Smoothing radius for the noise field. Higher values produce larger
+        irregular "chunks" (less speckle).
+    seed : int or None, optional
+        RNG seed for reproducibility.
+
+    Returns
+    -------
+    PIL.Image.Image
+        Soft alpha mask (mode 'L').
+    """
+    import cv2
+    import numpy as np
+
+    f = int(feather)
+    j = int(jagged)
+    if f <= 0:
+        return mask_l
+
+    m = np.array(mask_l, dtype=np.uint8)
+    fg = (m > 0).astype(np.uint8)
+    if fg.max() == 0:
+        return Image.new('L', mask_l.size, 0)
+
+    dist = cv2.distanceTransform(
+        fg, distanceType=cv2.DIST_L2, maskSize=3).astype(np.float32)
+
+    if j > 0:
+        rng = np.random.default_rng(seed)
+        noise = rng.random(dist.shape, dtype=np.float32)
+        noise = (noise * 2.0) - 1.0  # [-1..1]
+
+        jb = int(max(0, jagged_blur))
+        if jb > 0:
+            k = 2 * jb + 1
+            noise = cv2.GaussianBlur(
+                noise, (k, k), sigmaX=0, sigmaY=0, borderType=cv2.BORDER_REFLECT)
+
+        # Local threshold shift: positive noise -> stronger erosion, negative -> weaker.
+        # This produces a boundary that wiggles inward/outward.
+        dist = dist - (noise * float(j))
+
+        # Clamp negatives: outside/over-eroded becomes zero.
+        dist = np.maximum(dist, 0.0)
+
+    # Feather ramp from the (possibly jittered) distance.
+    a = np.clip(dist / float(f), 0.0, 1.0)
+    a = a * a * (3.0 - 2.0 * a)  # smoothstep
+    out = (a * 255.0).astype(np.uint8)
+
+    return Image.fromarray(out, mode='L')
+
+
 @dataclass
 class ImageLayerAttachmentSink(AttachmentSink):
     idx: int
@@ -786,7 +863,13 @@ class ImageStack(NodeRef):
                         # fallback: very small layer, just fill
                         draw.rectangle([0, 0, lw - 1, lh - 1], fill=255)
 
-                    a = m.filter(ImageFilter.GaussianBlur(radius=rad))
+                    # a = m.filter(ImageFilter.GaussianBlur(radius=rad))
+                    a = _jagged_cut_and_feather(
+                        m,
+                        feather=rad,
+                        jagged=rad // 2,
+                        jagged_blur=rad,
+                    )
                 else:
                     # Normal case: soften existing cutout edges
                     a = a.filter(ImageFilter.GaussianBlur(radius=rad))
