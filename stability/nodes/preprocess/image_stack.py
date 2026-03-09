@@ -1,8 +1,9 @@
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Tuple, Union
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageFilter
 
 from stability.core.paths import make_node_output_path
 from stability.dag import AttachmentSink, NodeRef
@@ -10,8 +11,7 @@ from stability.nodes.common.config_resolve import SpecInput, resolve_spec
 from stability.nodes.common.io import write_json_sidecar
 
 Pos = Union[Tuple[int, int], str]
-BlendMode = Literal['alpha']
-ResizeMode = Tuple[Optional[int], Optional[int]] \
+ResizeMode = Tuple[Optional[int | str], Optional[int | str]] \
     | Literal['fit', 'cover'] \
     | None
 
@@ -19,10 +19,9 @@ ResizeMode = Tuple[Optional[int], Optional[int]] \
 @dataclass(frozen=True)
 class LayerSpec:
     idx: int
-    position: Pos = 'center'   # tuple -> center coords; str -> anchor
+    position: Pos = 'center'
     resize: ResizeMode = None
-    blend: BlendMode = 'alpha'
-    feather: int = 0           # px gaussian blur on alpha
+    feather: int | str = 0
     corner_radius: Optional[int] = None
 
 
@@ -32,6 +31,109 @@ class Config:
     height: int
     background: Optional[Union[str, Tuple[int, int, int, int]]]
     out_mode: Literal['RGBA', 'RGB']
+
+
+def validate_size_expr(size_expr: int | str) -> None:
+    # Absolute pixel feather
+    if isinstance(size_expr, int):
+        if size_expr < 0:
+            raise ValueError('size expression must be >= 0')
+        return
+
+    # Must be a string from here
+    if not isinstance(size_expr, str):
+        raise ValueError(
+            f'invalid size expression type {type(size_expr).__name__}; '
+            'expected int or str'
+        )
+
+    s = size_expr.strip().lower()
+
+    pattern = r'^\d+(\.\d+)?(px|%)$'
+
+    if not re.match(pattern, s):
+        raise ValueError(
+            f'invalid size expression value "{size_expr}". '
+            'Expected formats: int, "<number>px", "<number>%".'
+        )
+
+
+def resolve_size_expr(
+    size_expr: int | str,
+    *,
+    max_size: int,
+) -> int:
+    validate_size_expr(size_expr)
+
+    if isinstance(size_expr, int):
+        return max(0, size_expr)
+
+    s = size_expr.strip().lower()
+
+    if s.endswith('px'):
+        return max(0, int(round(float(s[:-2]))))
+
+    pct = max(0.0, float(s[:-1])) / 100.0
+
+    # Size should always be at least 1
+    return max(1, int(round(max_size * pct)))
+
+
+def resolve_feather_xy(
+    feather: int | str,
+    *,
+    width: int,
+    height: int,
+) -> Tuple[int, int]:
+    validate_size_expr(feather)
+
+    if isinstance(feather, int):
+        px = max(0, feather)
+        return px, px
+
+    s = feather.strip().lower()
+
+    if s.endswith('px'):
+        px = max(0, int(round(float(s[:-2]))))
+        return px, px
+
+    pct = max(0.0, float(s[:-1])) / 100.0
+    feather_x = max(0, int(round(width * pct)))
+    feather_y = max(0, int(round(height * pct)))
+
+    return feather_x, feather_y
+
+
+def resolve_feather_radius(
+    feather: int | str,
+    *,
+    width: int,
+    height: int,
+) -> int:
+    validate_size_expr(feather)
+
+    if isinstance(feather, int):
+        return max(0, feather)
+
+    s = feather.strip().lower()
+
+    if s.endswith('px'):
+        return max(0, int(round(float(s[:-2]))))
+
+    pct = max(0.0, float(s[:-1])) / 100.0
+    mean_dim = (width + height) / 2.0
+
+    # I think that feather, if defined non zero, should always be at least 1
+    return max(1, int(round(mean_dim * pct)))
+
+
+def feather_is_nonzero(feather: int | str) -> bool:
+    if isinstance(feather, int):
+        return feather > 0
+
+    s = feather.strip().lower()
+
+    return float(s[:-2] if s.endswith('px') else s[:-1]) > 0
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -187,15 +289,15 @@ def _apply_resize(img: Image.Image, resize: ResizeMode, canvas_w: int, canvas_h:
         raise ValueError('resize cannot be (None, None)')
 
     if tw is not None and th is not None:
-        nw = int(tw)
-        nh = int(th)
+        nw = resolve_size_expr(tw, max_size=canvas_w)
+        nh = resolve_size_expr(th, max_size=canvas_h)
     elif tw is not None:
-        s = float(tw) / float(w)
-        nw = int(tw)
+        nw = resolve_size_expr(tw, max_size=canvas_w)
+        s = float(nw) / float(w)
         nh = max(1, int(round(h * s)))
     else:
-        s = float(th) / float(h)
-        nh = int(th)
+        nh = resolve_size_expr(th, max_size=canvas_h)
+        s = float(nh) / float(h)
         nw = max(1, int(round(w * s)))
 
     nw = max(1, nw)
@@ -203,81 +305,248 @@ def _apply_resize(img: Image.Image, resize: ResizeMode, canvas_w: int, canvas_h:
     return img.resize((nw, nh), resample=Image.LANCZOS)
 
 
-def _jagged_cut_and_feather(
-    mask_l: Image.Image,
+def _perturbed_alpha_ramp(
+    w: int,
+    h: int,
     *,
-    feather: int,
-    jagged: int,
-    jagged_blur: int = 24,
-    seed: Optional[int] = None,
+    feather_x: int,
+    feather_y: int,
+    corner_radius: int,
 ) -> Image.Image:
     """
-    Create an irregular (jagged) cutout boundary and then feather it.
+    Create a perturbed alpha ramp for compositing rectangular crops.
 
-    Steps:
-    1) Compute inside distance transform from a binary mask.
-    2) Apply a smooth noise field to locally erode/dilate the boundary.
-    3) Convert the resulting distance field into a soft alpha ramp (feather).
+    The generated alpha is based on an inset support region whose borders are
+    softened before compositing. Horizontal and vertical feather widths are
+    handled independently:
+
+    - ``feather_x`` controls the fade width for left and right edges
+    - ``feather_y`` controls the fade width for top and bottom edges
+
+    To reduce visible rectangular seams, each side of the support region is
+    perturbed independently with smooth random jitter. If ``corner_radius`` is
+    greater than zero, the four corners are additionally constrained by radial
+    ramps centered on the rounded-corner arc centers.
 
     Parameters
     ----------
-    mask_l : PIL.Image.Image
-        Binary-like mask in mode 'L' (0 background, 255 foreground).
-    feather : int
-        Feather width in pixels.
-    jagged : int
-        Irregular boundary amplitude in pixels. 0 disables jagged cut.
-    jagged_blur : int, optional
-        Smoothing radius for the noise field. Higher values produce larger
-        irregular "chunks" (less speckle).
-    seed : int or None, optional
-        RNG seed for reproducibility.
+    w : int
+        Layer width in pixels.
+    h : int
+        Layer height in pixels.
+    feather_x : int
+        Feather width in pixels for left and right edges.
+    feather_y : int
+        Feather width in pixels for top and bottom edges.
+    corner_radius : int
+        Rounded-corner radius in pixels.
 
     Returns
     -------
     PIL.Image.Image
-        Soft alpha mask (mode 'L').
+        Alpha mask in mode ``'L'`` with shape ``(w, h)``.
     """
-    import cv2
     import numpy as np
 
-    f = int(feather)
-    j = int(jagged)
-    if f <= 0:
-        return mask_l
+    fx = max(0, int(feather_x))
+    fy = max(0, int(feather_y))
+    corner = max(0, int(corner_radius))
 
-    m = np.array(mask_l, dtype=np.uint8)
-    fg = (m > 0).astype(np.uint8)
-    if fg.max() == 0:
-        return Image.new('L', mask_l.size, 0)
+    if w <= 0 or h <= 0:
+        return Image.new('L', (max(1, w), max(1, h)), 0)
 
-    dist = cv2.distanceTransform(
-        fg, distanceType=cv2.DIST_L2, maskSize=3).astype(np.float32)
+    if fx <= 0 and fy <= 0:
+        return Image.new('L', (w, h), 255)
 
-    if j > 0:
-        rng = np.random.default_rng(seed)
-        noise = rng.random(dist.shape, dtype=np.float32)
-        noise = (noise * 2.0) - 1.0  # [-1..1]
+    def _smooth_noise_1d(n: int, amp: float, sigma: float) -> np.ndarray:
+        """
+        Create smooth zero-mean 1D noise.
 
-        jb = int(max(0, jagged_blur))
-        if jb > 0:
-            k = 2 * jb + 1
-            noise = cv2.GaussianBlur(
-                noise, (k, k), sigmaX=0, sigmaY=0, borderType=cv2.BORDER_REFLECT)
+        Parameters
+        ----------
+        n : int
+            Number of samples.
+        amp : float
+            Target peak amplitude in pixels.
+        sigma : float
+            Gaussian smoothing sigma in samples.
 
-        # Local threshold shift: positive noise -> stronger erosion, negative -> weaker.
-        # This produces a boundary that wiggles inward/outward.
-        dist = dist - (noise * float(j))
+        Returns
+        -------
+        np.ndarray
+            Smooth noise of shape ``(n,)``.
+        """
+        if n <= 1 or amp <= 0.0:
+            return np.zeros((n,), dtype=np.float32)
 
-        # Clamp negatives: outside/over-eroded becomes zero.
-        dist = np.maximum(dist, 0.0)
+        noise = np.random.normal(0.0, 1.0, size=n).astype(np.float32)
 
-    # Feather ramp from the (possibly jittered) distance.
-    a = np.clip(dist / float(f), 0.0, 1.0)
-    a = a * a * (3.0 - 2.0 * a)  # smoothstep
-    out = (a * 255.0).astype(np.uint8)
+        sigma = max(1.0, float(sigma))
+        radius = max(1, int(round(3.0 * sigma)))
+        xs = np.arange(-radius, radius + 1, dtype=np.float32)
+        kernel = np.exp(-(xs ** 2) / (2.0 * sigma * sigma)).astype(np.float32)
+        kernel /= kernel.sum()
 
-    return Image.fromarray(out, mode='L')
+        smooth = np.convolve(noise, kernel, mode='same')
+
+        max_abs = float(np.max(np.abs(smooth)))
+        if max_abs > 1e-6:
+            smooth = smooth / max_abs
+
+        return smooth * float(amp)
+
+    def _smoothstep(x: np.ndarray) -> np.ndarray:
+        """
+        Apply smoothstep on ``[0, 1]``.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Input values in ``[0, 1]``.
+
+        Returns
+        -------
+        np.ndarray
+            Smoothstep output.
+        """
+        return x * x * (3.0 - 2.0 * x)
+
+    # A small inward bias helps hide mismatched crop borders.
+    bias_x = max(1, int(round(fx * 0.15))) if fx > 0 else 0
+    bias_y = max(1, int(round(fy * 0.15))) if fy > 0 else 0
+
+    x0 = bias_x
+    y0 = bias_y
+    x1 = (w - 1) - bias_x
+    y1 = (h - 1) - bias_y
+
+    if x1 <= x0 or y1 <= y0:
+        return Image.new('L', (w, h), 255)
+
+    support_w = x1 - x0 + 1
+    support_h = y1 - y0 + 1
+
+    # Clamp corner radius to valid support geometry.
+    max_corner = max(0, (min(support_w, support_h) // 2) - 1)
+    corner = min(corner, max_corner)
+
+    # Perturbation amplitude is proportional to feather width.
+    amp_x = 0.35 * float(fx) if fx > 0 else 0.0
+    amp_y = 0.35 * float(fy) if fy > 0 else 0.0
+
+    # Smoothing scale for side jitter. The exact factor is heuristic.
+    sigma_x = max(1.0, max(fx, fy) * 0.35)
+    sigma_y = max(1.0, max(fx, fy) * 0.35)
+
+    # Vertical borders vary along y; horizontal borders vary along x.
+    left_jitter = _smooth_noise_1d(h, amp=amp_x, sigma=sigma_y)
+    right_jitter = _smooth_noise_1d(h, amp=amp_x, sigma=sigma_y)
+    top_jitter = _smooth_noise_1d(w, amp=amp_y, sigma=sigma_x)
+    bottom_jitter = _smooth_noise_1d(w, amp=amp_y, sigma=sigma_x)
+
+    left_edge = x0 + left_jitter
+    right_edge = x1 + right_jitter
+    top_edge = y0 + top_jitter
+    bottom_edge = y1 + bottom_jitter
+
+    left_edge = np.clip(left_edge, 0.0, float(w - 1))
+    right_edge = np.clip(right_edge, 0.0, float(w - 1))
+    top_edge = np.clip(top_edge, 0.0, float(h - 1))
+    bottom_edge = np.clip(bottom_edge, 0.0, float(h - 1))
+
+    # Keep borders from crossing.
+    min_gap_x = max(1.0, float(fx if fx > 0 else 1))
+    min_gap_y = max(1.0, float(fy if fy > 0 else 1))
+    right_edge = np.maximum(right_edge, left_edge + min_gap_x)
+    bottom_edge = np.maximum(bottom_edge, top_edge + min_gap_y)
+
+    right_edge = np.clip(right_edge, 0.0, float(w - 1))
+    bottom_edge = np.clip(bottom_edge, 0.0, float(h - 1))
+
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    yy = np.arange(h, dtype=np.float32)[:, None]
+
+    # Distances to the four perturbed sides.
+    dist_left = xx - left_edge[:, None]
+    dist_right = right_edge[:, None] - xx
+    dist_top = yy - top_edge[None, :]
+    dist_bottom = bottom_edge[None, :] - yy
+
+    # Distance to the nearest vertical or horizontal side.
+    dist_x = np.minimum(dist_left, dist_right)
+    dist_y = np.minimum(dist_top, dist_bottom)
+
+    inside = (dist_x >= 0.0) & (dist_y >= 0.0)
+
+    if fx > 0:
+        tx = np.clip(dist_x / float(fx), 0.0, 1.0)
+    else:
+        tx = np.ones((h, w), dtype=np.float32)
+
+    if fy > 0:
+        ty = np.clip(dist_y / float(fy), 0.0, 1.0)
+    else:
+        ty = np.ones((h, w), dtype=np.float32)
+
+    # Base anisotropic ramp: the nearest side dominates.
+    t = np.minimum(tx, ty)
+
+    # Apply rounded-corner constraints with radial ramps.
+    #
+    # The support region behaves as a rounded rectangle:
+    # - side ramps control straight border segments
+    # - radial ramps control the four corner arcs
+    if corner > 0:
+        fr = max(1, min(fx if fx > 0 else corner, fy if fy > 0 else corner))
+        fr = min(fr, corner)
+
+        if fr > 0:
+            # Corner boxes.
+            tl_mask = (xx < (x0 + corner)) & (yy < (y0 + corner))
+            tr_mask = (xx > (x1 - corner)) & (yy < (y0 + corner))
+            bl_mask = (xx < (x0 + corner)) & (yy > (y1 - corner))
+            br_mask = (xx > (x1 - corner)) & (yy > (y1 - corner))
+
+            # Arc centers.
+            cx_tl, cy_tl = float(x0 + corner), float(y0 + corner)
+            cx_tr, cy_tr = float(x1 - corner), float(y0 + corner)
+            cx_bl, cy_bl = float(x0 + corner), float(y1 - corner)
+            cx_br, cy_br = float(x1 - corner), float(y1 - corner)
+
+            # Radial distance fields.
+            d_tl = np.sqrt((xx - cx_tl) ** 2 + (yy - cy_tl) ** 2)
+            d_tr = np.sqrt((xx - cx_tr) ** 2 + (yy - cy_tr) ** 2)
+            d_bl = np.sqrt((xx - cx_bl) ** 2 + (yy - cy_bl) ** 2)
+            d_br = np.sqrt((xx - cx_br) ** 2 + (yy - cy_br) ** 2)
+
+            # Pixels are fully opaque sufficiently inside the arc,
+            # fade over ``fr`` pixels, and become transparent outside.
+            t_tl = np.clip((float(corner) - d_tl) / float(fr), 0.0, 1.0)
+            t_tr = np.clip((float(corner) - d_tr) / float(fr), 0.0, 1.0)
+            t_bl = np.clip((float(corner) - d_bl) / float(fr), 0.0, 1.0)
+            t_br = np.clip((float(corner) - d_br) / float(fr), 0.0, 1.0)
+
+            t[tl_mask] = np.minimum(t[tl_mask], t_tl[tl_mask])
+            t[tr_mask] = np.minimum(t[tr_mask], t_tr[tr_mask])
+            t[bl_mask] = np.minimum(t[bl_mask], t_bl[bl_mask])
+            t[br_mask] = np.minimum(t[br_mask], t_br[br_mask])
+
+            # Update inside-mask so pixels outside the rounded corners are removed.
+            inside_tl = (~tl_mask) | (d_tl <= float(corner))
+            inside_tr = (~tr_mask) | (d_tr <= float(corner))
+            inside_bl = (~bl_mask) | (d_bl <= float(corner))
+            inside_br = (~br_mask) | (d_br <= float(corner))
+
+            inside &= inside_tl & inside_tr & inside_bl & inside_br
+
+    t[~inside] = 0.0
+
+    # Smooth the perceptual falloff.
+    t = _smoothstep(t)
+
+    alpha = np.clip(t * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    return Image.fromarray(alpha, mode='L')
 
 
 @dataclass
@@ -330,8 +599,8 @@ class ImageLayerAttachmentSink(AttachmentSink):
             1. Crop a region from an image.
             2. Refine it independently (e.g. via ``Img2Img``).
             3. Reinsert it into a stack using the original position and size.
-        - The transform input overrides only spatial parameters
-        (position and resize). Blending mode and feathering remain unchanged.
+        - The transform input overrides only spatial parameters (position and
+          resize).
         - The transform mechanism assumes that the stack canvas shares the same
         coordinate reference as the image from which the crop was generated.
         """
@@ -348,9 +617,9 @@ class ImageStack(NodeRef):
     """
     Layer-based image compositor node.
 
-    ``ImageStack`` is a deterministic, geometry-driven compositing node that
-    collects multiple upstream images via typed sinks created by :meth:`image`
-    and composites them in ascending ``idx`` order onto a configurable canvas.
+    ``ImageStack`` is a geometry-driven compositing node that collects multiple
+    upstream images via typed sinks created by :meth:`image` and composites
+    them in ascending ``idx`` order onto a configurable canvas.
 
     The node is designed for DAG-native compositing workflows such as:
 
@@ -363,7 +632,7 @@ class ImageStack(NodeRef):
     -----------
     Each upstream connection declared via :meth:`image` defines a *layer*.
 
-    Layers are rendered deterministically:
+    Layers are rendered deterministically with respect to ordering:
 
     - lowest ``idx`` → bottom layer
     - highest ``idx`` → top layer
@@ -372,7 +641,7 @@ class ImageStack(NodeRef):
 
     1. Load upstream image and convert to ``RGBA``.
     2. Apply optional resizing (``resize``).
-    3. Optionally feather the alpha channel (``feather``).
+    3. Optionally soften the layer edges (``feather``).
     4. Resolve placement center (``position``) on the canvas.
     5. Alpha-composite the layer onto the canvas.
 
@@ -414,11 +683,11 @@ class ImageStack(NodeRef):
     -----------
     The ``position`` parameter controls layer placement on the canvas.
 
-    - If a tuple ``(x, y)`` is provided, it is interpreted as the *center*
-    of the layer in canvas pixel coordinates.
-    - If a string anchor is provided, the layer is attached to the corresponding
-    edge or corner such that its bounding box touches the canvas border(s),
-    not such that its center lies on the border.
+    - If a tuple ``(x, y)`` is provided, it represents the *center* of the
+      layer in canvas pixel coordinates.
+    - If a string anchor is provided, the layer is attached to the
+      corresponding edge or corner such that its bounding box touches the
+      canvas border(s), not such that its center lies on the border.
 
     Supported anchors include:
 
@@ -451,28 +720,36 @@ class ImageStack(NodeRef):
     If no transform input is provided, the layer uses the geometry
     declared explicitly via :meth:`image`.
 
-    Blending
-    --------
-    Currently supported blend modes:
-
-    - ``'alpha'``:
-        Standard alpha compositing using the layer's alpha channel.
-
-    The compositor is purely geometric and does not perform:
-
-    - color matching,
-    - lighting harmonization,
-    - shadow synthesis,
-    - edge relighting.
-
     Feathering
     ----------
-    ``feather`` applies a Gaussian blur to the layer’s alpha channel
-    before compositing. This is particularly useful for:
+    ``feather`` softens layer edges before compositing.
 
-    - segmentation cutouts,
-    - hair or soft contours,
-    - reintegration of refined subregions.
+    Accepted formats:
+
+    - ``int`` → feather width in pixels
+    - ``"<number>px"`` → explicit pixel units
+    - ``"<number>%"`` → percentage of the layer size
+
+    The behavior depends on the alpha channel of the layer.
+
+    **Fully opaque alpha (typical for ``crop_mode='bbox'``):**
+
+    - The layer contains no transparency.
+    - A synthetic alpha mask is generated.
+    - The mask edge is softened using a feather ramp derived from
+      the specified feather width.
+    - When a percentage is used, the feather width is resolved
+      independently for the horizontal and vertical axes.
+
+    **Non-uniform alpha (e.g. segmentation masks or subject cutouts):**
+
+    - The existing alpha channel is preserved.
+    - The existing alpha channel is refined and softened using a small
+      erosion followed by Gaussian blur.
+    - Percentage values are resolved relative to the average of the
+      layer width and height.
+
+    A value of ``0`` disables feathering.
 
     Configuration
     -------------
@@ -492,7 +769,7 @@ class ImageStack(NodeRef):
 
     Methods
     -------
-    image(idx: int, position='center', resize=None, blend='alpha', feather=0)
+    image(idx: int, position='center', resize=None, feather=0)
         Declare a compositing layer and return an :class:`AttachmentSink`
         for wiring.
 
@@ -517,9 +794,11 @@ class ImageStack(NodeRef):
     Notes
     -----
     - Upstream nodes must provide an image path under ``'image'`` or ``'path'``.
-    - Layers are composited deterministically.
+    - Layers are composited deterministically with respect to ordering.
     - Layers extending beyond canvas bounds are safely clipped.
-    - The node is deterministic and contains no stochastic components.
+    - Synthetic alpha masks used for fully opaque layers include a small
+      stochastic edge perturbation to reduce visible rectangular seams.
+      Consequently, the exact output pixels may vary slightly between runs.
     """
 
     spec: SpecInput = field(default_factory=dict)
@@ -535,12 +814,8 @@ class ImageStack(NodeRef):
         *,
         position: Pos = 'center',
         resize: ResizeMode = None,
-        blend: BlendMode = 'alpha',
-        feather: int = 0,
+        feather: int | str = 0,
         corner_radius: Optional[int] = None,
-        edge_bleed: bool = False,
-        edge_bleed_strength: float = 1.0,
-        edge_bleed_gamma: float = 1.0,
     ) -> ImageLayerAttachmentSink:
         """
         Declare an input image layer.
@@ -580,42 +855,67 @@ class ImageStack(NodeRef):
 
             Default: ``"center"``.
 
-        resize : tuple[int | None, int | None] or {"fit", "cover"} or None, optional
+        resize : tuple[int | str | None, int | str | None] or {"fit", "cover"} or
+                 None, optional
             Optional resizing applied before placement.
 
+            Accepted forms:
+
             - ``None``:
-                No resizing; original image size is preserved.
-            - ``(W, H)``:
-                Force exact size in pixels.
-            - ``(W, None)``:
-                Set width to ``W`` and preserve aspect ratio.
-            - ``(None, H)``:
-                Set height to ``H`` and preserve aspect ratio.
+            No resizing. The original image size is preserved.
+
             - ``"fit"``:
-                Resize isotropically to the largest size that fits entirely
-                inside the canvas without distortion.
+            Isotropic resize to the largest size that fits entirely inside
+            the canvas without distortion.
+
             - ``"cover"``:
-                Resize isotropically to the smallest size that fully covers
-                the canvas without distortion. The layer may extend beyond
-                canvas bounds and will be cropped during compositing.
+            Isotropic resize to the smallest size that fully covers the canvas
+            without distortion. The layer may extend beyond canvas bounds and
+            will be cropped during compositing.
 
-        blend : {"alpha"}, optional
-            Blending mode used during compositing.
+            - ``(W, H)``:
+            Explicit target size.
 
-            Currently supported:
-            - ``"alpha"`` → standard alpha compositing using the image's
-            alpha channel (or opaque if absent).
+            Each component may be:
 
-            Default: ``"alpha"``.
+            - ``int`` → size in pixels
+            - ``"<number>px"`` → explicit pixel units
+            - ``"<number>%"`` → percentage of the canvas dimension
+                (width for ``W``, height for ``H``)
+            - ``None`` → keep aspect ratio along that axis
 
-        feather : int, optional
-            Gaussian blur radius (in pixels) applied to the layer's alpha
-            channel before compositing.
+            Examples:
 
-            Useful for:
-            - softening segmentation edges,
-            - blending cutouts into backgrounds,
-            - reducing visible halos.
+            - ``(512, 512)`` → force exact size
+            - ``("50%", None)`` → width = 50% of canvas, height scaled to preserve aspect ratio
+            - ``(None, "30%")`` → height = 30% of canvas, width scaled proportionally
+
+        feather : int or str, optional
+            Feathering applied to the layer edges before compositing.
+
+            Supported formats:
+
+            - ``int`` → feather width in pixels
+            - ``"<number>px"`` → explicit pixel units
+            - ``"<number>%"`` → percentage of the layer size
+
+            The interpretation depends on the alpha channel of the layer:
+
+            **Opaque alpha (typical for ``crop_mode='bbox'``):**
+
+            - The alpha channel contains no transparency.
+            - A synthetic alpha mask is generated.
+            - The mask edge is softened using a feather ramp whose width is
+              derived from ``feather``.
+            - When a percentage is used, the feather width is resolved
+              independently for the horizontal and vertical axes.
+
+            **Non-uniform alpha (e.g. segmentation masks, subject cutouts):**
+
+            - The existing alpha channel is preserved.
+            - A Gaussian blur is applied to the alpha channel to soften edges.
+            - Percentage values are resolved relative to the average of the
+            layer width and height.
 
             A value of ``0`` disables feathering.
 
@@ -623,28 +923,23 @@ class ImageStack(NodeRef):
 
         corner_radius : int or None, optional
             Corner rounding radius (in pixels) used when generating the
-            synthetic alpha mask for fully opaque layers (e.g. layers
-            originating from ``crop_mode='bbox'``).
+            synthetic alpha mask for fully opaque layers.
 
-            This parameter only affects the fallback mask that is constructed
-            when the layer alpha channel is completely opaque. In that case,
-            a filled rectangle (optionally rounded) is created and then blurred
-            to produce a soft edge.
+            This parameter only affects layers whose alpha channel is
+            completely opaque (e.g. ``crop_mode='bbox'``). In that case,
+            the synthetic support region used for feathering may optionally
+            use rounded corners.
 
             - ``None``:
-                Automatic mode. The corner radius is derived heuristically
-                from the ``feather`` radius to preserve backward-compatible
-                behavior.
+            Automatic mode. The corner radius may be derived heuristically
+            from the feather width.
             - ``0``:
-                Disable corner rounding. A standard rectangle is used before
-                applying Gaussian blur.
+            Disable corner rounding. A rectangular support region is used.
             - ``> 0``:
-                Explicit corner radius in pixels. The value is clamped at
-                runtime to avoid geometrically invalid rounding.
+            Explicit corner radius in pixels.
 
-            This parameter does not affect layers that already contain a
-            non-uniform alpha channel (e.g. segmentation masks). In those
-            cases, only Gaussian blur is applied to the existing alpha.
+            This parameter has no effect when the layer already contains
+            transparency (e.g. segmentation masks).
 
             Default: ``None``.
 
@@ -689,26 +984,15 @@ class ImageStack(NodeRef):
                     )
 
                 if w_target is not None:
-                    if not isinstance(w_target, int) or w_target <= 0:
-                        raise ValueError(
-                            f'{self.id}: resize width must be positive int or None, '
-                            f'got {w_target!r}'
-                        )
+                    validate_size_expr(w_target)
 
                 if h_target is not None:
-                    if not isinstance(h_target, int) or h_target <= 0:
-                        raise ValueError(
-                            f'{self.id}: resize height must be positive int or None, '
-                            f'got {h_target!r}'
-                        )
+                    validate_size_expr(h_target)
 
             else:
                 raise TypeError(
                     f'{self.id}: resize must be None, tuple or str, got {type(resize)}'
                 )
-
-        if blend != 'alpha':
-            raise ValueError(f'{self.id}: unsupported blend={blend!r}')
 
         idx = int(idx)
 
@@ -718,17 +1002,22 @@ class ImageStack(NodeRef):
                 'Each layer index must be unique.'
             )
 
-        corner_radius = corner_radius if corner_radius is None \
-            else int(corner_radius)
+        if corner_radius is not None:
+            corner_radius = int(corner_radius)
+
+            if corner_radius < 0:
+                raise ValueError(
+                    f"{self.id}: 'corner_radius' cannot be negative."
+                )
+
+        validate_size_expr(feather)
 
         self._layers[idx] = LayerSpec(
             idx=idx,
             position=position,
             resize=resize,
-            blend=blend,
-            feather=int(feather),
-            corner_radius=corner_radius if corner_radius is None else int(
-                corner_radius),
+            feather=feather,
+            corner_radius=corner_radius,
         )
 
         return ImageLayerAttachmentSink(
@@ -811,70 +1100,62 @@ class ImageStack(NodeRef):
                 layer, resize, cfg.width, cfg.height
             )
 
-            synthetic_alpha = False
+            lw, lh = layer.size
 
             # feather (alpha handling)
-            if layer_spec.feather and layer_spec.feather > 0:
-                rad = int(layer_spec.feather)
+            if feather_is_nonzero(layer_spec.feather):
                 r, g, b, a = layer.split()
 
                 # If alpha is fully opaque (typical for crop_mode='bbox'),
                 # blurring it does nothing. Build a soft-edge alpha mask instead.
                 a_min, a_max = a.getextrema()
+
                 if a_min == 255 and a_max == 255:
-                    lw, lh = layer.size
-
-                    # Start from transparent and paint an inset fully-opaque rect,
-                    # then blur -> produces a soft falloff near the layer borders.
-                    m = Image.new('L', (lw, lh), 0)
-                    draw = ImageDraw.Draw(m)
-
-                    inset = rad
-                    x0, y0 = inset, inset
-                    x1, y1 = lw - inset - 1, lh - inset - 1
-
-                    # Corner rounding radius (in pixels).
-                    # - None: backward compatible heuristic based on feather radius
-                    # - 0: no rounding
-                    # - >0: explicit
-                    if layer_spec.corner_radius is None:
-                        corner = max(1, int(round(rad * 3)))
-                    else:
-                        corner = int(layer_spec.corner_radius)
-
-                    # Clamp to avoid impossible / over-rounding geometries
-                    max_corner = max(0, (min(lw, lh) // 2) - 1)
-                    if corner < 0:
-                        corner = 0
-                    if corner > max_corner:
-                        corner = max_corner
-
-                    if (x1 - x0) > 1 and (y1 - y0) > 1:
-                        # Prefer rounded corners so the gradient doesn't look "boxy".
-                        # If corner == 0, draw a normal rectangle (no rounding).
-                        if corner > 0 and hasattr(draw, 'rounded_rectangle'):
-                            draw.rounded_rectangle(
-                                [x0, y0, x1, y1], radius=corner, fill=255
-                            )
-                        else:
-                            # Pillow too old: fallback to normal rectangle.
-                            draw.rectangle([x0, y0, x1, y1], fill=255)
-                    else:
-                        # fallback: very small layer, just fill
-                        draw.rectangle([0, 0, lw - 1, lh - 1], fill=255)
-
-                    # a = m.filter(ImageFilter.GaussianBlur(radius=rad))
-                    a = _jagged_cut_and_feather(
-                        m,
-                        feather=rad,
-                        jagged=rad // 2,
-                        jagged_blur=rad,
+                    feather_x, feather_y = resolve_feather_xy(
+                        layer_spec.feather,
+                        width=lw,
+                        height=lh,
                     )
+                    if feather_x > 0 or feather_y > 0:
+                        # Corner rounding radius (in pixels).
+                        # - None: backward compatible heuristic based on feather radius
+                        # - 0: no rounding
+                        # - >0: explicit
+                        if layer_spec.corner_radius is None:
+                            corner = int((feather_x + feather_y) * 3.0 / 2.0)
+                        else:
+                            corner = int(layer_spec.corner_radius)
+
+                        # Clamp to avoid impossible / over-rounding geometries
+                        max_corner = max(0, (min(lw, lh) // 2) - 1)
+                        corner = max(0, min(corner, max_corner))
+
+                        a = _perturbed_alpha_ramp(
+                            lw,
+                            lh,
+                            feather_x=feather_x,
+                            feather_y=feather_y,
+                            corner_radius=corner,
+                        )
+                        layer = Image.merge('RGBA', (r, g, b, a))
+
                 else:
                     # Normal case: soften existing cutout edges
-                    a = a.filter(ImageFilter.GaussianBlur(radius=rad))
-
-                layer = Image.merge('RGBA', (r, g, b, a))
+                    rad = resolve_feather_radius(
+                        layer_spec.feather,
+                        width=lw,
+                        height=lh,
+                    )
+                    if rad > 0:
+                        trim = min(2, max(1, rad // 10)) if rad > 0 else 0
+                        a_core = a.filter(
+                            ImageFilter.MinFilter(trim * 2 + 1)
+                        )
+                        a_soft = a_core.filter(
+                            ImageFilter.GaussianBlur(radius=rad)
+                        )
+                        a = ImageChops.darker(a_soft, a)
+                        layer = Image.merge('RGBA', (r, g, b, a))
 
             cx, cy = _resolve_center_xy(
                 position,
@@ -911,7 +1192,6 @@ class ImageStack(NodeRef):
                         'idx': ls.idx,
                         'position': ls.position,
                         'resize': ls.resize,
-                        'blend': ls.blend,
                         'feather': ls.feather,
                     }
                     for ls in (self._layers[i] for i in sorted(self._layers.keys()))

@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, Sequence, Union
+from typing import Any, Dict, Literal, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -18,14 +18,44 @@ from stability.nodes.sdxl_resolve import resolve_single_image_path
 CropMode = Literal['bbox', 'trim', 'full_frame']
 
 
+def _tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
+    """
+    Return the minimal end-exclusive box containing non-zero alpha pixels.
+
+    Parameters
+    ----------
+    alpha : np.ndarray
+        Alpha channel with shape ``(H, W)``.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Tight bounding box ``(x1, y1, x2, y2)`` in local coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If the alpha channel contains no non-zero pixels.
+    """
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        raise RuntimeError('Trimmed crop has no non-transparent pixels.')
+
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+    return x1, y1, x2, y2
+
+
 @dataclass
 class Config:
     device: str
-    yolo_model: str
+    yolo_model: Optional[str]
     sam_checkpoint: str
     sam_model_type: Optional[str]
     mode: str
-    crop_mode: CropMode
+    crop_mode: Optional[CropMode]
     conf: float
     box_margin: float
     multimask: bool
@@ -58,12 +88,15 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         raise ValueError(f"'{node_id}': Invalid mode={mode!r}")
 
     # It should apply only when mode='default'
-    crop_mode = str(params.get('crop_mode', 'trim'))
-    if crop_mode not in ('bbox', 'trim', 'full_frame'):
-        raise ValueError(
-            f"'{node_id}': invalid crop_mode={crop_mode!r} "
-            "(expected 'bbox', 'trim', or 'full_frame')"
-        )
+    if mode == 'default':
+        crop_mode = str(params.get('crop_mode', 'trim'))
+        if crop_mode not in ('bbox', 'trim', 'full_frame'):
+            raise ValueError(
+                f"'{node_id}': invalid crop_mode={crop_mode!r} "
+                "(expected 'bbox', 'trim', or 'full_frame')"
+            )
+    else:
+        crop_mode = None
 
     conf = float(params.get('conf', 0.35))
     box_margin = float(params.get('box_margin', 0.12))
@@ -183,20 +216,20 @@ def _mp_largest_face_bbox_xyxy(
             area = (x2 - x1) * (y2 - y1)
             candidates.append((area, x1, y1, x2, y2))
 
-    if not candidates:
-        # fallback: ignore score filtering
-        for landmarks in face_landmarks_list:
-            xs = [lm.x for lm in landmarks]
-            ys = [lm.y for lm in landmarks]
+    # if not candidates:
+    #     # fallback: ignore score filtering
+    #     for landmarks in face_landmarks_list:
+    #         xs = [lm.x for lm in landmarks]
+    #         ys = [lm.y for lm in landmarks]
 
-            x1 = max(0, int(round(min(xs) * w)))
-            y1 = max(0, int(round(min(ys) * h)))
-            x2 = min(w, int(round(max(xs) * w)))
-            y2 = min(h, int(round(max(ys) * h)))
+    #         x1 = max(0, int(round(min(xs) * w)))
+    #         y1 = max(0, int(round(min(ys) * h)))
+    #         x2 = min(w, int(round(max(xs) * w)))
+    #         y2 = min(h, int(round(max(ys) * h)))
 
-            if x2 > x1 and y2 > y1:
-                area = (x2 - x1) * (y2 - y1)
-                candidates.append((area, x1, y1, x2, y2))
+    #         if x2 > x1 and y2 > y1:
+    #             area = (x2 - x1) * (y2 - y1)
+    #             candidates.append((area, x1, y1, x2, y2))
 
     if not candidates:
         raise RuntimeError('Could not derive valid face bbox from landmarks.')
@@ -649,10 +682,9 @@ class SubjectCrop(NodeRef):
                     img2img without transparency.
 
                 - ``'trim'``:
-                    Output is the rectangular crop inside the bounding box, but alpha
-                    comes from SAM; background becomes transparent outside the mask.
-                    Use this for cutouts to be composited elsewhere.
-
+                    Output is an RGBA cutout cropped to the selected bounding box, with
+                    alpha derived from the mask. The result is then tightly trimmed to
+                    the minimal box containing non-transparent pixels.
                 - ``'full_frame'``:
                     Same cutout as ``'trim'`` but placed back into a full-size RGBA
                     canvas of the original image dimensions, preserving the original
@@ -715,6 +747,8 @@ class SubjectCrop(NodeRef):
         ``bbox_xyxy`` : list[int]
             Bounding box used to run SAM (typically person bbox; for face mode,
             the face bbox).
+        ``params`` : dict
+            Configuration parameters.
         ``crop`` : dict
             Crop metadata useful for reinsertion/compositing:
 
@@ -723,8 +757,6 @@ class SubjectCrop(NodeRef):
                 original image.
             ``bbox_size`` : list[int]
                 Width/height of the crop box in pixels: ``[b_width, b_height]``.
-            ``crop_mode`` : str
-                The resolved crop mode.
 
         ``metadata`` : str
             JSON sidecar path.
@@ -986,33 +1018,50 @@ class SubjectCrop(NodeRef):
             ext='png',
         )
 
-        b_width = int(crop_x2 - crop_x1)
-        b_height = int(crop_y2 - crop_y1)
-        anchor_x = int((crop_x1 + crop_x2) // 2)
-        anchor_y = int((crop_y1 + crop_y2) // 2)
+        out_x1 = int(crop_x1)
+        out_y1 = int(crop_y1)
+        out_x2 = int(crop_x2)
+        out_y2 = int(crop_y2)
 
         if cfg.mode == 'default':
             crop_rgb = img_rgb[crop_y1:crop_y2, crop_x1:crop_x2, :]
+            crop_h = int(crop_y2 - crop_y1)
+            crop_w = int(crop_x2 - crop_x1)
 
             if cfg.crop_mode == 'bbox':
-                # background incluso → alpha pieno
-                alpha = np.full((b_height, b_width), 255, dtype=np.uint8)
+                # Include the original background inside the crop; alpha is fully opaque.
+                alpha = np.full((crop_h, crop_w), 255, dtype=np.uint8)
                 crop_rgba = np.dstack([crop_rgb, alpha])
                 Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
             else:
-                # 'trim' e 'full_frame' → alpha dalla mask
+                # 'trim' and 'full_frame' -> alpha of mask
                 alpha = (crop_mask.astype(np.uint8) * 255)
                 crop_rgba = np.dstack([crop_rgb, alpha])
 
                 if cfg.crop_mode == 'trim':
+                    tx1, ty1, tx2, ty2 = _tight_alpha_bbox(alpha)
+                    crop_rgba = crop_rgba[ty1:ty2, tx1:tx2, :]
+
+                    out_x1 = int(crop_x1 + tx1)
+                    out_y1 = int(crop_y1 + ty1)
+                    out_x2 = int(crop_x1 + tx2)
+                    out_y2 = int(crop_y1 + ty2)
+
                     Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
                 elif cfg.crop_mode == 'full_frame':
                     full_rgba = np.zeros((h, w, 4), dtype=np.uint8)
                     full_rgba[crop_y1:crop_y2, crop_x1:crop_x2, :] = crop_rgba
-                    Image.fromarray(full_rgba, mode='RGBA').save(out_path)
 
+                    # For full-frame outputs, crop metadata must describe the output image
+                    # itself in source-image coordinates.
+                    out_x1 = 0
+                    out_y1 = 0
+                    out_x2 = w
+                    out_y2 = h
+
+                    Image.fromarray(full_rgba, mode='RGBA').save(out_path)
                 else:
                     raise ValueError(
                         f'{self.id}: invalid crop_mode={cfg.crop_mode!r}')
@@ -1045,6 +1094,11 @@ class SubjectCrop(NodeRef):
             cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (255, 0, 0), 3)
             dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')
             Image.fromarray(dbg).save(dbg_path)
+
+        b_width = int(out_x2 - out_x1)
+        b_height = int(out_y2 - out_y1)
+        anchor_x = int((out_x1 + out_x2) // 2)
+        anchor_y = int((out_y1 + out_y2) // 2)
 
         out = {
             'ok': True,

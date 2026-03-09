@@ -13,7 +13,7 @@ def cutout_stack_img2img_group(
     name: str,
     *,
     out_spec: SpecInput,
-    fg_layer_feather: int = 5,
+    fg_layer_feather: int | str = '0.5%',
     fg_layer_position: str = 'center',
     fg_layer_resize: ResizeMode = None,
 ) -> NodeGroup:

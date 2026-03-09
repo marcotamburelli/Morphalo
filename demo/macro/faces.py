@@ -17,7 +17,7 @@ def refine_face_group(
     stack_spec: SpecInput = {},
     face_id_scale: float,
     face_id_clip_strength: float = 1.0,
-    layer_feather: int = 30,
+    layer_feather: int | str = 30,
     layer_corner_radius: int = 50,
 ) -> NodeGroup:
     """
