@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from stability.core.paths import load_latest_output
@@ -48,7 +49,6 @@ def _execute(
         to_execute: set[str] = set()
 
         for node in entries:
-            # FIXME This part could be broken: see Bug#20
             node_id = node.id
             in_ups = {
                 e.edge.input_id: _resolve_output(e)
@@ -253,7 +253,7 @@ class SingleNodeRunner:
         if self.force_upstream:
             cached = {
                 n.id for n in self.__dag.nodes
-                if load_latest_output(self.__dag.out_dir, n.id) is not None
+                if self.load_output(n.id) is not None
             }
 
             # expand with uncached upstream
@@ -273,8 +273,11 @@ class SingleNodeRunner:
         edges_R = [
             e for e in self.__dag.edges if e.node_from in R and e.node_to in R
         ]
+        # All edges entering R: needed to hydrate inputs of nodes in R,
+        # including lateral/cached dependencies coming from outside R.
         executions_R = [
-            e for e in self._executions if e.edge.node_from in R and e.edge.node_to in R
+            ex for ex in self._executions
+            if ex.edge.node_to in R
         ]
 
         _execute(

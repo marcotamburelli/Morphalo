@@ -28,6 +28,9 @@ class CacheWritingSource(SourceNode):
         self.cache[self.id] = out
         return out
 
+# SingleNodeRunner expects a prebuilt execution list.
+# In production this is normally created by DAGRunner.
+
 
 def _build_executions(dag: DAG) -> list[Execution]:
     """
@@ -224,3 +227,262 @@ def test_run_downstream_intricate_graph_executes_correct_subgraph(tmp_path, monk
     # Extract correctness: pick the 'attachment' branch value (20)
     assert e.last_input is not None
     assert e
+
+
+# Checks run_downstream for cached lateral dependencies
+def test_run_downstream_uses_cached_lateral_dependencies_when_force_upstream_false(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Graph
+    -----
+      S1 -> P1 -----
+                  \
+                   -> M -> E -> P3
+                  /
+      S2 -> P2 --(attachment)
+
+    Target
+    ------
+    run_downstream(M, force_upstream=False)
+
+    Setup
+    -----
+    P1 and P2 are precomputed in cache.
+
+    Expected behavior
+    -----------------
+    The runner should:
+    - execute M, E, P3
+    - NOT execute S1/P1/S2/P2
+    - use cached outputs for both inputs of M
+    """
+    from tests.dag.nodes import ExtractNode
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    _patch_load_latest_output(monkeypatch, cache)
+
+    with DAG('downstream_cached_lateral', out_dir=tmp_path) as dag:
+        s1 = CacheWritingSource(name='S1', value=10, cache=cache)
+        p1 = PassNode(name='P1')
+        s1 >> p1
+
+        s2 = CacheWritingSource(name='S2', value=20, cache=cache)
+        p2 = PassNode(name='P2')
+        s2 >> p2
+
+        m = MergeNode(name='M')
+        p1 >> m
+        p2 >> m.sink(name='P2_to_M', input_id='attachment')
+
+        e = ExtractNode(name='E', key='attachment')
+        p3 = PassNode(name='P3')
+        m >> e >> p3
+
+    # Precompute both upstream branches, but do it manually so the runner
+    # must consume them from cache rather than execute them again.
+    s1_out = s1.run(tmp_path)
+    p1_out = p1.run(tmp_path, input={'default': s1_out})
+    s2_out = s2.run(tmp_path)
+    p2_out = p2.run(tmp_path, input={'default': s2_out})
+
+    cache[s1.id] = s1_out
+    cache[p1.id] = p1_out
+    cache[s2.id] = s2_out
+    cache[p2.id] = p2_out
+
+    runner = SingleNodeRunner(
+        node_id=m.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=False,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    runner.run_downstream()
+
+    # Upstream nodes were only executed during manual precomputation.
+    assert s1.calls == 1
+    assert p1.calls == 1
+    assert s2.calls == 1
+    assert p2.calls == 1
+
+    # Downstream execution starts at M.
+    assert m.calls == 1
+    assert e.calls == 1
+    assert p3.calls == 1
+
+    assert set(m.last_input.keys()) == {'default', 'attachment'}
+    assert m.last_input['default']['value'] == 10
+    assert m.last_input['attachment']['value'] == 20
+
+
+# run_downstream should fail since one lateral dependency of M is missing
+def test_run_downstream_fails_when_lateral_dependency_is_missing_and_force_upstream_false(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Graph
+    -----
+      S1 -> P1 -----
+                  \
+                   -> M -> E -> P3
+                  /
+      S2 -> P2 --(attachment)
+
+    Target
+    ------
+    run_downstream(M, force_upstream=False)
+
+    Setup
+    -----
+    Only P2 is precomputed in cache.
+    P1 is missing.
+
+    Expected behavior
+    -----------------
+    The runner must fail because M requires both inputs:
+    - default      <- P1
+    - attachment   <- P2
+
+    With force_upstream=False, the missing lateral dependency P1 must not be
+    materialized automatically, so execution should fail when M is reached.
+    """
+    from tests.dag.nodes import ExtractNode
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    _patch_load_latest_output(monkeypatch, cache)
+
+    with DAG('downstream_missing_lateral', out_dir=tmp_path) as dag:
+        s1 = CacheWritingSource(name='S1', value=10, cache=cache)
+        p1 = PassNode(name='P1')
+        s1 >> p1
+
+        s2 = CacheWritingSource(name='S2', value=20, cache=cache)
+        p2 = PassNode(name='P2')
+        s2 >> p2
+
+        m = MergeNode(name='M')
+        p1 >> m
+        p2 >> m.sink(name='P2_to_M', input_id='attachment')
+
+        e = ExtractNode(name='E', key='attachment')
+        p3 = PassNode(name='P3')
+        m >> e >> p3
+
+    # Precompute only the P2 branch.
+    s2_out = s2.run(tmp_path)
+    p2_out = p2.run(tmp_path, input={'default': s2_out})
+    cache[s2.id] = s2_out
+    cache[p2.id] = p2_out
+
+    runner = SingleNodeRunner(
+        node_id=m.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=False,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    with pytest.raises(Exception):
+        runner.run_downstream()
+
+    # P1 branch must not be auto-materialized.
+    assert s1.calls == 0
+    assert p1.calls == 0
+
+    # P2 branch was only executed during manual precomputation.
+    assert s2.calls == 1
+    assert p2.calls == 1
+
+    # M should not complete successfully.
+    assert e.calls == 0
+    assert p3.calls == 0
+
+
+# Checks run_downstream for materialized (force_upstream=True) lateral dependencies
+def test_run_downstream_materializes_missing_lateral_dependency_when_force_upstream_true(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Graph
+    -----
+      S1 -> P1 -----
+                  \
+                   -> M -> E -> P3
+                  /
+      S2 -> P2 --(attachment)
+
+    Target
+    ------
+    run_downstream(M, force_upstream=True)
+
+    Setup
+    -----
+    Only P2 is precomputed in cache.
+    P1 is missing.
+
+    Expected behavior
+    -----------------
+    The runner should detect that M also depends on P1, expand upstream
+    requirements accordingly, execute S1/P1, and then complete execution of
+    M -> E -> P3 successfully using:
+    - cached P2
+    - materialized P1
+    """
+    from tests.dag.nodes import ExtractNode
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    _patch_load_latest_output(monkeypatch, cache)
+
+    with DAG('downstream_force_lateral', out_dir=tmp_path) as dag:
+        s1 = CacheWritingSource(name='S1', value=10, cache=cache)
+        p1 = PassNode(name='P1')
+        s1 >> p1
+
+        s2 = CacheWritingSource(name='S2', value=20, cache=cache)
+        p2 = PassNode(name='P2')
+        s2 >> p2
+
+        m = MergeNode(name='M')
+        p1 >> m
+        p2 >> m.sink(name='P2_to_M', input_id='attachment')
+
+        e = ExtractNode(name='E', key='attachment')
+        p3 = PassNode(name='P3')
+        m >> e >> p3
+
+    # Precompute only the P2 branch; P1 is intentionally missing.
+    s2_out = s2.run(tmp_path)
+    p2_out = p2.run(tmp_path, input={'default': s2_out})
+    cache[s2.id] = s2_out
+    cache[p2.id] = p2_out
+
+    runner = SingleNodeRunner(
+        node_id=m.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=True,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    runner.run_downstream()
+
+    # P1 branch must be materialized by the runner.
+    assert s1.calls == 1
+    assert p1.calls == 1
+
+    # P2 branch must NOT be re-executed by the runner because it is already cached.
+    assert s2.calls == 1
+    assert p2.calls == 1
+
+    assert m.calls == 1
+    assert e.calls == 1
+    assert p3.calls == 1
+
+    assert set(m.last_input.keys()) == {'default', 'attachment'}
+    assert m.last_input['default']['value'] == 10
+    assert m.last_input['attachment']['value'] == 20
