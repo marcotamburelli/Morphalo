@@ -186,11 +186,12 @@ class SingleNodeRunner:
         self._run(node_from)  # build upstream (cycle guard is inside _run)
 
         out = self.load_output(node_from)
-        if out is None:
-            raise RuntimeError(
-                f'Upstream node {node_from!r} was executed but produced no cached output '
-                f'(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r}).'
-            )
+        # In theory None output is allowed
+        # if out is None:
+        #     raise RuntimeError(
+        #         f'Upstream node {node_from!r} was executed but produced no cached output '
+        #         f'(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r}).'
+        #     )
         return out
 
     def _run(self, node_id: str) -> None:

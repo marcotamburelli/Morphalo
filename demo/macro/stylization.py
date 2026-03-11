@@ -58,6 +58,7 @@ def stylize_subject_background_singlepass_group(
             spec={
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
                     'mode': 'mask',

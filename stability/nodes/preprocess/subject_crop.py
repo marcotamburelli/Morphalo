@@ -6,7 +6,8 @@ from typing import Any, Dict, Literal, Optional, Sequence, Union
 import numpy as np
 from PIL import Image
 
-from stability.cache.models import (get_mediapipe_face_landmarker, get_sam,
+from stability.cache.models import (get_mediapipe_face_landmarker,
+                                    get_mediapipe_pose_landmarker, get_sam,
                                     get_yolo)
 from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
@@ -65,6 +66,7 @@ class Config:
     target: str
     expansion: float
     face_landmarker_task: Optional[str]
+    pose_landmarker_task: str
     smoothing_radius: int
 
 
@@ -123,6 +125,13 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     face_landmarker_task = None
     yolo_model = None
 
+    pose_landmarker_task = model.get('pose_landmarker_task')
+    if pose_landmarker_task is None:
+        raise ValueError(
+            f"'{node_id}': target={target!r} requires model.pose_landmarker_task (MediaPipe .task path)"
+        )
+    pose_landmarker_task = str(pose_landmarker_task)
+
     if target in ('person', 'head'):
         yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
 
@@ -151,11 +160,32 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         target=target,
         expansion=expansion,
         face_landmarker_task=face_landmarker_task,
+        pose_landmarker_task=pose_landmarker_task,
         smoothing_radius=smoothing_radius,
     )
 
 
-def _largest_person_bbox_xyxy(res, node_id: str) -> tuple[int, int, int, int]:
+def _person_bboxes_xyxy(res, node_id: str) -> list[tuple[int, int, int, int]]:
+    """
+    Return all YOLO person detections as integer xyxy boxes.
+
+    Parameters
+    ----------
+    res : Any
+        Single YOLO prediction result.
+    node_id : str
+        Node id used for error messages.
+
+    Returns
+    -------
+    list[tuple[int, int, int, int]]
+        Person bounding boxes in ``(x1, y1, x2, y2)`` format.
+
+    Raises
+    ------
+    RuntimeError
+        If YOLO returns no boxes or no person detections.
+    """
     if res.boxes is None or len(res.boxes) == 0:
         raise RuntimeError(f'{node_id}: YOLO found no boxes.')
 
@@ -166,18 +196,345 @@ def _largest_person_bbox_xyxy(res, node_id: str) -> tuple[int, int, int, int]:
     if person_idx.size == 0:
         raise RuntimeError(f"{node_id}: YOLO found no 'person' detections.")
 
-    best_i, best_area = None, -1.0
-
+    out = []
     for i in person_idx:
-        x1, y1, x2, y2 = xyxy[i]
-        area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
-        if area > best_area:
-            best_area = area
-            best_i = int(i)
+        x1, y1, x2, y2 = xyxy[int(i)].tolist()
+        x1 = int(round(x1))
+        y1 = int(round(y1))
+        x2 = int(round(x2))
+        y2 = int(round(y2))
 
-    x1, y1, x2, y2 = xyxy[best_i].tolist()
+        if x2 > x1 and y2 > y1:
+            out.append((x1, y1, x2, y2))
 
-    return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+    if not out:
+        raise RuntimeError(f"{node_id}: YOLO found no valid 'person' boxes.")
+
+    out.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+
+    return out
+
+
+def _score_bbox_with_pose(
+    bbox_xyxy: tuple[int, int, int, int],
+    *,
+    pose_xy: np.ndarray,
+) -> tuple[float, float, float, float]:
+    """
+    Score a person bbox against pose landmarks.
+
+    Parameters
+    ----------
+    bbox_xyxy : tuple[int, int, int, int]
+        Candidate bbox in full-image coordinates.
+    pose_xy : np.ndarray
+        Pose landmarks with shape ``(33, 2)`` in full-image coordinates.
+        Missing landmarks are encoded as ``(-1, -1)``.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        Lexicographic score tuple:
+        - torso coverage
+        - landmark coverage ratio
+        - face landmark coverage ratio
+        - area
+    """
+    x1, y1, x2, y2 = bbox_xyxy
+
+    valid = (
+        (pose_xy[:, 0] >= 0) &
+        (pose_xy[:, 1] >= 0)
+    )
+    pts = pose_xy[valid]
+
+    if pts.size == 0:
+        area = float((x2 - x1) * (y2 - y1))
+        return (0.0, 0.0, 0.0, area)
+
+    inside = (
+        (pts[:, 0] >= x1) & (pts[:, 0] < x2) &
+        (pts[:, 1] >= y1) & (pts[:, 1] < y2)
+    )
+    landmark_ratio = float(np.mean(inside))
+
+    torso_ids = [11, 12, 23, 24]
+    torso_hits = 0
+    torso_total = 0
+    for idx in torso_ids:
+        px, py = pose_xy[idx]
+        if px >= 0 and py >= 0:
+            torso_total += 1
+            if x1 <= px < x2 and y1 <= py < y2:
+                torso_hits += 1
+    torso_ratio = float(torso_hits / torso_total) if torso_total > 0 else 0.0
+
+    face_ids = [0, 2, 5, 7, 8]
+    face_hits = 0
+    face_total = 0
+    for idx in face_ids:
+        px, py = pose_xy[idx]
+        if px >= 0 and py >= 0:
+            face_total += 1
+            if x1 <= px < x2 and y1 <= py < y2:
+                face_hits += 1
+    face_ratio = float(face_hits / face_total) if face_total > 0 else 0.0
+
+    area = float((x2 - x1) * (y2 - y1))
+
+    return (
+        torso_ratio,
+        landmark_ratio,
+        face_ratio,
+        area,
+    )
+
+
+def _select_person_bbox_xyxy(
+    person_boxes_xyxy: list[tuple[int, int, int, int]],
+    *,
+    pose_xy: Optional[np.ndarray],
+) -> tuple[int, int, int, int]:
+    """
+    Select the best person bbox, optionally guided by pose landmarks.
+
+    Parameters
+    ----------
+    person_boxes_xyxy : list[tuple[int, int, int, int]]
+        Candidate person boxes.
+    pose_xy : np.ndarray, optional
+        Pose landmarks in full-image coordinates.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Selected person bbox.
+    """
+    if not person_boxes_xyxy:
+        raise RuntimeError('No candidate person boxes provided.')
+
+    if pose_xy is None:
+        return person_boxes_xyxy[0]
+
+    best_box = None
+    best_score = None
+
+    for box in person_boxes_xyxy:
+        score = _score_bbox_with_pose(box, pose_xy=pose_xy)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_box = box
+
+    if best_box is None:
+        raise RuntimeError('Could not select a pose-aligned person bbox.')
+
+    return best_box
+
+
+def _head_area_xyxy_from_pose(
+    pose_xy: np.ndarray,
+    *,
+    full_w: int,
+    full_h: int,
+    expansion: float = 1.6,
+) -> tuple[int, int, int, int]:
+    """
+    Derive a pose-guided upper-body area suitable for downstream face detection.
+
+    Despite the historical function name, the returned region is intentionally
+    larger than a tight head crop. When torso landmarks are available, the box
+    includes the head, neck, shoulders, and as much upper body as possible,
+    typically down to the hips. This preserves context that can help face
+    detection on difficult images.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        Pose landmarks with shape ``(33, 2)`` in full-image coordinates.
+        Missing landmarks must be encoded as ``(-1, -1)``.
+    full_w : int
+        Full image width.
+    full_h : int
+        Full image height.
+    expansion : float, optional
+        Expansion multiplier applied to the estimated region size.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Bounding box ``(x1, y1, x2, y2)`` in full-image coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If the pose does not provide enough information to estimate a plausible
+        head / upper-body area.
+    """
+    def _valid(i: int) -> bool:
+        return (
+            0 <= i < pose_xy.shape[0]
+            and pose_xy[i, 0] >= 0
+            and pose_xy[i, 1] >= 0
+        )
+
+    def _clip_box(
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> tuple[int, int, int, int]:
+        ix1 = max(0, min(full_w, int(math.floor(x1))))
+        iy1 = max(0, min(full_h, int(math.floor(y1))))
+        ix2 = max(0, min(full_w, int(math.ceil(x2))))
+        iy2 = max(0, min(full_h, int(math.ceil(y2))))
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            raise RuntimeError('Invalid pose-derived head area.')
+
+        return ix1, iy1, ix2, iy2
+
+    face_ids = [0, 2, 5, 7, 8]  # nose, eyes, ears
+    face_pts = [
+        pose_xy[i].astype(np.float32)
+        for i in face_ids
+        if _valid(i)
+    ]
+
+    has_torso = all(_valid(i) for i in [11, 12, 23, 24])
+
+    # ------------------------------------------------------------------
+    # Best case: torso available -> build a generous upper-body region.
+    # ------------------------------------------------------------------
+    if has_torso:
+        ls = pose_xy[11].astype(np.float32)
+        rs = pose_xy[12].astype(np.float32)
+        lh = pose_xy[23].astype(np.float32)
+        rh = pose_xy[24].astype(np.float32)
+
+        shoulder_center = 0.5 * (ls + rs)
+        hip_center = 0.5 * (lh + rh)
+
+        torso_vec = shoulder_center - hip_center
+        torso_len = float(np.linalg.norm(torso_vec))
+        if torso_len < 1.0:
+            raise RuntimeError(
+                'Cannot derive head area from pose: torso too small.'
+            )
+
+        head_dir = torso_vec / torso_len
+        shoulder_width = float(np.linalg.norm(ls - rs))
+        hip_width = float(np.linalg.norm(lh - rh))
+
+        # Top anchor: use face center if available, otherwise project above shoulders.
+        if face_pts:
+            face_pts_arr = np.stack(face_pts, axis=0)
+            face_center = np.mean(face_pts_arr, axis=0)
+            top_center = 0.7 * face_center + 0.3 * (
+                shoulder_center + head_dir * (0.35 * torso_len)
+            )
+
+            face_y_min = float(np.min(face_pts_arr[:, 1]))
+            top_y = min(face_y_min - 0.35 * shoulder_width,
+                        top_center[1] - 0.8 * shoulder_width)
+            x_center = float(top_center[0])
+        else:
+            top_center = shoulder_center + head_dir * (0.55 * torso_len)
+            top_y = float(top_center[1] - 0.6 * shoulder_width)
+            x_center = float(top_center[0])
+
+        # Bottom: include hips and a little extra below.
+        bottom_center = hip_center
+        bottom_y = float(bottom_center[1] + 0.25 * torso_len)
+
+        # Width: wide enough for head + shoulders + some torso context.
+        region_width = max(
+            1.35 * shoulder_width,
+            1.15 * hip_width,
+            0.9 * torso_len,
+        ) * float(expansion)
+
+        half_w = max(12.0, 0.5 * region_width)
+
+        x1 = x_center - half_w
+        x2 = x_center + half_w
+        y1 = top_y
+        y2 = bottom_y
+
+        return _clip_box(x1, y1, x2, y2)
+
+    # ------------------------------------------------------------------
+    # Fallback: face landmarks only -> build a looser face-centered region.
+    # ------------------------------------------------------------------
+    if len(face_pts) >= 2:
+        face_pts_arr = np.stack(face_pts, axis=0)
+
+        fx_min = float(np.min(face_pts_arr[:, 0]))
+        fy_min = float(np.min(face_pts_arr[:, 1]))
+        fx_max = float(np.max(face_pts_arr[:, 0]))
+        fy_max = float(np.max(face_pts_arr[:, 1]))
+
+        face_w = max(1.0, fx_max - fx_min)
+        face_h = max(1.0, fy_max - fy_min)
+        face_span = max(face_w, face_h)
+
+        cx = 0.5 * (fx_min + fx_max)
+        cy = 0.5 * (fy_min + fy_max)
+
+        # Keep more vertical context below the face.
+        half_w = max(8.0, 1.2 * face_span * float(expansion))
+        top_pad = 0.9 * face_span * float(expansion)
+        bottom_pad = 1.8 * face_span * float(expansion)
+
+        x1 = cx - half_w
+        x2 = cx + half_w
+        y1 = cy - top_pad
+        y2 = cy + bottom_pad
+
+        return _clip_box(x1, y1, x2, y2)
+
+    raise RuntimeError(
+        'Cannot derive head area from pose: insufficient face or torso landmarks.'
+    )
+
+
+def _get_head_area(
+    img_rgb: np.ndarray,
+    *,
+    pose_xy: np.ndarray,
+    expansion: float = 1.6,
+) -> tuple[np.ndarray, int, int]:
+    """
+    Crop a coarse head area from the input image using pose landmarks.
+
+    Parameters
+    ----------
+    img_rgb : np.ndarray
+        Full RGB image with shape ``(H, W, 3)``.
+    pose_xy : np.ndarray
+        Pose landmarks with shape ``(33, 2)`` in full-image coordinates.
+    expansion : float, optional
+        Expansion multiplier applied to the estimated head area.
+
+    Returns
+    -------
+    tuple[np.ndarray, int, int]
+        Tuple ``(head_area_rgb, x1, y1)`` where ``x1`` and ``y1`` are the
+        top-left offsets of the cropped area in full-image coordinates.
+    """
+    h, w = img_rgb.shape[:2]
+
+    x1, y1, x2, y2 = _head_area_xyxy_from_pose(
+        pose_xy,
+        full_w=w,
+        full_h=h,
+        expansion=expansion,
+    )
+
+    head_area_rgb = img_rgb[y1:y2, x1:x2, :]
+    if head_area_rgb.size == 0:
+        raise RuntimeError('Pose-derived head area is empty.')
+
+    return np.ascontiguousarray(head_area_rgb), x1, y1
 
 
 def _mp_largest_face_bbox_xyxy(
@@ -215,21 +572,6 @@ def _mp_largest_face_bbox_xyxy(
         if x2 > x1 and y2 > y1:
             area = (x2 - x1) * (y2 - y1)
             candidates.append((area, x1, y1, x2, y2))
-
-    # if not candidates:
-    #     # fallback: ignore score filtering
-    #     for landmarks in face_landmarks_list:
-    #         xs = [lm.x for lm in landmarks]
-    #         ys = [lm.y for lm in landmarks]
-
-    #         x1 = max(0, int(round(min(xs) * w)))
-    #         y1 = max(0, int(round(min(ys) * h)))
-    #         x2 = min(w, int(round(max(xs) * w)))
-    #         y2 = min(h, int(round(max(ys) * h)))
-
-    #         if x2 > x1 and y2 > y1:
-    #             area = (x2 - x1) * (y2 - y1)
-    #             candidates.append((area, x1, y1, x2, y2))
 
     if not candidates:
         raise RuntimeError('Could not derive valid face bbox from landmarks.')
@@ -528,6 +870,43 @@ def _head_bbox_square_from_face(
     return bx1, by1, bx2, by2
 
 
+def _score_sam_mask_with_landmarks(
+    mask: np.ndarray,
+    pose_xy: np.ndarray,
+) -> tuple[int, int]:
+    """
+    Score a SAM mask using pose landmarks.
+
+    Returns
+    -------
+    tuple[int, int]
+        (num_landmarks_inside, negative_area)
+
+        Higher is better.
+    """
+
+    h, w = mask.shape
+
+    valid = (
+        (pose_xy[:, 0] >= 0) &
+        (pose_xy[:, 1] >= 0)
+    )
+
+    pts = pose_xy[valid]
+
+    inside = 0
+    for px, py in pts:
+        px = int(px)
+        py = int(py)
+
+        if 0 <= px < w and 0 <= py < h and mask[py, px]:
+            inside += 1
+
+    area = int(mask.sum())
+
+    return (inside, -area)
+
+
 def _infer_sam_model_type(ckpt: Path, sam_model_type: Optional[str]) -> str:
     if sam_model_type:
         return sam_model_type
@@ -544,78 +923,187 @@ def _infer_sam_model_type(ckpt: Path, sam_model_type: Optional[str]) -> str:
     return 'vit_h'
 
 
+def _mp_pose_landmarks_xy(
+    img_rgb: np.ndarray,
+    *,
+    pose_landmarker,
+) -> np.ndarray:
+    """
+    Detect pose landmarks and return stable landmark coordinates in pixel space.
+
+    Parameters
+    ----------
+    img_rgb : np.ndarray
+        Input RGB image with shape ``(H, W, 3)`` and dtype uint8.
+    pose_landmarker : Any
+        MediaPipe `PoseLandmarker` instance, typically obtained from
+        `get_mediapipe_pose_landmarker(...)`.
+
+    Returns
+    -------
+    np.ndarray
+        Array with shape ``(33, 2)`` containing absolute pixel coordinates
+        ``(x, y)`` for the canonical MediaPipe pose landmark indices.
+
+        Landmarks considered too weak are stored as ``(-1, -1)`` so the
+        original MediaPipe indexing is preserved.
+
+    Raises
+    ------
+    RuntimeError
+        If MediaPipe detects no pose, if too few landmarks are reliable,
+        or if key torso landmarks are missing.
+
+    Notes
+    -----
+    Preserving the original 33-slot indexing is important because downstream
+    logic uses canonical MediaPipe landmark ids such as shoulders and hips.
+    A compacted list of only visible landmarks would break that mapping.
+    """
+    import mediapipe as mp
+
+    h, w = img_rgb.shape[:2]
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=img_rgb,
+    )
+
+    result = pose_landmarker.detect(mp_image)
+
+    pose_landmarks = result.pose_landmarks or []
+    if not pose_landmarks:
+        raise RuntimeError('MediaPipe found no pose landmarks.')
+
+    pts = np.full((33, 2), -1, dtype=np.int32)
+    strong_count = 0
+
+    for idx, lm in enumerate(pose_landmarks[0]):
+        visibility = float(getattr(lm, 'visibility', 1.0))
+        presence = float(getattr(lm, 'presence', 1.0))
+
+        if visibility < 0.35 or presence < 0.35:
+            continue
+
+        x = int(round(float(lm.x) * w))
+        y = int(round(float(lm.y) * h))
+
+        x = max(0, min(w - 1, x))
+        y = max(0, min(h - 1, y))
+
+        pts[idx] = (x, y)
+        strong_count += 1
+
+    if strong_count < 8:
+        raise RuntimeError(
+            'MediaPipe pose landmarks are too weak to identify a person reliably.'
+        )
+
+    torso_ids = [11, 12, 23, 24]
+    torso_ok = all(
+        pts[i, 0] >= 0 and pts[i, 1] >= 0
+        for i in torso_ids
+    )
+    if not torso_ok:
+        raise RuntimeError(
+            'MediaPipe pose is missing key torso landmarks '
+            '(shoulders / hips).'
+        )
+
+    return pts
+
+
 @dataclass
 class SubjectCrop(NodeRef):
     """
     Subject-aware cutout and inpaint-mask generator using YOLO / MediaPipe / SAM.
 
-    ``SubjectCrop`` detects a region of interest (person / face / head) and produces
-    either:
+    ``SubjectCrop`` detects a region of interest (person / face / head / eyes) and
+    produces either:
 
     - an RGBA cutout (``mode='default'``), or
     - a full-frame inpaint mask aligned to the input image (``mode='mask'`` or
-      ``mode='negative-mask'``).
+    ``mode='negative-mask'``).
 
     The node is intended to support workflows such as:
 
     - extracting subjects for compositing (e.g. with ``ImageStack``),
-    - producing robust inpaint masks for SDXL pipelines,
-    - extracting head regions (hair-friendly) for FaceID / IP-Adapter refinement,
-    - “refine a small face” by cropping → upscaling/refining → reinserting at the
-      original coordinates.
+    - producing inpaint masks for SDXL pipelines,
+    - extracting head regions for FaceID / IP-Adapter refinement,
+    - refining a small region by cropping, processing it separately, and reinserting
+      it at the original coordinates.
 
     Pipeline
     --------
-    The node combines:
+    The node combines several models to robustly localize a subject region:
 
-    - YOLO (COCO class 0) to locate the largest person when ``target`` is
-      ``'person'`` or ``'head'``.
-    - MediaPipe Face Landmarker to localize face landmarks when ``target`` is
-      ``'face'``, ``'eyes'``, ``'left-eye'``, ``'right-eye'`` or ``'head'``.
-    - Segment Anything (SAM) to obtain a segmentation mask guided by a bounding box.
+    - MediaPipe Pose is always executed first to obtain body landmarks.
+      These landmarks provide a geometric prior for locating the subject
+      and estimating the head region.
 
-    Targets
-    -------
+    - YOLO (COCO class 0) proposes candidate person bounding boxes when
+      ``target`` is ``'person'`` or ``'head'``.
+
+    - Pose landmarks are used to select the most plausible person bounding
+      box among YOLO detections.
+
+    - A coarse *head area* is derived from the pose landmarks. This region
+      approximates the subject head location and is used to improve the
+      robustness of face and eye detection when the face is small relative
+      to the full image.
+
+    - MediaPipe Face Landmarker is executed inside the head area to obtain
+      accurate face or eye landmarks.
+
+    - Segment Anything (SAM) is used to produce segmentation masks when
+      needed (person / face / head targets).
+
     ``target='person'``
-        - YOLO finds the largest person bounding box.
-        - The box is optionally expanded by ``box_margin``.
-        - SAM segments inside that box.
+        - MediaPipe Pose landmarks are computed for the full image.
+        - YOLO proposes candidate person bounding boxes.
+        - Pose landmarks are used to select the bbox that best matches the
+        detected body.
+        - The bbox may be expanded using ``box_margin``.
+        - SAM segments inside the selected bbox.
+        - The final crop region corresponds to the selected person bbox.
 
     ``target='face'``
-        - MediaPipe derives a face bounding box from landmarks.
-        - SAM segments using that face box.
+        - MediaPipe Pose landmarks are used to estimate a coarse head area.
+        - MediaPipe Face Landmarker runs inside this head area.
+        - The largest detected face bbox is remapped to full-image coordinates.
+        - SAM segments using the face bbox.
 
     ``target='head'``
-        - YOLO finds the person box (used for SAM segmentation).
-        - MediaPipe derives the face box.
-        - A *square head crop box* is computed from the face box (hair-friendly)
-          using ``expansion`` and an upward bias.
-        - SAM is still run on the (expanded) person box for robustness, while the
-          final crop region is the derived head box.
+        - MediaPipe Pose landmarks are computed.
+        - YOLO proposes person bounding boxes.
+        - Pose landmarks select the most plausible person bbox.
+        - A head area is derived from pose landmarks.
+        - Face landmarks are detected within the head area.
+        - A square head crop box is computed from the face bbox using
+        ``expansion`` and an upward bias to preserve hair.
+        - SAM segmentation is still guided by the person bbox for robustness,
+          while the crop region corresponds to the derived head box.
 
     ``target='eyes'``
-        - MediaPipe derives face landmarks.
-        - A bounding box enclosing both eyes is computed from landmark
-          clusters corresponding to the left and right orbital regions.
-        - The box is optionally expanded via ``expansion`` to include
-          eyelids and avoid hard inpaint borders.
-        - Landmark-derived mask (SAM skipped).
-        - The final crop region corresponds to the combined eyes area.
+        - MediaPipe Pose landmarks estimate a head area.
+        - MediaPipe Face Landmarker runs inside that head area.
+        - Eye landmarks are extracted and converted to a bounding box.
+        - A landmark-derived mask is produced directly (SAM is skipped).
 
     ``target='left-eye'``
         - MediaPipe derives face landmarks.
-        - A bounding box is computed from landmark indices corresponding
-          to the subject's left eye (subject perspective, not viewer).
+        - A bounding box is computed from landmark indices corresponding to the
+          subject's left eye (subject perspective, not viewer).
         - The box is optionally expanded via ``expansion``.
-        - Landmark-derived mask (SAM skipped).
+        - A landmark-derived mask is used directly; SAM is skipped.
         - The final crop region isolates only the left eye.
 
     ``target='right-eye'``
         - MediaPipe derives face landmarks.
-        - A bounding box is computed from landmark indices corresponding
-          to the subject's right eye (subject perspective, not viewer).
+        - A bounding box is computed from landmark indices corresponding to the
+          subject's right eye (subject perspective, not viewer).
         - The box is optionally expanded via ``expansion``.
-        - Landmark-derived mask (SAM skipped).
+        - A landmark-derived mask is used directly; SAM is skipped.
         - The final crop region isolates only the right eye.
 
     Head crop geometry
@@ -647,7 +1135,8 @@ class SubjectCrop(NodeRef):
             ``sam_checkpoint`` : str
                 Path to the SAM checkpoint. Required.
             ``sam_model_type`` : {'vit_h', 'vit_l', 'vit_b'}, optional
-                SAM backbone type. If omitted, inferred from the checkpoint filename.
+                SAM backbone type. If omitted, inferred from the checkpoint
+                filename.
             ``device`` : str, optional
                 Inference device (e.g. ``'cuda'``, ``'cuda:0'``, ``'cpu'``).
                 Default: ``'cuda'``.
@@ -657,10 +1146,13 @@ class SubjectCrop(NodeRef):
                 MediaPipe FaceLandmarker ``.task`` path. Required for
                 ``target='face'``, ``target='eyes'``, ``target='left-eye'``,
                 ``target='right-eye'`` and ``target='head'``.
+            ``pose_landmarker_task`` : str
+                MediaPipe PoseLandmarker ``.task`` path.
+                This model is required because pose landmarks are used to derive
+                head regions and to select the correct person bbox.
 
         ``params`` : dict
-            ``target`` : {'person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'},
-             optional
+            ``target`` : {'person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'}, optional
                 Region to extract. Default: ``'person'``.
 
             ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -671,45 +1163,43 @@ class SubjectCrop(NodeRef):
                 Default: ``'default'``.
 
             ``crop_mode`` : {'bbox', 'trim', 'full_frame'}, optional
-                Applies only when ``mode='default'`` and controls *spatial layout*
+                Applies only when ``mode='default'`` and controls the spatial layout
                 of the RGBA cutout:
 
                 - ``'bbox'``:
                     Output is the rectangular crop inside the selected bounding box,
                     including the original background; alpha is fully opaque
                     (255 everywhere).
-                    Use this when you want a classic “crop” suitable for further
-                    img2img without transparency.
 
                 - ``'trim'``:
-                    Output is an RGBA cutout cropped to the selected bounding box, with
-                    alpha derived from the mask. The result is then tightly trimmed to
-                    the minimal box containing non-transparent pixels.
+                    Output is an RGBA cutout cropped to the selected bounding box,
+                    with alpha derived from the mask. The result is then tightly
+                    trimmed to the minimal box containing non-transparent pixels.
+
                 - ``'full_frame'``:
                     Same cutout as ``'trim'`` but placed back into a full-size RGBA
                     canvas of the original image dimensions, preserving the original
-                    coordinates. This is ideal for downstream compositing nodes that
-                    expect full-frame alignment.
+                    coordinates.
 
                 Default: ``'trim'``.
 
             ``conf`` : float, optional
                 YOLO confidence threshold (only used when YOLO runs).
-                Typical range: 0.2–0.6. Default: 0.35.
+                Typical range: 0.2-0.6. Default: 0.35.
 
             ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the YOLO person bounding box
-                before SAM, expressed as a fraction of bbox size.
-                Typical range: 0.05–0.20. Default: 0.12.
+                Symmetric expansion ratio applied to the selected bounding box before
+                SAM, expressed as a fraction of bbox size.
+                Typical range: 0.05-0.20. Default: 0.12.
 
             ``multimask`` : bool, optional
                 If True, SAM returns multiple candidate masks and the node selects
-                one via a heuristic (bbox-center inclusion, reasonable coverage,
-                and SAM score). Default: True.
+                one via a heuristic based on bbox-center inclusion, coverage, and
+                SAM score. Default: True.
 
             ``expansion`` : float, optional
-                Head square expansion multiplier for ``target='head'``.
-                Default: 1.0.
+                Head square expansion multiplier for ``target='head'`` and box
+                expansion factor for eye targets. Default: 1.0.
 
             ``dilate_radius`` : int, optional
                 Mask dilation radius in pixels (mask modes only).
@@ -725,7 +1215,8 @@ class SubjectCrop(NodeRef):
 
         ``debug`` : dict
             ``save_debug`` : bool, optional
-                If True, saves a debug image with the SAM bbox overlay. Default: False.
+                If True, saves a debug image with the selected SAM bbox overlay.
+                Default: False.
 
     Returns
     -------
@@ -745,18 +1236,16 @@ class SubjectCrop(NodeRef):
         ``image`` : str
             Output file path (RGBA cutout or mask).
         ``bbox_xyxy`` : list[int]
-            Bounding box used to run SAM (typically person bbox; for face mode,
-            the face bbox).
+            Bounding box used to run SAM.
         ``params`` : dict
             Configuration parameters.
         ``crop`` : dict
             Crop metadata useful for reinsertion/compositing:
 
             ``anchor_xy`` : list[int]
-                Center of the *selected crop box* in absolute coordinates of the
-                original image.
+                Center of the selected crop box in absolute source-image coordinates.
             ``bbox_size`` : list[int]
-                Width/height of the crop box in pixels: ``[b_width, b_height]``.
+                Width and height of the crop box in pixels: ``[b_width, b_height]``.
 
         ``metadata`` : str
             JSON sidecar path.
@@ -764,14 +1253,17 @@ class SubjectCrop(NodeRef):
     Notes
     -----
     - Mask outputs are always full-frame and aligned to the original image size.
-    - For ``target='head'``, SAM segmentation uses the person box for robustness,
-      while the crop region is the derived head square.
+    - For ``target='head'``, SAM uses the selected person bbox, while the final crop
+      region is the derived head box.
+    - For eye targets, the mask is derived directly from face landmarks and SAM is
+      skipped.
     - 'left-eye' and 'right-eye' refer to the subject perspective.
       In mirrored images this may appear inverted to the viewer.
-    - Heavy models (YOLO, SAM) are retrieved via the global model cache.
-      The SAM predictor is created per-run because it stores per-image state.
-    - If you change code or spec and need fresh outputs, delete the existing
-      sidecar JSON to avoid reusing cached results.
+    - Heavy models (YOLO, SAM, MediaPipe Tasks) are retrieved via the global model
+      cache where available.
+    - The SAM predictor is created per run because it stores per-image state.
+    - If you change code or spec and need fresh outputs, delete the existing sidecar
+      JSON to avoid reusing cached results.
     """
 
     # Either pass a path explicitly, or wire an upstream image into default input.
@@ -817,6 +1309,15 @@ class SubjectCrop(NodeRef):
         eye_which: Optional[str] = None
         eye_mask: Optional[np.ndarray] = None
 
+        pose_landmarker = get_mediapipe_pose_landmarker(
+            model_asset_path=cfg.pose_landmarker_task,
+            device=cfg.device,
+        )
+        pose_xy = _mp_pose_landmarks_xy(
+            img_rgb=img_rgb,
+            pose_landmarker=pose_landmarker,
+        )
+
         if cfg.target == 'person':
             # -----------------------------
             # YOLO: find largest 'person' bbox (COCO class 0)
@@ -829,7 +1330,54 @@ class SubjectCrop(NodeRef):
                 device=cfg.device
             )[0]
 
-            bx1, by1, bx2, by2 = _largest_person_bbox_xyxy(res, node_id)
+            person_boxes_xyxy = _person_bboxes_xyxy(res, node_id)
+
+            bx1, by1, bx2, by2 = _select_person_bbox_xyxy(
+                person_boxes_xyxy,
+                pose_xy=pose_xy,
+            )
+
+        elif cfg.target == 'head':
+            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
+            res = yolo.predict(
+                img_rgb,
+                conf=float(cfg.conf),
+                verbose=False,
+                device=cfg.device,
+            )[0]
+
+            person_boxes_xyxy = _person_bboxes_xyxy(res, node_id)
+
+            bx1, by1, bx2, by2 = _select_person_bbox_xyxy(
+                person_boxes_xyxy,
+                pose_xy=pose_xy,
+            )
+
+            landmarker = get_mediapipe_face_landmarker(
+                model_asset_path=cfg.face_landmarker_task,
+                device=cfg.device,
+            )
+
+            head_area_rgb, a_x, a_y = _get_head_area(
+                img_rgb=img_rgb,
+                pose_xy=pose_xy,
+                expansion=1.6,
+            )
+
+            r_x1, r_y1, r_x2, r_y2 = _mp_largest_face_bbox_xyxy(
+                img_rgb=head_area_rgb,
+                face_landmarker_task=landmarker,
+            )
+
+            fx1 = r_x1 + a_x
+            fy1 = r_y1 + a_y
+            fx2 = r_x2 + a_x
+            fy2 = r_y2 + a_y
+
+            fx1, fy1, fx2, fy2 = _head_bbox_square_from_face(
+                fx1, fy1, fx2, fy2, w, h,
+                expansion=cfg.expansion,
+            )
 
         elif cfg.target == 'face':
             landmarker = get_mediapipe_face_landmarker(
@@ -837,11 +1385,21 @@ class SubjectCrop(NodeRef):
                 device=cfg.device,
             )
 
-            bx1, by1, bx2, by2 = _mp_largest_face_bbox_xyxy(
+            head_area_rgb, a_x, a_y = _get_head_area(
                 img_rgb=img_rgb,
-                face_landmarker_task=landmarker,
-                # face_min_score=cfg.face_min_score,
+                pose_xy=pose_xy,
+                expansion=1.6,
             )
+
+            r_x1, r_y1, r_x2, r_y2 = _mp_largest_face_bbox_xyxy(
+                img_rgb=head_area_rgb,
+                face_landmarker_task=landmarker,
+            )
+
+            bx1 = r_x1 + a_x
+            by1 = r_y1 + a_y
+            bx2 = r_x2 + a_x
+            by2 = r_y2 + a_y
 
         elif cfg.target in ('eyes', 'left-eye', 'right-eye'):
             landmarker = get_mediapipe_face_landmarker(
@@ -855,46 +1413,34 @@ class SubjectCrop(NodeRef):
                 'right-eye': 'right',
             }[cfg.target]
 
-            # Use bbox only for crop geometry; mask comes from landmarks.
-            bx1, by1, bx2, by2 = _mp_eye_bbox_xyxy(
+            head_area_rgb, a_x, a_y = _get_head_area(
                 img_rgb=img_rgb,
+                pose_xy=pose_xy,
+                expansion=1.6,
+            )
+
+            r_x1, r_y1, r_x2, r_y2 = _mp_eye_bbox_xyxy(
+                img_rgb=head_area_rgb,
                 face_landmarker_task=landmarker,
                 which=eye_which,
                 expansion=max(1.0, float(cfg.expansion)),
             )
 
-            eye_mask = _mp_eye_mask_from_landmarks(
-                img_rgb=img_rgb,
+            bx1 = r_x1 + a_x
+            by1 = r_y1 + a_y
+            bx2 = r_x2 + a_x
+            by2 = r_y2 + a_y
+
+            local_eye_mask = _mp_eye_mask_from_landmarks(
+                img_rgb=head_area_rgb,
                 face_landmarker_task=landmarker,
                 which=eye_which,
                 expansion=max(1.0, float(cfg.expansion)),
             )
 
-        elif cfg.target == 'head':
-            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-            res = yolo.predict(
-                img_rgb,
-                conf=float(cfg.conf),
-                verbose=False,
-                device=cfg.device
-            )[0]
-
-            landmarker = get_mediapipe_face_landmarker(
-                model_asset_path=cfg.face_landmarker_task,
-                device=cfg.device,
-            )
-
-            fx1, fy1, fx2, fy2 = _mp_largest_face_bbox_xyxy(
-                img_rgb=img_rgb,
-                face_landmarker_task=landmarker,
-            )
-            # Additional heuristic to capture hair/crowns:
-            fx1, fy1, fx2, fy2 = _head_bbox_square_from_face(
-                fx1, fy1, fx2, fy2, w, h,
-                expansion=cfg.expansion,
-            )
-
-            bx1, by1, bx2, by2 = _largest_person_bbox_xyxy(res, node_id)
+            eye_mask = np.zeros((h, w), dtype=bool)
+            eye_h, eye_w = local_eye_mask.shape
+            eye_mask[a_y:a_y + eye_h, a_x:a_x + eye_w] = local_eye_mask
 
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
@@ -947,30 +1493,69 @@ class SubjectCrop(NodeRef):
                     f"SubjectCrop node '{node_id}': SAM returned no masks.")
 
             # Pick the best mask in a robust way:
-            cx = int((bx1 + bx2) // 2)
-            cy = int((by1 + by2) // 2)
-
             best_i = 0
             best_key = None
 
             for i in range(len(masks)):
+
                 mi = masks[i].astype(bool)
 
-                frac = float(mi[by1:by2, bx1:bx2].mean())
-                center_in = bool(mi[cy, cx])
-                ok_area = (0.05 <= frac <= 0.95)
-                score_i = float(scores[i]) if scores is not None else 0.0
+                if cfg.target == 'person':
 
-                key = (center_in, ok_area, score_i, -abs(frac - 0.35))
+                    key = _score_sam_mask_with_landmarks(
+                        mi,
+                        pose_xy,
+                    )
+
+                else:
+                    frac = float(mi[by1:by2, bx1:bx2].mean())
+                    score_i = float(scores[i]) if scores is not None else 0.0
+                    key = (score_i, -abs(frac - 0.35))
 
                 if best_key is None or key > best_key:
                     best_key = key
                     best_i = i
 
-            mask = masks[int(best_i)].astype(bool)  # HxW
+            mask = masks[int(best_i)].astype(bool)
 
-            if not mask[cy, cx]:
-                mask = ~mask
+            # ------------------------------------------------------------------
+            # SAM may occasionally return the complementary (background) mask
+            # when prompted with a bounding box only. In that case the subject
+            # appears as a hole in the mask.
+            #
+            # We detect this situation using MediaPipe pose landmarks: the correct
+            # subject mask should contain most valid body landmarks. If fewer than
+            # half of them fall inside the predicted mask, we assume SAM returned
+            # the background instead.
+            #
+            # When flipping the mask we must restrict the inversion to the prompt
+            # bounding box. Outside that region SAM predictions are undefined and
+            # inverting the whole mask would incorrectly mark the entire image as
+            # foreground.
+            # ------------------------------------------------------------------
+            valid = (
+                (pose_xy[:, 0] >= 0) &
+                (pose_xy[:, 1] >= 0)
+            )
+
+            pts = pose_xy[valid]
+
+            inside = 0
+            for px, py in pts:
+                px = int(px)
+                py = int(py)
+
+                if mask[py, px]:
+                    inside += 1
+
+            if inside < len(pts) / 2:
+                # Invert mask only inside the prompt bbox to avoid turning the entire
+                # background of the image into foreground.
+                inv = ~mask
+                new_mask = np.zeros_like(mask, dtype=bool)
+                new_mask[by1:by2, bx1:bx2] = inv[by1:by2, bx1:bx2]
+                mask = new_mask
+
         # --------------------------------------------------
         # Select crop region depending on target
         # --------------------------------------------------
@@ -1091,7 +1676,16 @@ class SubjectCrop(NodeRef):
         dbg_path = None
         if cfg.save_debug:
             dbg = img_rgb.copy()
-            cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (255, 0, 0), 3)
+            dbg_x1, dbg_y1, dbg_x2, dbg_y2 = bx1, by1, bx2, by2
+            if cfg.target == 'head':
+                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
+            cv2.rectangle(
+                dbg,
+                (dbg_x1, dbg_y1),
+                (dbg_x2, dbg_y2),
+                (255, 0, 0),
+                3,
+            )
             dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')
             Image.fromarray(dbg).save(dbg_path)
 
@@ -1107,13 +1701,16 @@ class SubjectCrop(NodeRef):
             'input_image': str(img_path),
             'mode': cfg.mode,
             'image': str(out_path),
-            'bbox_xyxy': [int(bx1), int(by1), int(bx2), int(by2)],
+            'sam_bbox_xyxy': [int(bx1), int(by1), int(bx2), int(by2)],
             'model': {
                 **({} if cfg.yolo_model is None else {'yolo': cfg.yolo_model}),
                 'sam_checkpoint': str(ckpt),
                 'sam_model_type': model_type,
                 **({} if cfg.face_landmarker_task is None else {
                     'face_landmarker_task': cfg.face_landmarker_task,
+                }),
+                **({} if cfg.pose_landmarker_task is None else {
+                    'pose_landmarker_task': cfg.pose_landmarker_task,
                 }),
                 'device': cfg.device,
             },

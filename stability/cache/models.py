@@ -470,3 +470,75 @@ def get_mediapipe_face_landmarker(
 
     landmarker = mp_vision.FaceLandmarker.create_from_options(options)
     return ModelCache.put(key, landmarker)
+
+
+def get_mediapipe_pose_landmarker(
+    *,
+    model_asset_path: str,
+    device: str,
+):
+    """
+    Cached MediaPipe PoseLandmarker (Tasks API).
+
+    Parameters
+    ----------
+    model_asset_path : str
+        Path to the MediaPipe PoseLandmarker `.task` model file.
+    device : str
+        Logical device string kept for cache-key consistency with the rest
+        of the project. MediaPipe Tasks does not currently use it here as
+        an execution selector, but it is still part of the cache identity.
+
+    Returns
+    -------
+    Any
+        A cached MediaPipe `PoseLandmarker` instance configured for
+        single-image inference.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the model file does not exist.
+
+    Notes
+    -----
+    This mirrors the caching strategy already used for
+    `get_mediapipe_face_landmarker`.
+
+    The landmarker is configured for image mode because `SubjectCrop`
+    performs per-image analysis rather than video or live-stream inference.
+    """
+    from pathlib import Path
+
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+
+    model_path = Path(str(model_asset_path)).expanduser().resolve()
+    if not model_path.exists() or not model_path.is_file():
+        raise FileNotFoundError(f'MediaPipe model not found: {model_path}')
+
+    key = CacheKey(
+        kind='mediapipe_pose_landmarker',
+        ref=str(model_path),
+        device=str(device),
+        dtype='na',
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
+        output_segmentation_masks=False,
+    )
+
+    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+    return ModelCache.put(key, landmarker)

@@ -91,6 +91,7 @@ def refine_face_group(
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
                     'target': 'head',
@@ -255,6 +256,7 @@ def apply_face_id_head_group(
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
                     'target': 'head',
@@ -444,6 +446,7 @@ def fine_face_details_group(
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                     # 'yolo_model' is only needed when region == 'head' and your SubjectCrop uses YOLO for it.
                     # Add it if your SubjectCrop config requires it for head mode.
                     # 'yolo_model': 'yolov8n.pt',

@@ -17,17 +17,21 @@ class Tap(NodeRef):
     Tap forwards the single upstream output under input_id 'default',
     rewrites node metadata to itself, and materializes the result to JSON.
 
+    Parameters
+    ----------
+    strict : bool, default=True
+        If True, the node fails when no upstream payload is available.
+        If False, missing upstream input produces an empty payload
+        under key 'default'.
+
     Contract
     --------
-    - Exactly one upstream input is expected.
-    - That input must be under key 'default'.
+    - At most one upstream input is supported.
+    - When present, the input must be under key 'default'.
     - Lateral wiring is not supported.
-
-    Raises
-    ------
-    RuntimeError
-
     """
+
+    strict: bool = True
 
     def run(
         self,
@@ -36,9 +40,17 @@ class Tap(NodeRef):
     ) -> Output:
 
         if not input:
-            raise RuntimeError(
-                f'Tap {self.id!r} received no input.'
-            )
+            if self.strict:
+                raise RuntimeError(
+                    f'Tap {self.id!r} received no input.'
+                )
+
+            # Non-strict mode: propagate empty payload
+            return {
+                'ok': True,
+                'node': self.op,
+                'id': self.id,
+            }
 
         if len(input) != 1 or 'default' not in input:
             raise RuntimeError(

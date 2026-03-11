@@ -61,7 +61,7 @@ def cutout_stack_img2img_group(
         # -------------------
         fg = Tap(name='foreground')
         bg = Tap(name='background')
-        prompt = Tap(name='prompt')
+        prompt = Tap(name='prompt', strict=False)
 
         # -------------------
         # Subject cut-out
@@ -71,6 +71,7 @@ def cutout_stack_img2img_group(
             spec={
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
                     # Full-frame RGBA output with alpha mask applied
