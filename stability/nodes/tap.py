@@ -21,36 +21,73 @@ class Tap(NodeRef):
     ----------
     strict : bool, default=True
         If True, the node fails when no upstream payload is available.
-        If False, missing upstream input produces an empty payload
-        under key 'default'.
-
-    Contract
-    --------
-    - At most one upstream input is supported.
-    - When present, the input must be under key 'default'.
-    - Lateral wiring is not supported.
+        If False, missing input produces a minimal materialized payload.
     """
 
     strict: bool = True
 
+    def _write_output(self, output_dir: str, out: Output) -> Output:
+        """
+        Materialize the output payload to the node JSON artifact.
+
+        Parameters
+        ----------
+        output_dir : str
+            Directory where the node output is stored.
+        out : Output
+            Output payload to materialize.
+
+        Returns
+        -------
+        Output
+            The same payload enriched with the metadata file path.
+        """
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir),
+            node_id=self.id,
+            ext='json',
+        )
+
+        meta_path = write_json(out_path, out)
+        out['metadata'] = str(meta_path)
+        return out
+
     def run(
         self,
         output_dir: str,
-        input: Optional[Dict[str, Output]] = None
+        input: Optional[Dict[str, Output]] = None,
     ) -> Output:
+        """
+        Execute the checkpoint node.
 
+        Parameters
+        ----------
+        output_dir : str
+            Directory where the node JSON artifact is written.
+        input : dict[str, Output] | None, optional
+            Upstream payload mapping. When present, exactly one entry under
+            key 'default' is expected.
+
+        Returns
+        -------
+        Output
+            The forwarded upstream payload with Tap metadata, or a minimal
+            materialized payload when running in non-strict mode without
+            upstream input.
+        """
         if not input:
             if self.strict:
                 raise RuntimeError(
                     f'Tap {self.id!r} received no input.'
                 )
-
-            # Non-strict mode: propagate empty payload
-            return {
-                'ok': True,
-                'node': self.op,
-                'id': self.id,
-            }
+            return self._write_output(
+                output_dir,
+                {
+                    'ok': True,
+                    'node': self.op,
+                    'id': self.id,
+                },
+            )
 
         if len(input) != 1 or 'default' not in input:
             raise RuntimeError(
@@ -60,29 +97,26 @@ class Tap(NodeRef):
 
         upstream = input['default']
         if upstream is None:
-            raise RuntimeError(
-                f'Tap {self.id!r} received None upstream output.'
+            if self.strict:
+                raise RuntimeError(
+                    f'Tap {self.id!r} received None upstream output.'
+                )
+            return self._write_output(
+                output_dir,
+                {
+                    'ok': True,
+                    'node': self.op,
+                    'id': self.id,
+                },
             )
 
-        # Shallow copy to avoid mutating upstream object.
         out: Output = dict(upstream)
 
-        # Remove previous node metadata if present.
         for k in ('metadata', 'id', 'node', 'op', 'from'):
             out.pop(k, None)
 
-        # Stamp Tap metadata.
         out['ok'] = True
         out['node'] = self.op
         out['id'] = self.id
 
-        out_path = make_node_output_path(
-            out_dir=Path(output_dir),
-            node_id=self.id,
-            ext='json',
-        )
-
-        meta_path = write_json(out_path, out)
-        out['metadata'] = str(meta_path)
-
-        return out
+        return self._write_output(output_dir, out)

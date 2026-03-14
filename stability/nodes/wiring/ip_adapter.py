@@ -12,7 +12,6 @@ from stability.nodes.wiring.utils import infer_image_encoder_subfolder
 
 IpAdapterScale = Union[
     float,
-    List[float],
     Dict[str, Dict[str, List[float]]]
 ]
 
@@ -208,10 +207,12 @@ class IpAdapterRegistry:
         scale : IpAdapterScale, optional
             Influence of the IP-Adapter on the diffusion process for this slot.
             It may be:
-            - a single float (uniform weighting),
-            - a list of floats (per-image weighting when multiple reference images
-              are attached to this slot),
+            - a single float shared by all reference images attached to this slot,
             - a dictionary specifying per-block configuration.
+
+            Per-image scale lists are intentionally not supported at the slot
+            level. If different reference images need different weights, declare
+            multiple IP-Adapter slots instead.
             Default is ``1.0``.
 
         key : str, optional
@@ -320,11 +321,11 @@ class IpAdapterBundle:
                 raise ValueError(
                     f'Upstream output for {in_id!r} does not contain an image path')
 
-            self._validate_scale_for_slot(
-                key=ad.key,
-                scale=ad.scale,
-                img_path=img_path
-            )
+            if not isinstance(ad.scale, (float, int, dict)):
+                raise TypeError(
+                    f'Invalid IP-Adapter scale for slot {ad.key!r}: got {type(ad.scale).__name__}. '
+                    'Expected a float (uniform adapter strength) or a per-block dict configuration.'
+                )
 
             self._weight_names.append(ad.weight_name)
             self._images.append(img_path)
@@ -428,53 +429,6 @@ class IpAdapterBundle:
             )
         self._subfolder = next(iter(subfolders))
 
-    @classmethod
-    def _num_images_for_slot(cls, img_path: Union[str, List[str]]) -> int:
-        return len(img_path) if isinstance(img_path, list) else 1
-
-    @classmethod
-    def _validate_scale_for_slot(
-        cls,
-        *,
-        key: str,
-        scale: IpAdapterScale,
-        img_path: Union[str, List[str]],
-    ) -> None:
-        """
-        Minimal validation for IP-Adapter scale vs number of images in a slot.
-
-        Rules:
-        1) If scale is List[float], it must match the number of images in that slot.
-        2) If scale is a per-block dict and the slot has >1 images, raise (ambiguous/undocumented).
-        """
-        n_imgs = cls._num_images_for_slot(img_path)
-
-        if isinstance(scale, list):
-            if len(scale) != n_imgs:
-                raise ValueError(
-                    f'Invalid IP-Adapter scale for {key!r}: got a per-image scale list of length {len(scale)}, '
-                    f'but the slot has {n_imgs} image(s). '
-                    'Provide one scale per image, or use a single float.'
-                )
-            return
-
-        if isinstance(scale, dict):
-            if n_imgs > 1:
-                raise ValueError(
-                    f'Invalid IP-Adapter scale for {key!r}: per-block scale dict is not supported when multiple '
-                    f'reference images are attached to the same adapter slot (got {n_imgs} images). '
-                    'Use a single reference image for per-block scaling, or use per-image float scales instead.'
-                )
-            return
-
-        if isinstance(scale, (float, int)):
-            return
-
-        raise TypeError(
-            f'Invalid scale type for IP-Adapter {key!r}: {type(scale)}. '
-            'Expected float, List[float], or per-block dict.'
-        )
-
     def build_ip_adapter_masks(
         self,
         *,
@@ -538,30 +492,23 @@ class IpAdapterBundle:
         return self._has
 
     @property
-    def ip_adapter_image(self) -> Union[
-        Image.Image,
-        List[Image.Image],
-        List[List[Image.Image]],
-    ]:
-        per_adapter: List[Union[Image.Image, List[Image.Image]]] = []
+    def ip_adapter_image(self) -> List[Image.Image | List[Image.Image]]:
+        per_adapter: List[Image.Image | List[Image.Image]] = []
 
         for item in self._images:
             if isinstance(item, str):
-                per_adapter.append(Image.open(item).convert('RGB'))
+                per_adapter.append(Image.open(item).convert("RGB"))
+
             elif isinstance(item, list):
-                per_adapter.append([Image.open(p).convert('RGB')
-                                   for p in item])
-            else:
-                raise TypeError(
-                    f'Invalid ip-adapter image entry: expected str or list[str], got {type(item)}'
+                per_adapter.append(
+                    [Image.open(p).convert("RGB") for p in item]
                 )
 
-        # if only one adapter slot, return its payload directly (Image or list[Image])
-        if len(per_adapter) == 1:
-            # TODO In case the single item is an array then it should return per adapter, otherwise first item.
-            return per_adapter if isinstance(per_adapter[0], list) else per_adapter[0]
+            else:
+                raise TypeError(
+                    f"Invalid ip-adapter image entry: expected str or list[str], got {type(item)}"
+                )
 
-        # otherwise return the per-adapter list (flat or nested depending on inputs)
         return per_adapter
 
     @property

@@ -7,7 +7,7 @@ import pytest
 
 import stability.dag.runner as runner_mod
 from stability.dag import DAG
-from stability.dag.runner import Execution, SingleNodeRunner
+from stability.dag.runner import DAGRunner, Execution, SingleNodeRunner
 from tests.dag.nodes import MergeNode, PassNode, SourceNode
 
 
@@ -27,6 +27,35 @@ class CacheWritingSource(SourceNode):
         assert self.cache is not None
         self.cache[self.id] = out
         return out
+
+
+@dataclass
+class CacheWritingPass(PassNode):
+    """
+    Pass-through node that persists its output into the in-memory test cache.
+    """
+    cache: Dict[str, Dict[str, Any]] = None
+
+    def run(self, output_dir, input: Dict[str, Dict]) -> Dict[str, Any]:
+        out = super().run(output_dir, input=input)
+        assert self.cache is not None
+        self.cache[self.id] = out
+        return out
+
+
+@dataclass
+class CacheWritingMerge(MergeNode):
+    """
+    Merge node that persists its output into the in-memory test cache.
+    """
+    cache: Dict[str, Dict[str, Any]] = None
+
+    def run(self, output_dir, input: Dict[str, Dict]) -> Dict[str, Any]:
+        out = super().run(output_dir, input=input)
+        assert self.cache is not None
+        self.cache[self.id] = out
+        return out
+
 
 # SingleNodeRunner expects a prebuilt execution list.
 # In production this is normally created by DAGRunner.
@@ -486,3 +515,118 @@ def test_run_downstream_materializes_missing_lateral_dependency_when_force_upstr
     assert set(m.last_input.keys()) == {'default', 'attachment'}
     assert m.last_input['default']['value'] == 10
     assert m.last_input['attachment']['value'] == 20
+
+
+def _reset_tracking(*nodes) -> None:
+    """
+    Reset execution tracking fields between the first full run and the replay run.
+    """
+    for n in nodes:
+        n.calls = 0
+        n.last_input = None
+        n.outputs = []
+
+
+def test_run_downstream_replay_must_not_use_stale_cache_for_node_inside_current_subgraph(
+    tmp_path,
+):
+    """
+    Guard against stale-cache reads during downstream replay.
+
+    Graph
+    -----
+      A -> B -> Y -> C -> M
+      A -> X ---------(attachment)
+
+    Replay target
+    -------------
+    run_downstream(A, force_upstream=False)
+
+    Scenario
+    --------
+    1) Run the full DAG once to populate cache for every node.
+    2) Change A.value.
+    3) Run downstream replay rooted at A.
+
+    Bug to detect
+    -------------
+    During replay, M must not consume the cached output of C from the previous run
+    before C has been re-executed in the current run.
+
+    Why this graph shape matters
+    ----------------------------
+    The side branch A -> X reaches M earlier than the longer branch
+    A -> B -> Y -> C -> M.
+
+    Therefore, if the runner incorrectly allows cached reads for nodes that belong
+    to the *current* downstream subgraph, M may see:
+    - attachment: fresh current-run output from X
+    - default: stale previous-run output from C
+
+    Expected behavior
+    -----------------
+    M must receive fresh current-run outputs on both inputs.
+    """
+    cache: Dict[str, Dict[str, Any]] = {}
+
+    with DAG('downstream_replay_no_stale_internal_cache', out_dir=tmp_path) as dag:
+        a = CacheWritingSource(name='A', value=1, cache=cache)
+        b = CacheWritingPass(name='B', cache=cache)
+        y = CacheWritingPass(name='Y', cache=cache)
+        c = CacheWritingPass(name='C', cache=cache)
+        x = CacheWritingPass(name='X', cache=cache)
+        m = CacheWritingMerge(name='M', cache=cache)
+
+        a >> b >> y >> c >> m
+        a >> x >> m.sink(name='X_to_M', input_id='attachment')
+
+    # First run: populate cache for the whole DAG.
+    DAGRunner(dag).run()
+
+    # Sanity check: cache really contains previous-run outputs.
+    assert cache[a.id]['value'] == 1
+    assert cache[c.id]['value'] == 1
+    assert cache[x.id]['value'] == 1
+
+    # Prepare replay:
+    # - change the source value so fresh current-run outputs differ from stale cache
+    # - reset node tracking so we can observe only the replay run
+    a.value = 2
+    _reset_tracking(a, b, y, c, x, m)
+
+    # IMPORTANT:
+    # Recreate executions for the replay run.
+    # Execution objects are mutable and may retain outputs from earlier runs,
+    # so reusing them would hide stale-cache behavior.
+    replay_runner = SingleNodeRunner(
+        node_id=a.id,
+        dag=dag,
+        executions=_build_executions(dag),
+        force_upstream=False,
+        load_output=lambda node_id: cache.get(node_id),
+    )
+
+    replay_runner.run_downstream()
+
+    # All nodes in the replayed downstream subgraph should execute once.
+    assert a.calls == 1
+    assert b.calls == 1
+    assert y.calls == 1
+    assert c.calls == 1
+    assert x.calls == 1
+    assert m.calls == 1
+
+    assert m.last_input is not None
+    assert set(m.last_input.keys()) == {'default', 'attachment'}
+
+    # Both branches must be fresh from the current run.
+    #
+    # If the bug is present, a likely bad state is:
+    #   default.value == 1   (stale cached C from previous run)
+    #   attachment.value == 2 (fresh X from current run)
+    assert m.last_input['default']['value'] == 2
+    assert m.last_input['attachment']['value'] == 2
+
+    # Extra sanity: the default branch must really come from C, and attachment from X.
+    assert m.last_input['default']['from'] == c.id
+    assert m.last_input['attachment']['from'] == x.id

@@ -117,6 +117,7 @@ def face_id_meta(face_specs: List[FaceIdSpec]) -> list[dict]:
             'weight_name': fid.weight_name,
             'subfolder': fid.subfolder,
             'scale': fid.scale,
+            'clip_strength': fid.clip_strength,
             'has_mask': fid.has_mask,
             'input_id': f'face_id:{fid.key}',
             'mask_input_id': f'ip_adapter_mask:{fid.key}' if fid.has_mask else None,

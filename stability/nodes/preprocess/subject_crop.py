@@ -931,34 +931,29 @@ def _mp_pose_landmarks_xy(
     """
     Detect pose landmarks and return stable landmark coordinates in pixel space.
 
+    This variant is intentionally tolerant to partial bodies (e.g. bust shots,
+    cropped portraits, or images where hips are outside the frame). It avoids
+    rejecting otherwise valid detections while still enforcing a minimal
+    geometric structure.
+
     Parameters
     ----------
     img_rgb : np.ndarray
         Input RGB image with shape ``(H, W, 3)`` and dtype uint8.
     pose_landmarker : Any
-        MediaPipe `PoseLandmarker` instance, typically obtained from
-        `get_mediapipe_pose_landmarker(...)`.
+        MediaPipe PoseLandmarker instance.
 
     Returns
     -------
     np.ndarray
-        Array with shape ``(33, 2)`` containing absolute pixel coordinates
-        ``(x, y)`` for the canonical MediaPipe pose landmark indices.
-
-        Landmarks considered too weak are stored as ``(-1, -1)`` so the
-        original MediaPipe indexing is preserved.
+        Array with shape ``(33, 2)`` containing absolute pixel coordinates.
+        Missing or weak landmarks are encoded as ``(-1, -1)``.
 
     Raises
     ------
     RuntimeError
-        If MediaPipe detects no pose, if too few landmarks are reliable,
-        or if key torso landmarks are missing.
-
-    Notes
-    -----
-    Preserving the original 33-slot indexing is important because downstream
-    logic uses canonical MediaPipe landmark ids such as shoulders and hips.
-    A compacted list of only visible landmarks would break that mapping.
+        If no pose is detected or if the landmark configuration is too weak
+        to plausibly represent a person.
     """
     import mediapipe as mp
 
@@ -976,12 +971,14 @@ def _mp_pose_landmarks_xy(
         raise RuntimeError('MediaPipe found no pose landmarks.')
 
     pts = np.full((33, 2), -1, dtype=np.int32)
+
     strong_count = 0
 
     for idx, lm in enumerate(pose_landmarks[0]):
         visibility = float(getattr(lm, 'visibility', 1.0))
         presence = float(getattr(lm, 'presence', 1.0))
 
+        # Conservative threshold that works well with cropped images
         if visibility < 0.35 or presence < 0.35:
             continue
 
@@ -994,20 +991,26 @@ def _mp_pose_landmarks_xy(
         pts[idx] = (x, y)
         strong_count += 1
 
+    # -------------------------------------------------------------
+    # Basic robustness checks
+    # -------------------------------------------------------------
+
     if strong_count < 8:
         raise RuntimeError(
             'MediaPipe pose landmarks are too weak to identify a person reliably.'
         )
 
-    torso_ids = [11, 12, 23, 24]
-    torso_ok = all(
-        pts[i, 0] >= 0 and pts[i, 1] >= 0
-        for i in torso_ids
-    )
-    if not torso_ok:
+    # Require at least some structural anchors.
+    # Shoulders are the most reliable torso landmarks in cropped images.
+    left_shoulder = (pts[11, 0] >= 0 and pts[11, 1] >= 0)
+    right_shoulder = (pts[12, 0] >= 0 and pts[12, 1] >= 0)
+
+    # Nose is almost always present when the upper body is visible.
+    nose = (pts[0, 0] >= 0 and pts[0, 1] >= 0)
+
+    if not (left_shoulder or right_shoulder or nose):
         raise RuntimeError(
-            'MediaPipe pose is missing key torso landmarks '
-            '(shoulders / hips).'
+            'MediaPipe pose landmarks lack stable anchors (no shoulders or nose).'
         )
 
     return pts

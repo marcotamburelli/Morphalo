@@ -79,7 +79,7 @@ def refine_face_group(
         # Ports (entry nodes)
         # -------------------
         tap_image = Tap(name='in_image')
-        tap_prompt = Tap(name='in_prompt')
+        tap_prompt = Tap(name='in_prompt', strict=False)
         face_embed = FaceIdEmbedImage(name='in_face_image')
 
         # -------------------
@@ -111,6 +111,7 @@ def refine_face_group(
         face_id_sink = refine_face.face_id.add(
             model_id='h94/IP-Adapter-FaceID',
             weight_name='ip-adapter-faceid-plusv2_sdxl.bin',
+            # weight_name='ip-adapter-faceid_sdxl.bin',
             scale=face_id_scale,
             clip_strength=face_id_clip_strength,
             key='face_id',

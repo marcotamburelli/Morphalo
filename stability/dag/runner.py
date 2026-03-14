@@ -186,12 +186,11 @@ class SingleNodeRunner:
         self._run(node_from)  # build upstream (cycle guard is inside _run)
 
         out = self.load_output(node_from)
-        # In theory None output is allowed
-        # if out is None:
-        #     raise RuntimeError(
-        #         f'Upstream node {node_from!r} was executed but produced no cached output '
-        #         f'(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r}).'
-        #     )
+        if out is None:
+            raise RuntimeError(
+                f'Upstream node {node_from!r} was executed but produced no cached output '
+                f'(needed by {ex.edge.node_to!r} on input {ex.edge.input_id!r}).'
+            )
         return out
 
     def _run(self, node_id: str) -> None:
@@ -281,12 +280,17 @@ class SingleNodeRunner:
             if ex.edge.node_to in R
         ]
 
+        def _load_output_wrapped(node_id: str) -> Optional[Output]:
+            if node_id in R:
+                return None
+            return self.load_output(node_id)
+
         _execute(
             out_dir=self.__dag.out_dir,
             entries=get_entry_nodes(nodes=nodes_R, edges=edges_R),
             executions=executions_R,
             nodes=nodes_R,
-            load_output=self.load_output,
+            load_output=_load_output_wrapped,
         )
 
 
