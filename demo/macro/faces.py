@@ -18,7 +18,7 @@ def refine_face_group(
     face_id_scale: float,
     face_id_clip_strength: float = 1.0,
     layer_feather: int | str = 30,
-    layer_corner_radius: int = 50,
+    layer_corner_radius: int | str = 50,
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines a head/face region and overlays it back.
@@ -52,9 +52,9 @@ def refine_face_group(
         IP-Adapter FaceID scale.
     face_id_clip_strength : float, optional
         FaceID CLIP conditioning strength.
-    layer_feather : int, optional
+    layer_feather : int | str, optional
         Feather applied when compositing the refined layer.
-    layer_corner_radius : int, optional
+    layer_corner_radius : int | str, optional
         Corner radius applied to the refined layer mask.
 
     Returns

@@ -22,7 +22,7 @@ class LayerSpec:
     position: Pos = 'center'
     resize: ResizeMode = None
     feather: int | str = 0
-    corner_radius: Optional[int] = None
+    corner_radius: Optional[int | str] = None
 
 
 @dataclass
@@ -34,7 +34,7 @@ class Config:
 
 
 def validate_size_expr(size_expr: int | str) -> None:
-    # Absolute pixel feather
+    # Absolute pixel value
     if isinstance(size_expr, int):
         if size_expr < 0:
             raise ValueError('size expression must be >= 0')
@@ -62,21 +62,52 @@ def resolve_size_expr(
     size_expr: int | str,
     *,
     max_size: int,
+    min_size: int = 1,
 ) -> int:
+    """
+    Resolve a size expression to pixels.
+
+    Parameters
+    ----------
+    size_expr : int or str
+        Size specification.
+
+        Supported formats are:
+
+        - ``int``:
+          Explicit size in pixels.
+        - ``'<number>px'``:
+          Explicit size in pixels.
+        - ``'<number>%'``:
+          Percentage of ``max_size``.
+
+    max_size : int
+        Reference size used to resolve percentage expressions.
+    min_size : int, default=1
+        Minimum resolved value returned by the function.
+
+        This is useful because some geometric quantities, such as output
+        image size, should never collapse to zero, while others, such as
+        corner radius, may validly resolve to zero.
+
+    Returns
+    -------
+    int
+        Resolved size in pixels, clamped to be at least ``min_size``.
+    """
     validate_size_expr(size_expr)
 
     if isinstance(size_expr, int):
-        return max(0, size_expr)
+        return max(min_size, size_expr)
 
     s = size_expr.strip().lower()
 
     if s.endswith('px'):
-        return max(0, int(round(float(s[:-2]))))
+        return max(min_size, int(round(float(s[:-2]))))
 
     pct = max(0.0, float(s[:-1])) / 100.0
 
-    # Size should always be at least 1
-    return max(1, int(round(max_size * pct)))
+    return max(min_size, int(round(max_size * pct)))
 
 
 def resolve_feather_xy(
@@ -815,7 +846,7 @@ class ImageStack(NodeRef):
         position: Pos = 'center',
         resize: ResizeMode = None,
         feather: int | str = 0,
-        corner_radius: Optional[int] = None,
+        corner_radius: Optional[int | str] = None,
     ) -> ImageLayerAttachmentSink:
         """
         Declare an input image layer.
@@ -921,27 +952,23 @@ class ImageStack(NodeRef):
 
             Default: ``0``.
 
-        corner_radius : int or None, optional
-            Corner rounding radius (in pixels) used when generating the
-            synthetic alpha mask for fully opaque layers.
+        corner_radius : int or str or None, optional
+            Corner rounding radius used when generating the synthetic alpha mask
+            for fully opaque layers.
 
-            This parameter only affects layers whose alpha channel is
-            completely opaque (e.g. ``crop_mode='bbox'``). In that case,
-            the synthetic support region used for feathering may optionally
-            use rounded corners.
+            Supported formats are:
 
-            - ``None``:
-            Automatic mode. The corner radius may be derived heuristically
-            from the feather width.
-            - ``0``:
-            Disable corner rounding. A rectangular support region is used.
-            - ``> 0``:
-            Explicit corner radius in pixels.
+            - ``None`` → Automatic mode. The corner radius is derived
+              heuristically from the feather width.
+            - ``int`` → Explicit radius in pixels.
+            - ``"<number>px"`` → Explicit radius in pixels.
+            - ``"<number>%"`` → Percentage of the maximum valid corner radius,
+              defined as half of the shorter layer side.
+
+            A value of ``0`` or ``"0%"`` disables corner rounding.
 
             This parameter has no effect when the layer already contains
             transparency (e.g. segmentation masks).
-
-            Default: ``None``.
 
         Returns
         -------
@@ -1003,12 +1030,7 @@ class ImageStack(NodeRef):
             )
 
         if corner_radius is not None:
-            corner_radius = int(corner_radius)
-
-            if corner_radius < 0:
-                raise ValueError(
-                    f"{self.id}: 'corner_radius' cannot be negative."
-                )
+            validate_size_expr(corner_radius)
 
         validate_size_expr(feather)
 
@@ -1117,17 +1139,22 @@ class ImageStack(NodeRef):
                         height=lh,
                     )
                     if feather_x > 0 or feather_y > 0:
-                        # Corner rounding radius (in pixels).
+                        max_corner = max(0, (min(lw, lh) // 2) - 1)
+
+                        # Corner rounding radius.
                         # - None: backward compatible heuristic based on feather radius
                         # - 0: no rounding
                         # - >0: explicit
                         if layer_spec.corner_radius is None:
                             corner = int((feather_x + feather_y) * 3.0 / 2.0)
                         else:
-                            corner = int(layer_spec.corner_radius)
+                            corner = resolve_size_expr(
+                                layer_spec.corner_radius,
+                                max_size=max_corner,
+                                min_size=0,
+                            )
 
                         # Clamp to avoid impossible / over-rounding geometries
-                        max_corner = max(0, (min(lw, lh) // 2) - 1)
                         corner = max(0, min(corner, max_corner))
 
                         a = _perturbed_alpha_ramp(
@@ -1193,6 +1220,7 @@ class ImageStack(NodeRef):
                         'position': ls.position,
                         'resize': ls.resize,
                         'feather': ls.feather,
+                        'corner_radius': ls.corner_radius,
                     }
                     for ls in (self._layers[i] for i in sorted(self._layers.keys()))
                 ],

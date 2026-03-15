@@ -45,13 +45,11 @@ def cutout_stack_img2img_group(
         Group name (scope prefix).
     out_spec : SpecInput
         Spec for the final Img2Img harmonization pass.
-    fg_layer_feather : int, optional
+    fg_layer_feather : int | str, optional
         Feather applied to the subject layer in the stack.
     fg_layer_position : str, optional
         Subject placement anchor/position for stack.image(...).
-    fg_layer_corner_radius : int or None, optional
-        Optional rounded corner radius for the subject alpha edge (if supported by ImageStack).
-    fg_layer_corner_radius : ResizeMode, optional
+    fg_layer_resize : ResizeMode, optional
         Optional resize parameter. See `stack.image()` for more details.
     """
 
