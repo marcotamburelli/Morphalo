@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
                        StableDiffusionXLImg2ImgPipeline)
@@ -20,6 +20,55 @@ from stability.nodes.sdxl_resolve import resolve_common
 from stability.nodes.wiring.conditioning import apply_ip_adapter
 from stability.nodes.wiring.mixins import ControlNetMixin, PromptMixin
 from stability.nodes.wiring.prompt import PromptBundle
+
+
+def _resolve_long_side_size(
+    *,
+    image: Image.Image,
+    long_side: int,
+    multiple: int = 8,
+) -> Tuple[int, int]:
+    """
+    Resolve a proportional output size from an input image.
+
+    The longest side is scaled toward ``long_side`` and then aligned to the
+    specified ``multiple`` and the shorter side is scaled proportionally
+    from the input image aspect ratio.
+
+    Parameters
+    ----------
+    image : PIL.Image.Image
+        Input image.
+    long_side : int
+        Target size for the longest side.
+    multiple : int, default=8
+        Round each resolved dimension down to a multiple of this value.
+
+    Returns
+    -------
+    tuple[int, int]
+        Resolved ``(width, height)``.
+    """
+    if long_side <= 0:
+        raise ValueError(f"'long_side' must be > 0, got {long_side}")
+
+    src_w, src_h = image.size
+
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError(f'invalid input image size {src_w}x{src_h}')
+
+    if src_w >= src_h:
+        width = int(long_side)
+        height = int(round(src_h * (width / src_w)))
+    else:
+        height = int(long_side)
+        width = int(round(src_w * (height / src_h)))
+
+    if multiple > 1:
+        width = max(multiple, (width // multiple) * multiple)
+        height = max(multiple, (height // multiple) * multiple)
+
+    return width, height
 
 
 @dataclass
@@ -99,7 +148,10 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             Output width (default: 1024).
         - ``params.height`` : int, optional
             Output height (default: 1024).
-
+        - ``params.long_side`` : int, optional
+            If provided, overrides ``params.width`` and ``params.height`` and
+            resolves the generation size proportionally from the input image so
+            that its longest side matches this value.
         **Randomness**
         - ``seed`` : int or str, optional
             Seed value or ``"random"`` (default: ``"random"``). Resolved by
@@ -153,17 +205,20 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
 
     Notes
     -----
-    - The init image is loaded from the upstream path, converted to RGB, and resized
-    to ``(width, height)`` prior to generation.
-    - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle is
-    wired into ``prompt:default``, it takes precedence over the local ``spec``;
+    - The init image is loaded from the upstream path and converted to RGB.
+      The effective generation size is resolved either from ``params.width`` /
+      ``params.height`` or, when ``params.long_side`` is provided, from the
+      input image aspect ratio.
+    - Prompt resolution is performed by :class:`PromptBundle`: 
+      if a prompt bundle is
+      wired into ``prompt:default``, it takes precedence over the local ``spec``;
     otherwise the local ``spec`` is used.
     - ControlNet, IP-Adapter, and FaceID inputs are collected from DAG wiring
-    through their respective registries and bundled via
-    ``build_control_bundles``.
+      through their respective registries and bundled via
+      ``build_control_bundles``.
     - When ControlNet is enabled, this node calls the img2img pipeline with
-    ``image=init_image`` and passes ControlNet conditioning via ``control_image``
-    (through ``build_pipe_kwargs(..., init_image_already_passed=True)``).
+      ``image=init_image`` and passes ControlNet conditioning via ``control_image``
+      (through ``build_pipe_kwargs(..., init_image_already_passed=True)``).
     - IP-Adapter and FaceID are mutually exclusive in this node.
     """
 
@@ -191,9 +246,22 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             raise ValueError(
                 "Init image upstream output must contain 'image' (path).")
 
-        init_image = Image.open(init_path) \
-            .convert('RGB') \
-            .resize((ctx.width, ctx.height))
+        with Image.open(init_path) as im:
+            init_image = im.convert('RGB')
+
+        long_side = ctx.long_side
+
+        if long_side is not None:
+            width, height = _resolve_long_side_size(
+                image=init_image,
+                long_side=long_side,
+                multiple=8,
+            )
+        else:
+            width = ctx.width
+            height = ctx.height
+
+        init_image = init_image.resize((width, height), resample=Image.LANCZOS)
 
         # --- resolve inputs from DAG wiring ---
         cn_bundle, ip_bundle, face_bundle = self.build_control_bundles(
@@ -242,8 +310,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             cn_bundle=cn_bundle,
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
-            height=ctx.height,
-            width=ctx.width,
+            height=height,
+            width=width,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
             init_image_already_passed=True,
@@ -266,8 +334,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
             generator=ctx.rng.gen,
-            width=ctx.width,
-            height=ctx.height,
+            # width=width,
+            # height=height,
             **pipe_kwargs
         )
 
@@ -295,8 +363,9 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
                 'steps': ctx.steps,
                 'guidance_scale': ctx.cfg,
                 'strength': ctx.strength,
-                'width': ctx.width,
-                'height': ctx.height,
+                'width': width,
+                'height': height,
+                **({'long_side': ctx.long_side} if ctx.long_side is not None else {}),
             },
             dt_s=dt_s,
             cuda_mem=mem,

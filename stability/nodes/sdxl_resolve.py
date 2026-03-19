@@ -63,6 +63,8 @@ class ImageGenerationContext:
     width: int
     height: int
 
+    long_side: Optional[int]
+
     # randomness
     rng: RandomConfig
 
@@ -97,6 +99,10 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
     width = int(params.get('width', 1024))
     height = int(params.get('height', 1024))
 
+    long_side = params.get('long_side', None)
+    if long_side is not None:
+        long_side = int(long_side)
+
     # seed / RNG
     seed = resolve_seed(spec.get('seed', 'random'))
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -109,6 +115,7 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
         strength=strength,
         width=width,
         height=height,
+        long_side=long_side,
         rng=RandomConfig(
             seed=seed,
             gen=gen,
