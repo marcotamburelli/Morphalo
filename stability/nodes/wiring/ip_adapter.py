@@ -205,14 +205,66 @@ class IpAdapterRegistry:
             (e.g. ``'sdxl_models'``).
 
         scale : IpAdapterScale, optional
-            Influence of the IP-Adapter on the diffusion process for this slot.
-            It may be:
-            - a single float shared by all reference images attached to this slot,
-            - a dictionary specifying per-block configuration.
+            Influence of this IP-Adapter slot on the diffusion process.
 
-            Per-image scale lists are intentionally not supported at the slot
-            level. If different reference images need different weights, declare
-            multiple IP-Adapter slots instead.
+            Accepted formats:
+
+            - ``float``
+                Uniform strength applied to the whole adapter slot.
+
+                This is the simplest and most common form. The same scalar
+                weight is used for all reference images attached to this slot
+                and for all internal blocks where the adapter is active.
+
+                Example::
+
+                    scale = 0.7
+
+            - ``dict[str, dict[str, list[float]]]``
+                Per-block configuration for SDXL IP-Adapter processors that
+                support granular routing of the adapter contribution across
+                the UNet.
+
+                The top-level keys identify the UNet section:
+
+                - ``'down'``: lower-resolution blocks, typically affecting
+                  structure, layout, and global composition.
+                - ``'mid'``: bottleneck block, potentially affecting more
+                  global semantic features.
+                - ``'up'``: higher-resolution blocks, typically affecting
+                  style, texture, and fine visual details.
+
+                Each section maps block names such as ``'block_0'`` or
+                ``'block_2'`` to a list of per-layer weights. The length of
+                each list must match the number of IP-Adapter-aware layers
+                in that block for the target pipeline architecture.
+
+                Example::
+
+                    scale = {
+                        'up': {'block_0': [0.0, 0.7, 0.0]},
+                        'down': {'block_2': [0.0, 1.0]},
+                    }
+
+                In this example:
+                - ``down.block_2`` is used to strengthen layout/composition,
+                - ``up.block_0`` is used to transfer visual style/details,
+                - zero values disable the adapter contribution for the
+                  corresponding internal layer.
+
+            Notes
+            -----
+            - ``scale`` is defined per adapter slot, not per reference image.
+              If multiple images are attached to the same slot, they share the
+              same slot-level scale configuration.
+            - Per-image scale lists are intentionally not supported. If
+              different reference images need different strengths, declare
+              multiple IP-Adapter slots instead.
+            - Per-block dict configurations are supported only when the
+              underlying Diffusers IP-Adapter processor supports them. Some
+              adapter variants, such as FaceID-based ones, may accept only a
+              scalar float scale.
+
             Default is ``1.0``.
 
         key : str, optional

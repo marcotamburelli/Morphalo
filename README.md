@@ -398,6 +398,174 @@ Run it:
 
 Outputs are written under `outputs/hello_txt2img/` (image file + JSON metadata per node).
 
+### Direct connections vs lateral wiring
+
+Stability distinguishes between two kinds of node connections.
+
+#### Direct connection (main artifact flow)
+
+A direct connection passes the primary output artifact of one node into
+the main input of another node.
+
+Example:
+
+``` python
+file_img >> img2img
+```
+
+Here, `img2img` receives the upstream image as its required main input.
+This is the standard data flow of the DAG: one node produces the
+artifact, the next node consumes it.
+
+Use a direct connection when the downstream node requires that artifact
+in order to run.
+
+Typical examples include:
+
+-   image source → `Img2Img`
+-   image source → `Inpaint`
+-   `Txt2Img` → `Img2Img`
+-   `Img2Img` → `ImageStack`
+
+#### Lateral wiring (conditioning channels)
+
+Some nodes also expose dedicated attachment points for lateral
+conditioning. These are not the main input of the node, but additional
+signals that modify or guide its behavior.
+
+Example:
+
+``` python
+prompt >> out.prompt()
+```
+
+Here, the `Prompt` node is not connected to the main input of `Txt2Img`.
+Instead, it is injected through a dedicated prompt channel exposed by
+`out.prompt()`.
+
+This same pattern is used for other conditioning mechanisms such as:
+
+-   prompt bundles
+-   ControlNet inputs
+-   IP-Adapter reference images
+-   FaceID inputs
+-   T2I-Adapter inputs
+
+In other words:
+
+-   **required primary data** should be passed through a direct
+    connection
+-   **conditioning inputs** should be attached through the node's
+    dedicated lateral wiring API
+
+For more advanced wiring patterns, see the examples in the `demo/`
+directory.
+
+## Node specification resolution
+
+Nodes accept their configuration through the `spec` parameter.
+
+A spec can be provided in three forms:
+
+-   a Python dictionary
+-   a path to a HOCON configuration file
+-   a sequence of layered specifications combining both
+
+Example:
+
+``` python
+spec = [
+    "configs/base.conf",
+    "configs/scene.conf",
+    {"params": {"steps": 30}}
+]
+```
+
+During execution, Stability resolves this specification into a single
+configuration dictionary.
+
+Resolution works as follows:
+
+1.  Each layer is resolved independently.
+    -   dictionaries are used directly
+    -   strings or `Path` objects are interpreted as paths to HOCON
+        files and loaded accordingly
+2.  The resolved layers are then **merged from left to right**.
+
+Later layers override earlier ones.
+
+### Merge rules
+
+The merge operation follows a deterministic deep-merge strategy:
+
+-   **nested dictionaries are merged recursively**
+-   **scalars override previous values**
+-   **lists are replaced entirely**
+
+Example:
+
+Layer 1:
+
+``` python
+{
+  "params": {
+    "steps": 20,
+    "width": 1024
+  }
+}
+```
+
+Layer 2:
+
+``` python
+{
+  "params": {
+    "steps": 30
+  }
+}
+```
+
+Final result:
+
+``` python
+{
+  "params": {
+    "steps": 30,
+    "width": 1024
+  }
+}
+```
+
+However, lists are not merged:
+
+Layer 1:
+
+``` python
+{
+  "negative_prompt": ["blurry"]
+}
+```
+
+Layer 2:
+
+``` python
+{
+  "negative_prompt": ["low quality"]
+}
+```
+
+Final result:
+
+``` python
+{
+  "negative_prompt": ["low quality"]
+}
+```
+
+This layered specification model allows base configurations to be reused
+and selectively overridden for different nodes or experiments while
+keeping configuration files compact and composable.
+
 ## CLI Usage and Execution Model
 
 Stability is designed around a small but flexible CLI runner that executes DAGs deterministically and supports partial execution.
