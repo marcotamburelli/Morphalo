@@ -129,6 +129,34 @@ Each node produces artifacts on disk and can receive inputs through
 explicit channels. Nodes are connected using a wiring DSL that allows both
 **main data flow** and **lateral conditioning inputs**.
 
+### Node model
+
+In Stability, each step of a workflow is represented by a **node**.
+
+A node is a lightweight object that:
+
+- has a unique **name** within the DAG
+- receives a **spec** (configuration)
+- optionally consumes artifacts produced by upstream nodes
+- materializes its outputs to disk
+
+Conceptually:
+
+```
+Node
+ ├ name        (identifier within the DAG)
+ ├ spec        (configuration dictionary or layered spec)
+ ├ run(...)    (execution logic)
+ └ artifacts   (files written to disk)
+```
+
+The `run(...)` method is responsible for executing the node's logic and
+producing its artifacts. These artifacts are later consumed by downstream
+nodes through the DAG wiring system.
+
+This design keeps nodes deterministic and makes pipeline execution
+inspectable and reproducible.
+
 A typical graph might look like this:
 
 ```mermaid
@@ -202,6 +230,39 @@ class Prompt,ControlNet,IPAdapter,FaceID cond
 ```
 
 > Solid edges represent the main artifact flow, while dashed edges represent lateral conditioning inputs.
+
+### Wiring API
+
+Nodes are connected using a small wiring DSL built around the `>>` operator.
+
+Two main patterns exist:
+
+**Direct wiring (main artifact flow):**
+
+```
+upstream_node >> downstream_node
+```
+
+This connects the primary artifact produced by `upstream_node` to the main
+input of `downstream_node`.
+
+**Channel wiring (lateral inputs):**
+
+```
+conditioning_node >> target_node.channel()
+```
+
+Here the upstream node is attached to a specific **input channel** exposed by
+the downstream node.
+
+These channels are implemented internally through `AttachmentSink` objects
+and allow nodes to expose structured attachment points for conditioning
+signals such as prompts, ControlNet inputs, or adapter references.
+
+This distinction keeps the **main data flow explicit**, while allowing
+multiple optional conditioning signals to be injected without breaking the
+pipeline structure.
+
 
 ### Artifact-based execution
 
