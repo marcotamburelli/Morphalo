@@ -15,7 +15,8 @@ from stability.nodes.common.config_resolve import (SpecInput, resolve_dtype,
 from stability.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                               cuda_sync)
 from stability.nodes.common.env import setup_env
-from stability.nodes.io import finalize_image_output, save_image
+from stability.nodes.common.io import save_image
+from stability.nodes.io import finalize_image_output
 from stability.nodes.wiring.mixins import PromptMixin
 from stability.nodes.wiring.prompt import PromptBundle
 

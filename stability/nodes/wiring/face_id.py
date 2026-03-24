@@ -8,6 +8,7 @@ from transformers import CLIPVisionModelWithProjection
 
 from stability.cache.models import get_ip_image_encoder
 from stability.dag import NodeRef
+from stability.nodes.common.io import load_faceid_embeds
 from stability.nodes.wiring.ip_adapter import IpAdapterAttachmentSink
 from stability.nodes.wiring.utils import infer_image_encoder_subfolder
 
@@ -307,7 +308,11 @@ class FaceIdBundle:
 
         # Load embeds tensors (and normalize shapes) eagerly here.
         self._embeds = [
-            self._load_faceid_embeds(p) for p in self._embeds_paths
+            load_faceid_embeds(
+                p,
+                device=self._device,
+                dtype=self._dtype,
+            ) for p in self._embeds_paths
         ]
 
         if self._weight_names_requiring_clip:
@@ -424,32 +429,6 @@ class FaceIdBundle:
             )
 
         return p
-
-    def _load_faceid_embeds(self, path_or_paths: Union[str, List[str]]) -> torch.Tensor:
-        """
-        Load FaceID embeds and normalize to (2, N, D).
-
-        If a list of paths is provided, we concatenate references along N (dim=1),
-        preserving the (neg,pos) pairing in dim=0.
-        """
-        def load_one(p: str) -> torch.Tensor:
-            t = torch.load(p, map_location='cpu')
-            if not isinstance(t, torch.Tensor):
-                raise TypeError(
-                    f'FaceID embeds file {p!r} did not contain a torch.Tensor. Got: {type(t)}')
-            if t.ndim != 3 or t.shape[0] != 2 or t.shape[1] < 1:
-                raise ValueError(
-                    f'FaceID embeds must have shape (2, N, D). Got {tuple(t.shape)} from {p!r}')
-            return t
-
-        if isinstance(path_or_paths, str):
-            t = load_one(path_or_paths)
-        else:
-            ts = [load_one(p) for p in path_or_paths]
-            # concatenate along N dimension
-            t = torch.cat(ts, dim=1)  # (2, sum(Ni), D)
-
-        return t.to(device=self._device, dtype=self._dtype)
 
     def build_ip_adapter_masks(
         self,

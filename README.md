@@ -1,6 +1,14 @@
 # Stability
 
-Stability is a **local-first playground** for building **reproducible image and video generation workflows** as **DAGs (Directed Acyclic Graphs)**.
+Stability is a **local-first framework** for building reproducible **generative image and video workflows** as
+**DAGs (Directed Acyclic Graphs)**.
+
+Instead of exposing the internal components of diffusion models, Stability treats
+complete diffusion pipelines as **high-level operators** that can be composed into
+larger image-processing workflows.
+
+Diffusers pipelines (`txt2img`, `img2img`, `inpaint`) become building blocks inside a DAG,
+alongside other tools such as MediaPipe, Segment Anything, or custom preprocessing steps.
 
 The core idea is simple:
 
@@ -57,6 +65,35 @@ Stability takes a different approach:
 - favors **explicit configuration and version-controlled pipelines**
 
 While ComfyUI focuses on interactive visual experimentation, Stability focuses on **structured and programmable pipelines**.
+
+In particular, Stability operates at a **higher abstraction level** than tools such as ComfyUI.
+
+In ComfyUI, users typically construct graphs that closely mirror the **internal structure of diffusion inference**. 
+Nodes often represent low-level components of the generation process (e.g. CLIP encoders, schedulers, samplers, VAE decoding, latent transformations), 
+and building a workflow means assembling these internal building blocks manually.
+
+Stability instead treats diffusion models as **high-level operators** by relying directly on ready-made pipelines provided by
+libraries such as Diffusers. Rather than exposing the internal model graph, Stability orchestrates complete generation steps such as:
+
+- `Txt2Img`
+- `Img2Img`
+- `Inpaint`
+- ControlNet-conditioned generation
+- adapter-based conditioning (IP-Adapter, FaceID, etc.)
+
+These operators are then combined inside a DAG to build **larger image-processing workflows**.
+
+This makes it natural to integrate diffusion with other processing stages, for example:
+
+- preprocessing images (cropping subjects, extracting faces, generating control maps)
+- running diffusion pipelines with prompts and conditioning signals
+- refining or reprocessing generated outputs
+
+In practice, a Stability workflow may combine components from several libraries—such as Diffusers, MediaPipe, Segment Anything (SAM), 
+or other preprocessing tools—to construct end-to-end generation pipelines driven by prompts, images, or both.
+
+The result is a system where diffusion pipelines become **building blocks in a broader image-processing DAG**, 
+rather than the graph itself.
 
 That said, the DAG model used by Stability is intentionally **UI-friendly**.  
 Because workflows are represented as graphs with explicit channels, it would be straightforward in the future to build a graphical editor that generates DAG definitions automatically.

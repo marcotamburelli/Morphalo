@@ -436,9 +436,6 @@ def get_mediapipe_face_landmarker(
       bbox from them), not FaceDetector.
     - `device` is kept for cache-key consistency with the rest of the project.
     """
-
-    from pathlib import Path
-
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
@@ -508,8 +505,6 @@ def get_mediapipe_pose_landmarker(
     The landmarker is configured for image mode because `SubjectCrop`
     performs per-image analysis rather than video or live-stream inference.
     """
-    from pathlib import Path
-
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
@@ -541,4 +536,74 @@ def get_mediapipe_pose_landmarker(
     )
 
     landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+    return ModelCache.put(key, landmarker)
+
+
+def get_mediapipe_hand_landmarker(
+    *,
+    model_asset_path: str,
+    device: str,
+):
+    """
+    Cached MediaPipe HandLandmarker (Tasks API).
+
+    Parameters
+    ----------
+    model_asset_path : str
+        Path to the MediaPipe HandLandmarker `.task` model file.
+    device : str
+        Logical device string kept for cache-key consistency with the rest
+        of the project. MediaPipe Tasks does not currently use it here as
+        an execution selector, but it is still part of the cache identity.
+
+    Returns
+    -------
+    Any
+        A cached MediaPipe `HandLandmarker` instance configured for
+        single-image inference.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the model file does not exist.
+
+    Notes
+    -----
+    The landmarker is configured for image mode because the current scoring
+    pipeline performs per-image analysis rather than video or live-stream
+    inference.
+
+    The configuration allows detecting up to two hands, which is the most
+    natural choice for character images and portraits.
+    """
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+
+    model_path = Path(str(model_asset_path)).expanduser().resolve()
+    if not model_path.exists() or not model_path.is_file():
+        raise FileNotFoundError(f'MediaPipe model not found: {model_path}')
+
+    key = CacheKey(
+        kind='mediapipe_hand_landmarker',
+        ref=str(model_path),
+        device=str(device),
+        dtype='na',
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_hands=2,
+        min_hand_detection_confidence=0.3,
+        min_hand_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
+    )
+
+    landmarker = mp_vision.HandLandmarker.create_from_options(options)
     return ModelCache.put(key, landmarker)

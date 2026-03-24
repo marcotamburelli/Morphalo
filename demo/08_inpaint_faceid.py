@@ -14,7 +14,7 @@ Source image (base)  ------------------->
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.06_inpaint_faceid --dag inpaint_faceid
+    ./bin/run_dag.sh demo.08_inpaint_faceid --dag inpaint_faceid
 
 Inputs (local paths)
 -------------------

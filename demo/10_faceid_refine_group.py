@@ -31,7 +31,7 @@ Why a group?
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.08_faceid_refine_group --dag faceid_refine_group
+    ./bin/run_dag.sh demo.10_faceid_refine_group --dag faceid_refine_group
 '''
 
 from pathlib import Path

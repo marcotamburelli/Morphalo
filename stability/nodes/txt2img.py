@@ -14,7 +14,8 @@ from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.common.cuda_stat import *
 from stability.nodes.common.env import setup_env
-from stability.nodes.io import finalize_image_output, save_image
+from stability.nodes.common.io import save_image
+from stability.nodes.io import finalize_image_output
 from stability.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from stability.nodes.sdxl_resolve import resolve_common
 from stability.nodes.wiring.conditioning import apply_ip_adapter

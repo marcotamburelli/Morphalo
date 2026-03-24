@@ -14,7 +14,8 @@ from stability.dag import NodeRef
 from stability.nodes.common.config_resolve import SpecInput
 from stability.nodes.common.cuda_stat import *
 from stability.nodes.common.env import setup_env
-from stability.nodes.io import finalize_image_output, save_image
+from stability.nodes.common.io import save_image
+from stability.nodes.io import finalize_image_output
 from stability.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from stability.nodes.sdxl_resolve import resolve_common
 from stability.nodes.wiring.conditioning import apply_ip_adapter
@@ -244,7 +245,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
         init_path = init_up.get('image') or init_up.get('path')
         if not init_path:
             raise ValueError(
-                "Init image upstream output must contain 'image' (path).")
+                "Init image upstream output must contain 'image' (path)."
+            )
 
         with Image.open(init_path) as im:
             init_image = im.convert('RGB')
@@ -323,6 +325,11 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']
             assert len(masks) == l
 
+        if ctx.strength <= 0:
+            raise ValueError(
+                'params.strength cannot be 0 or lesser.'
+            )
+
         # IMPORTANT: Img2Img + ControlNet uses image=init and control_image=control
         result = pipe(
             prompt=prompt_bundle.prompt,
@@ -334,8 +341,8 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
             generator=ctx.rng.gen,
-            # width=width,
-            # height=height,
+            width=width,
+            height=height,
             **pipe_kwargs
         )
 

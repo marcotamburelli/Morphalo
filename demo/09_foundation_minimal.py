@@ -9,9 +9,9 @@ This module contains three small DAGs, one for each "foundation" node:
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.07_foundation_minimal --dag qwen_image_min
-    ./bin/run_dag.sh demo.07_foundation_minimal --dag qwen_image_edit_min
-    ./bin/run_dag.sh demo.07_foundation_minimal --dag omnigen_one_image_min
+    ./bin/run_dag.sh demo.00_foundation_minimal --dag qwen_image_min
+    ./bin/run_dag.sh demo.00_foundation_minimal --dag qwen_image_edit_min
+    ./bin/run_dag.sh demo.00_foundation_minimal --dag omnigen_one_image_min
 '''
 
 from pathlib import Path
