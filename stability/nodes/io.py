@@ -12,8 +12,8 @@ def finalize_image_output(
     *,
     node_kind: str,
     node_id: str,
-    img_path: Path,
-    seed: int,
+    img_path: Path | List[Path],
+    seed: int | List[int],
     params: dict,
     dt_s: float,
     cuda_mem: dict,
@@ -23,15 +23,97 @@ def finalize_image_output(
     face_id_specs: List[FaceIdSpec] = None,
     model_info: Optional[dict] = None,
 ) -> dict:
+    """
+    Build the final output payload and write a single JSON sidecar for the node.
+
+    This helper supports both single-image and batched-image outputs.
+
+    Normalization rules
+    -------------------
+    Internally, image paths and seeds are normalized to lists.
+
+    Public output rules
+    -------------------
+    - If exactly one image is present, expose:
+      - ``image``
+      - ``seed``
+    - If more than one image is present, expose:
+      - ``images``
+      - ``seeds``
+
+    Sidecar naming
+    --------------
+    Only one JSON sidecar is written per node execution. When multiple images are
+    present, the metadata file is anchored to the lexicographically smallest image
+    path to keep the naming deterministic and stable.
+
+    Parameters
+    ----------
+    node_kind : str
+        Node type / operator name.
+    node_id : str
+        Node identifier.
+    img_path : Path | list[Path]
+        Output image path or list of output image paths.
+    seed : int | list[int]
+        Seed or list of seeds aligned with ``img_path``.
+    params : dict
+        Generation parameters to store in metadata.
+    dt_s : float
+        Execution time in seconds.
+    cuda_mem : dict
+        CUDA memory statistics.
+    controlnet_specs : list[ControlNetSpec], optional
+        ControlNet configuration metadata.
+    t2i_adapter_specs : list[T2IAdapterSpec], optional
+        T2I-Adapter configuration metadata.
+    ip_adapter_specs : list[IpAdapterSpec], optional
+        IP-Adapter configuration metadata.
+    face_id_specs : list[FaceIdSpec], optional
+        FaceID configuration metadata.
+    model_info : dict, optional
+        Additional model metadata.
+
+    Returns
+    -------
+    dict
+        Final node output payload, including metadata path.
+
+    Raises
+    ------
+    ValueError
+        If image paths or seeds are empty, or if their lengths do not match.
+    """
+    img_paths = [img_path] if isinstance(img_path, Path) else list(img_path)
+    seeds = [seed] if isinstance(seed, int) else list(seed)
+
+    if not img_paths:
+        raise ValueError('finalize_image_output: img_path cannot be empty')
+
+    if not seeds:
+        raise ValueError('finalize_image_output: seed cannot be empty')
+
+    if len(img_paths) != len(seeds):
+        raise ValueError(
+            'finalize_image_output: number of image paths must match number '
+            f'of seeds, got {len(img_paths)} images and {len(seeds)} seeds'
+        )
+
     out = {
         'ok': True,
         'node': node_kind,
         'id': node_id,
-        'image': str(img_path),
-        'seed': seed,
         'params': params,
-        'timing': {'seconds': round(dt_s, 3)}
+        'timing': {'seconds': round(dt_s, 3)},
     }
+
+    if len(img_paths) == 1:
+        out['image'] = str(img_paths[0])
+        out['seed'] = seeds[0]
+    else:
+        out['images'] = [str(p) for p in img_paths]
+        out['seeds'] = seeds
+        out['batch'] = len(seeds)
 
     if cuda_mem:
         out['cuda_mem'] = cuda_mem
@@ -51,11 +133,11 @@ def finalize_image_output(
     if model_info is not None:
         out['model'] = model_info
 
-    meta_path = write_json_sidecar(img_path, out)
+    meta_anchor = min(img_paths, key=lambda p: str(p))
+    meta_path = write_json_sidecar(meta_anchor, out)
     out['metadata'] = str(meta_path)
 
     return out
-
 
 def controlnet_meta(controlnet_specs: List[ControlNetSpec]) -> list[dict]:
     return [

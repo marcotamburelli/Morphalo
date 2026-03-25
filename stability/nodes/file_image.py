@@ -47,37 +47,54 @@ class FileImage(NodeRef):
         Operator identifier automatically derived from the concrete class name
         (for example ``'file_image'``).
 
+    Outputs
+    -------
+    dict
+        Primary output dictionary.
+
+        The node may expose either a single image or multiple images,
+        depending on the number of provided paths.
+
+        **Single image output**
+
+        - ``ok`` : bool
+        - ``node`` : str (e.g. ``"file_image"``)
+        - ``id`` : str
+        - ``image`` : str
+          Absolute path to the image file.
+        - ``metadata`` : str
+          Path to the JSON sidecar.
+
+        **Multiple images output**
+
+        - ``ok`` : bool
+        - ``node`` : str
+        - ``id`` : str
+        - ``images`` : list[str]
+          Absolute paths to the image files.
+        - ``metadata`` : str
+          Path to the JSON sidecar.
+
+        The order of ``images`` is stable and corresponds to the input order.
+
     Notes
     -----
     - The JSON sidecar produced by this node is used as a persistent cache.
       If the node implementation, its configuration, or specification changes,
       any previously generated sidecar files must be removed manually in order
       to avoid reusing stale cached outputs.
+
+    - This node does not perform any transformation: it only validates and
+      exposes filesystem paths.
+
+    - When multiple images are provided, downstream nodes may interpret them
+      as ordered inputs (for example, per-slot conditioning in IP-Adapter or
+      ControlNet pipelines).
     """
 
     path: Union[str, Path, List[Union[str, Path]]]
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        """
-        Returns the image path as node output.
-
-        Parameters
-        ----------
-        output_dir : str or Path-like
-            Unused (kept for interface compatibility).
-        input : dict, optional
-            Unused. Source nodes are executed with empty inputs.
-
-        Returns
-        -------
-        dict
-            Output dictionary containing:
-            - 'ok': True
-            - 'node': 'file_image'
-            - 'id': node id
-            - 'image': absolute path or list of paths to the image files
-        """
-
         if not isinstance(self.path, list):
             paths = [self.path]
         else:
@@ -97,8 +114,13 @@ class FileImage(NodeRef):
             'ok': True,
             'node': self.op,
             'id': self.id,
-            'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0])
+            # 'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0])
         }
+
+        if len(paths) > 1:
+            out['images'] = [str(p) for p in paths]
+        else:
+            out['image'] = str(paths[0])
 
         out_path = make_node_output_path(
             out_dir=Path(output_dir),

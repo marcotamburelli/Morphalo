@@ -38,8 +38,11 @@ def get_sdxl_base_pipe(
         extra=extra
     )
 
-    cached = ModelCache.get(key)
+    cached: StableDiffusionXLPipeline = ModelCache.get(key)
     if cached is not None:
+        if hasattr(cached, 'unload_ip_adapter'):
+            cached.unload_ip_adapter()
+
         return cached
 
     vae = get_vae(

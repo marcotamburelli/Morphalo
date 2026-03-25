@@ -87,9 +87,81 @@ def apply_ip_adapter(
     ip_bundle: IpAdapterBundle,
     face_bundle: FaceIdBundle,
     pipe: DiffusionPipeline | IPAdapterMixin,
+    batch: int,
     device: str,
     dtype: torch.dtype,
 ):
+    """
+    Configure IP-Adapter or FaceID conditioning on a diffusion pipeline.
+
+    This function inspects the provided bundles and mutates the given
+    pipeline to enable either:
+
+    - standard IP-Adapter conditioning, or
+    - FaceID conditioning (including optional CLIP-based conditioning for
+      Plus / PlusV2 variants).
+
+    The two modes are mutually exclusive:
+    if both bundles are present, IP-Adapter takes precedence.
+
+    Parameters
+    ----------
+    ip_bundle : IpAdapterBundle
+        Runtime bundle describing standard IP-Adapter configuration.
+        If ``has_ip_adapter`` is True, the corresponding adapter(s) are
+        loaded and configured on the pipeline.
+
+    face_bundle : FaceIdBundle
+        Runtime bundle describing FaceID configuration. Used only if no
+        standard IP-Adapter is active. Supports both base FaceID and
+        Plus / PlusV2 variants.
+
+    pipe : DiffusionPipeline | IPAdapterMixin
+        Diffusers pipeline instance to be configured. This function
+        mutates the pipeline in-place by loading adapter weights and
+        registering required modules.
+
+    batch : int
+        Number of images per prompt (``num_images_per_prompt``).
+
+        This value MUST match the batch used when calling the pipeline.
+        It is required to correctly prepare CLIP image embeddings for
+        FaceID Plus / PlusV2 variants, ensuring alignment with the
+        internal batch size (including classifier-free guidance).
+
+    device : str
+        Target device for model execution (e.g. ``'cuda'``).
+
+    dtype : torch.dtype
+        Data type used for model weights and intermediate tensors.
+
+    Behavior
+    --------
+    - If ``ip_bundle.has_ip_adapter`` is True:
+        - loads IP-Adapter weights via ``load_ip_adapter``
+        - sets adapter scale via ``set_ip_adapter_scale``
+        - registers the corresponding image encoder
+
+    - Else if ``face_bundle.has_face_id`` is True:
+        - loads FaceID weights via ``load_ip_adapter`` (FaceID-compatible)
+        - sets FaceID scale configuration
+        - optionally registers the CLIP image encoder (for Plus / PlusV2)
+        - applies CLIP-based conditioning via ``apply_faceid_clip``,
+          using ``batch`` to correctly expand embeddings
+
+    - Else:
+        - unloads any previously configured IP-Adapter from the pipeline
+
+    Notes
+    -----
+    - This function performs in-place mutation of the pipeline.
+    - The ``batch`` parameter is critical for FaceID Plus / PlusV2:
+      mismatched values may lead to tensor shape errors during UNet
+      forward passes.
+    - IP-Adapter and FaceID conditioning are treated as mutually exclusive
+      to avoid conflicts in adapter loading and projection layers.
+    """
+
     if ip_bundle.has_ip_adapter:
         pipe.register_modules(image_encoder=ip_bundle.image_encoder)
         pipe.load_ip_adapter(
@@ -115,6 +187,7 @@ def apply_ip_adapter(
             pipe=pipe,
             device=torch.device(device),
             dtype=dtype,
+            num_images=batch,
         )
 
     else:

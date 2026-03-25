@@ -3,9 +3,9 @@ from typing import Any, Dict
 
 import torch
 
-from stability.nodes.common.config_resolve import (SpecLike, resolve_dtype,
-                                                   resolve_seed, resolve_spec)
-from stability.nodes.sdxl_resolve import RandomConfig
+from stability.nodes.common.config_resolve import (RandomConfig, SpecLike,
+                                                   resolve_dtype, resolve_seed,
+                                                   resolve_spec)
 
 _default_model = 'Lightricks/LTX-Video-0.9.7-dev'
 _default_upscaler = 'Lightricks/ltxv-spatial-upscaler-0.9.7'

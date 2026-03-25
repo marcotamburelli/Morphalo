@@ -1,4 +1,5 @@
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Sequence, Union
 
@@ -8,6 +9,12 @@ from stability.core.spec_loader import load_hocon_spec
 
 SpecLike = Union[Dict[str, Any], str, Path]
 SpecInput = Union[SpecLike, Sequence[SpecLike]]
+
+
+@dataclass(frozen=True)
+class RandomConfig:
+    seed: int
+    gen: torch.Generator
 
 
 def deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:

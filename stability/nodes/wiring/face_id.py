@@ -295,10 +295,10 @@ class FaceIdBundle:
 
             # plus/v2 clip reference images (optional; runner will compute clip embeds)
             if requires_clip:
-                ip = upstream.get('image')
+                ip = upstream.get('image') or upstream.get('images')
                 if not ip:
                     raise ValueError(
-                        f"Upstream output for {in_id!r} must contain an image path in 'image'."
+                        f"Upstream output for {in_id!r} must contain an image path in 'image' or 'images'."
                     )
                 self._clip_img_paths.append((ip, is_plusv2))
             else:

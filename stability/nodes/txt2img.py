@@ -104,10 +104,30 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
         - ``params.height`` : int, optional
             Output height (default: 1024).
 
-        **Randomness**
-        - ``seed`` : int or str, optional
-            Seed value or ``"random"`` (default: ``"random"``). Resolved by
-            ``resolve_seed``.
+        **Batch and randomness**
+
+        - ``batch`` : int, optional  
+            Number of images to generate.
+
+            - Must be greater than 0.
+            - If ``seed`` is a list, defaults to ``len(seed)``.
+            - If ``seed`` is a single integer, must be ``1``.
+            - If ``seed`` is ``"rand"``, controls how many independent random seeds
+            are generated.
+
+        - ``seed`` : int or list[int] or str, optional  
+            Seed specification controlling stochastic sampling.
+
+            Supported forms:
+
+            - ``int``  
+            Single deterministic seed. Implies ``batch = 1``.
+
+            - ``list[int]``  
+            Explicit list of seeds.
+
+            - ``"rand"`` or ``"random"``  
+            Generate one or more random seeds (controlled by ``batch``).
 
     Attributes
     ----------
@@ -143,16 +163,42 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
     Outputs
     -------
     dict
-        Primary output dictionary with at least:
+        Primary output dictionary.
+
+        The node may produce either a single image or a batch of images,
+        depending on the resolved ``batch`` size.
+
+        **Single image output (batch = 1)**
 
         - ``ok`` : bool
         - ``node`` : str (e.g. ``"txt2img"``)
         - ``id`` : str (node id)
-        - ``image`` : str (path to the generated image)
-        - ``metadata`` : str (path to a JSON sidecar with generation details)
+        - ``image`` : str  
+        Path to the generated image.
+        - ``seed`` : int  
+        Seed used to generate the image.
+        - ``metadata`` : str  
+        Path to the JSON sidecar.
 
-        The metadata sidecar includes resolved parameters, model information, timing
-        information, and (when running on CUDA) memory statistics.
+        **Batch output (batch > 1)**
+
+        - ``ok`` : bool
+        - ``node`` : str
+        - ``id`` : str
+        - ``images`` : list[str]  
+        Paths to generated images.
+        - ``seeds`` : list[int]  
+        Seeds aligned with ``images`` (same order).
+        - ``batch`` : int  
+        Number of generated images.
+        - ``metadata`` : str  
+        Path to the JSON sidecar (shared across the batch).
+
+        The metadata sidecar includes resolved parameters, model information,
+        timing information, and (when running on CUDA) memory statistics.
+
+        For batch outputs, a single sidecar file is written per node execution
+        and anchored to one of the generated images (deterministically chosen).
 
     Notes
     -----
@@ -242,6 +288,7 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
             pipe=pipe,
+            batch=ctx.batch,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
         )
@@ -270,32 +317,37 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             negative_prompt_2=prompt_bundle.negative_prompt_2,
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
-            generator=ctx.rng.gen,
+            generator=ctx.rng.generators,
             width=ctx.width,
             height=ctx.height,
-            **pipe_kwargs,
+            num_images_per_prompt=ctx.batch,
+            ** pipe_kwargs,
         )
 
         cuda_sync(ctx.model.device)
         dt_s = time.perf_counter() - t0
 
-        img = result.images[0]
+        images = result.images
+        if len(images) != len(ctx.rng.seeds):
+            raise ValueError(
+                f'Expected {len(ctx.rng.seeds)} output images, got {len(images)}'
+            )
 
         out_dir = ensure_out_dir(output_dir)
-        img_path = save_image(
+        img_paths = [save_image(
             out_dir,
             node_id=self.id,
-            seed=ctx.rng.seed,
+            seed=seed,
             img=img,
-        )
+        ) for img, seed in zip(images, ctx.rng.seeds)]
 
         mem = cuda_mem_stats(ctx.model.device)
 
         out = finalize_image_output(
             node_kind=str(self.op),
             node_id=self.id,
-            img_path=img_path,
-            seed=ctx.rng.seed,
+            img_path=img_paths,
+            seed=ctx.rng.seeds,
             params={
                 'steps': ctx.steps,
                 'guidance_scale': ctx.cfg,

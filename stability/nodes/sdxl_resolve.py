@@ -1,12 +1,13 @@
 import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
 from stability.nodes.common.config_resolve import (SpecInput, resolve_dtype,
-                                                   resolve_seed, resolve_spec)
+                                                   resolve_spec)
 
 ModelSource = Literal['single_file', 'pretrained_id']
 
@@ -44,9 +45,9 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
-class RandomConfig:
-    seed: int
-    gen: torch.Generator
+class BatchedRandomConfig:
+    seeds: list[int]
+    generators: list[torch.Generator]
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,60 @@ class ImageGenerationContext:
     strength: float
     width: int
     height: int
-
     long_side: Optional[int]
 
-    # randomness
-    rng: RandomConfig
+    # batch and randomness
+    batch: int
+    rng: BatchedRandomConfig
+
+
+def resolve_batched_seed(seed: Any, batch: int | None) -> Tuple[List[int], int]:
+    # normalize batch
+    if batch is not None:
+        batch = int(batch)
+        if batch <= 0:
+            raise ValueError(f"'batch' must be > 0, got {batch}")
+
+    # --- case: random ---
+    if seed is None or seed in ('rand', 'random'):
+        if batch is None:
+            batch = 1
+
+        seeds = [secrets.randbelow(2**31) for _ in range(batch)]
+        return seeds, batch
+
+    # --- case: list of seeds ---
+    if isinstance(seed, (list, tuple)):
+        seeds = [int(s) for s in seed]
+
+        if len(seeds) == 0:
+            raise ValueError("'seed' list cannot be empty")
+
+        if batch is None:
+            batch = len(seeds)
+        elif batch != len(seeds):
+            raise ValueError(
+                f"'batch' ({batch}) must match len(seed) ({len(seeds)})"
+            )
+
+        return seeds, batch
+
+    # --- case: single seed ---
+    try:
+        s = int(seed)
+    except Exception:
+        raise ValueError(
+            f"Invalid 'seed' value: {seed!r}. Expected int, list[int], or 'rand'."
+        )
+
+    if batch is None:
+        batch = 1
+    elif batch != 1:
+        raise ValueError(
+            f"'batch' must be 1 when 'seed' is a single integer, got {batch}"
+        )
+
+    return [s], 1
 
 
 def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
@@ -104,9 +154,14 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
         long_side = int(long_side)
 
     # seed / RNG
-    seed = resolve_seed(spec.get('seed', 'random'))
-    gen = torch.Generator(device=device).manual_seed(seed)
-
+    seed, batch = resolve_batched_seed(
+        seed=spec.get('seed', 'random'),
+        batch=spec.get('batch'),
+    )
+    generators = [
+        torch.Generator(device=device).manual_seed(s)
+        for s in seed
+    ]
     return ImageGenerationContext(
         spec=spec,
         model=model_conf,
@@ -116,9 +171,10 @@ def resolve_common(source_spec: SpecInput) -> ImageGenerationContext:
         width=width,
         height=height,
         long_side=long_side,
-        rng=RandomConfig(
-            seed=seed,
-            gen=gen,
+        batch=batch,
+        rng=BatchedRandomConfig(
+            seeds=seed,
+            generators=generators,
         )
     )
 
@@ -135,7 +191,8 @@ def resolve_image_paths(
 
     Resolution order:
       1) If `path` is provided (str/Path or list), use it.
-      2) Else, read from upstream `input[input_key]` taking `image` or `path`.
+      2) Else, read from upstream `input[input_key]` taking `image`, 'images',
+         or `path`.
          The upstream value may be a single path or a list of paths.
 
     Returns a list of resolved existing file paths.
@@ -156,7 +213,9 @@ def resolve_image_paths(
             raise ValueError(
                 f"'{node_id}': missing input '{input_key}'. Provide `path=` or wire an upstream image.")
         up = input[input_key] or {}
-        src = up.get('image') or up.get('path')
+        src = up.get('image') or \
+            up.get('images') or \
+            up.get('path')
         srcs = _as_list(src)
 
     if not srcs:

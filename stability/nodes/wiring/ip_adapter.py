@@ -56,31 +56,35 @@ class IpAdapterAttachmentSink(AttachmentSink):
 
     def mask_for(self, idx: int) -> AttachmentSink:
         """
-        Declare an indexed mask input for this IP-Adapter slot.
+        Declare a mask input for a specific reference image index.
 
-        This method marks the underlying :class:`~stability.ip_adapter.IpAdapterSpec`
-        as using masks and returns an :class:`~stability.dag.AttachmentSink`
-        representing the mask input ``'ip_adapter_mask:{key}[{idx}]'``.
+        This creates a per-index mask binding for the adapter slot. The provided
+        mask will be applied only to the reference image at position ``idx``.
 
-        The index ``idx`` identifies which mask in a mask list is being attached.
-        In typical usage, an upstream source node (e.g. :class:`FileImage`) provides
-        a list of mask images and ``idx`` refers to the position within that list::
+        Parameters
+        ----------
+        idx : int
+            Index of the reference image within the adapter slot.
 
-            masks = FileImage(name='masks', path=[mask0, mask1])
-            ip = node.ip_adapter.add(..., key='face')
+        Returns
+        -------
+        AttachmentSink
+            A sink expecting a single mask image for the given index.
 
-            masks >> ip.mask_for(0)   # attaches mask0
-            masks >> ip.mask_for(1)   # attaches mask1
+        Input conventions
+        -----------------
+        The upstream node must provide a single mask path via:
 
-        The returned sink is a declarative attachment endpoint only; it does not
-        read files or preprocess masks. Mask loading and preprocessing are handled
-        later by the execution layer (e.g., by building an ``IpAdapterBundle`` and
-        passing ``ip_adapter_masks`` to the diffusion pipeline).
+        - ``image`` : str
+        - ``path`` : str
+
+        Lists (``images`` or list-valued ``path``) are NOT supported for indexed
+        mask inputs.
 
         Notes
         -----
-        Calling this method has a declarative side effect: it sets
-        ``spec.has_mask = True`` on the associated :class:`IpAdapterSpec`.
+        - Use this method when masks differ per reference image.
+        - For broadcast or list-based masks, use :meth:`mask` instead.
         """
 
         self.spec.has_mask = True
@@ -92,6 +96,40 @@ class IpAdapterAttachmentSink(AttachmentSink):
         )
 
     def mask(self) -> AttachmentSink:
+        """
+        Declare a global mask input for this adapter slot.
+
+        This mask applies to all reference images in the slot unless overridden
+        by per-index masks declared via :meth:`mask_for`.
+
+        Returns
+        -------
+        AttachmentSink
+            A sink expecting one or more mask paths.
+
+        Input conventions
+        -----------------
+        The upstream node may provide:
+
+        - ``image`` : str
+            Single mask path (broadcast to all reference images)
+
+        - ``images`` : list[str]
+            List of mask paths
+
+        - ``path`` : str or list[str]
+            Equivalent to ``image`` / ``images``
+
+        List semantics:
+
+        - length 1 → broadcast to all reference images
+        - length N → must match number of reference images (1:1 mapping)
+
+        Notes
+        -----
+        - Global masks act as defaults and are overridden by per-index masks.
+        - Prefer this method when masks are shared or aligned with all images.
+        """
         self.spec.has_mask = True
 
         return AttachmentSink(
@@ -115,6 +153,9 @@ class IpAdapterRegistry:
     - exposed externally via an :class:`~stability.ip_adapter.IpAdapterAttachmentSink`
       returned by :meth:`add`, which acts as the image input endpoint for that slot
       and can be wired from upstream nodes.
+    - Each adapter slot may receive one or more reference images. When multiple
+      images are provided, they are interpreted as a list of references for the
+      same adapter slot and are passed to the diffusion pipeline accordingly.
 
     The registry itself is purely declarative:
     it does not load models, preprocess images, validate runtime inputs,
@@ -286,9 +327,16 @@ class IpAdapterRegistry:
         -------
         IpAdapterAttachmentSink
             A specialized attachment sink targeting the owning node. Wire an
-            upstream image-producing node into this sink to provide reference
-            image(s) for the declared IP-Adapter slot. Use ``mask_for(idx)`` on
-            the returned sink to declare mask inputs tied to the same slot.
+            upstream node producing image data into this sink.
+
+            The upstream node must provide one of:
+
+            - ``image`` : single image path
+            - ``images`` : list of image paths
+            - ``path`` : single path or list of paths
+
+            Multiple images are interpreted as multiple reference images for the
+            same adapter slot.
 
         Notes
         -----
@@ -325,6 +373,48 @@ class IpAdapterRegistry:
 
 
 class IpAdapterBundle:
+    """
+    Runtime bundle for IP-Adapter conditioning.
+
+    This class resolves declarative IP-Adapter specifications together with
+    wired inputs into a concrete runtime representation consumable by
+    Diffusers pipelines.
+
+    Responsibilities
+    ----------------
+    - Collect reference images for each adapter slot.
+    - Normalize input payloads supporting ``image``, ``images``, and ``path``.
+    - Associate optional masks with each reference image.
+    - Validate consistency between images and masks.
+    - Prepare arguments for pipeline calls (image inputs, scales, masks).
+
+    Input conventions
+    -----------------
+    Each adapter slot expects upstream payloads providing one of:
+
+    - ``image`` : single image path
+    - ``images`` : list of image paths
+    - ``path`` : single path or list of paths
+
+    These are normalized internally while preserving ordering.
+
+    Mask semantics
+    --------------
+    Masks may be provided either:
+
+    - per image (``ip_adapter_mask:{key}[idx]``)
+    - globally (``ip_adapter_mask:{key}``)
+
+    Global masks may be broadcast to all images or provided as a list
+    matching the number of reference images.
+
+    Notes
+    -----
+    - Each adapter slot operates independently.
+    - Multiple images attached to the same slot share the same scale.
+    - Per-image scaling is not supported; use multiple slots instead.
+    """
+
     def __init__(
         self,
         adapters: Optional[List[IpAdapterSpec]],
@@ -368,7 +458,9 @@ class IpAdapterBundle:
                 raise ValueError(
                     f'Missing IP-Adapter input for {in_id!r}. Did you wire an image into it?')
 
-            img_path = upstream.get('image') or upstream.get('path')
+            img_path = upstream.get('image') or\
+                upstream.get('images') or\
+                upstream.get('path')
             if not img_path:
                 raise ValueError(
                     f'Upstream output for {in_id!r} does not contain an image path')
@@ -427,7 +519,9 @@ class IpAdapterBundle:
         global_up = input.get(global_id)
 
         if global_up is not None:
-            gp = global_up.get('image') or global_up.get('path')
+            gp = global_up.get('image') \
+                or global_up.get('images') \
+                or global_up.get('path')
 
             # gp can be str or list[str]
             if isinstance(gp, str) and gp:
@@ -451,8 +545,8 @@ class IpAdapterBundle:
                     )
             else:
                 raise TypeError(
-                    f'Upstream output for {global_id!r} must provide \'image\'/\'path\' as str or list[str]. '
-                    f'Got: {type(gp)}'
+                    f'Upstream output for {global_id!r} must provide \'image\', \'images\', or '
+                    f'\'path\' as str or list[str]. Got: {type(gp)}'
                 )
 
         # 3) final check

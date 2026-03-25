@@ -80,6 +80,9 @@ class ImgRegistry:
 class ImgBundle:
     """
     Helper for collecting candidate images and propagating ranking state.
+    The bundle accepts both singular and plural image payload conventions
+    (``image`` / ``images``), as well as the generic ``path`` field. All inputs
+    are normalized to a flat list of unique image paths, preserving order.
 
     ``ImgBundle`` centralizes the logic for:
 
@@ -113,10 +116,11 @@ class ImgBundle:
 
         1. Explicit wiring (``image:{idx}``)
             For each declared image input, the corresponding upstream node must
-            provide either:
+            provide one of:
 
-                - ``'image'`` : path to image
-                - or ``'path'`` : path to image
+                - ``'image'`` : path to a single image
+                - ``'images'`` : list of image paths
+                - ``'path'`` : path to a single image or list of paths
 
             Missing inputs or invalid payloads raise an error.
 
@@ -125,12 +129,30 @@ class ImgBundle:
             referenced in it are added as candidates. This enables chaining of
             scorer nodes without re-wiring images explicitly.
 
-        3. Fallback image input
-            If no rankings are present, the default input is checked for:
+        3. Fallback to 'default' input
+            If no explicit images are provided, the bundle inspects the ``default``
+            input payload.
 
-                - ``'image'`` or ``'path'``
+            The following keys are supported (in priority order):
 
-            which can be either a single value or a list of paths.
+            - ``'rankings'`` : dict
+                If present, image paths are extracted from ranking outputs produced
+                by scorer nodes.
+
+            - ``'image'`` : str
+                Path to a single image.
+
+            - ``'images'`` : list[str]
+                List of image paths.
+
+            - ``'path'`` : str or list[str]
+                Path or list of paths to image files.
+
+            The first available key among these is used. If none are found, an error
+            is raised.
+
+            Values may be either a single path or a sequence of paths. All values are
+            normalized to a flat list of paths.
 
         The final candidate list is the concatenation of all collected sources.
 
@@ -170,19 +192,26 @@ class ImgBundle:
                     f"(expected wiring into input_id='image:{idx}')"
                 )
 
-            path = up.get('image') or up.get('path')
+            path = up.get('image')\
+                or up.get('images')\
+                or up.get('path')
             if not path:
                 raise ValueError(
-                    f"{node_id}: upstream for idx={idx} must contain 'image' or 'path'"
+                    f"{node_id}: upstream for idx={idx} must contain one or more image paths"
                 )
 
-            self._paths.append(str(path))
+            if isinstance(path, list):
+                self._paths += [str(p) for p in path]
+            else:
+                self._paths.append(str(path))
 
         init_up = input.get('default', {})
 
         # Checking images from ranking of previous scoring
         rankings: dict = init_up.get('rankings', None)
-        init_path = init_up.get('image') or init_up.get('path')
+        init_path = init_up.get('image') \
+            or init_up.get('images')\
+            or init_up.get('path')
 
         if rankings is not None:
             # If a ranking is found from a previous scoring node

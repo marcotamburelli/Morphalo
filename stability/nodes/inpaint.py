@@ -28,12 +28,13 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
     """
     SDXL inpainting node with optional ControlNet and IP-Adapter/FaceID conditioning.
 
-    This node performs inpainting using Stable Diffusion XL. The init image is
-    provided by the upstream node connected to the default input channel
-    (``input_id="default"``). The inpainting mask is provided by an upstream node
-    connected to the mask input channel (``input_id="mask"``). Text prompts are
-    resolved from the node configuration and may optionally be overridden by an
-    upstream prompt bundle connected through the prompt channel (see Notes).
+    This node performs inpainting using Stable Diffusion XL and may produce a single
+    image or a batch of images. The init image is provided by the upstream node
+    connected to the default input channel (``input_id="default"``). The inpainting
+    mask is provided by an upstream node connected to the mask input channel
+    (``input_id="mask"``). Text prompts are resolved from the node configuration and
+    may optionally be overridden by an upstream prompt bundle connected through the
+    prompt channel (see Notes).
 
     If one or more ControlNet specifications are configured on this node, the
     underlying pipeline switches to ``StableDiffusionXLControlNetInpaintPipeline``
@@ -83,10 +84,32 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
         - ``params.height`` : int, optional
             Output height (default: 1024).
 
-        **Randomness**
-        - ``seed`` : int or str, optional
-            Seed value or ``"random"`` (default: ``"random"``). Resolved by
-            ``resolve_seed``.
+        **Batch and randomness**
+        - ``batch`` : int, optional
+            Number of images to generate.
+
+            - Must be greater than 0.
+            - If ``seed`` is a list, defaults to ``len(seed)``.
+            - If ``seed`` is a single integer, must be ``1``.
+            - If ``seed`` is ``"rand"`` or ``"random"``, controls how many
+            independent random seeds are generated.
+
+        - ``seed`` : int or list[int] or str, optional
+            Seed specification controlling stochastic sampling.
+
+            Supported forms:
+
+            - ``int``
+            Single deterministic seed. Implies ``batch = 1``.
+
+            - ``list[int]``
+            Explicit list of seeds. If ``batch`` is not provided, it is inferred
+            as ``len(seed)``. If ``batch`` is provided, it must match the list
+            length.
+
+            - ``"rand"`` or ``"random"``
+            Generate one or more random seeds. If ``batch`` is not provided,
+            defaults to ``1``. Otherwise, ``batch`` independent seeds are generated.
 
     Attributes
     ----------
@@ -128,34 +151,70 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
     Outputs
     -------
     dict
-        Primary output dictionary with at least:
+        Primary output dictionary.
+
+        The node may produce either a single image or a batch of images,
+        depending on the resolved ``batch`` size.
+
+        **Single image output (batch = 1)**
 
         - ``ok`` : bool
         - ``node`` : str (e.g. ``"inpaint"``)
-        - ``id`` : str (node id)
-        - ``image`` : str (path to the generated image)
-        - ``metadata`` : str (path to a JSON sidecar with generation details)
+        - ``id`` : str
+        - ``image`` : str
+        Path to the generated image.
+        - ``seed`` : int
+        Seed used to generate the image.
+        - ``metadata`` : str
+        Path to the JSON sidecar.
 
-        The metadata sidecar includes resolved parameters, timing information, and
-        (when running on CUDA) memory statistics.
+        **Batch output (batch > 1)**
+
+        - ``ok`` : bool
+        - ``node`` : str
+        - ``id`` : str
+        - ``images`` : list[str]
+        Paths to generated images.
+        - ``seeds`` : list[int]
+        Seeds aligned with ``images`` (same order).
+        - ``batch`` : int
+        Number of generated images.
+        - ``metadata`` : str
+        Path to the JSON sidecar (shared across the batch).
+
+        The metadata sidecar includes resolved parameters, timing information,
+        model information, and (when running on CUDA) memory statistics.
+
+        For batch outputs, a single sidecar file is written per node execution.
 
     Notes
     -----
-    - The init image is loaded from the upstream path, converted to RGB, and resized
-    to ``(width, height)`` prior to generation.
-    - The mask image is loaded from the upstream path, converted to single-channel
-    (``"L"``), and resized to ``(width, height)``. White areas are repainted and
-    black areas preserved (mask polarity depends on mask authoring conventions).
-    - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle is
-    wired into ``prompt:default``, it takes precedence over the local ``spec``;
-    otherwise the local ``spec`` is used.
-    - ControlNet, IP-Adapter, and FaceID inputs are collected from DAG wiring
-    through their respective registries and bundled via
-    ``build_control_bundles``.
-    - When ControlNet is enabled, this node calls the inpaint pipeline with
-    ``image=init_image`` and ``control_image=<conditioning>`` (via
-    ``build_pipe_kwargs(..., init_image_already_passed=True)``).
-    - IP-Adapter and FaceID are mutually exclusive in this node.
+    - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle
+      is wired into ``prompt:default``, it takes precedence over the local
+    ``spec``; otherwise the local ``spec`` is used.
+    - The init image and mask are shared across the generated batch. When
+    ``batch > 1``, the node produces multiple stochastic samples from the same
+      inpainting setup.
+    - The init image is resized to the resolved ``width`` and ``height`` before
+      being passed to the pipeline. The mask is expected to be aligned with the
+      init image and is resized accordingly.
+    - ControlNet and T2I-Adapter inputs are collected from DAG wiring through
+      their respective registries and resolved into runtime bundles before
+      pipeline construction.
+    - ControlNet and T2I-Adapter are mutually exclusive within the same node.
+      Attempting to enable both results in an error.
+    - For ``StableDiffusionXLControlNetInpaintPipeline``, ControlNet conditioning
+      images are passed via the pipeline ``image`` argument together with
+    ``controlnet_conditioning_scale`` (via :func:`build_pipe_kwargs`).
+    - For ``StableDiffusionXLAdapterPipeline`` (inpaint), adapter conditioning
+      images are passed via the pipeline ``image`` argument together with
+    ``adapter_conditioning_scale`` (via :func:`build_pipe_kwargs`).
+    - IP-Adapter conditioning uses one or more reference images passed through
+    ``ip_adapter_image``; FaceID uses precomputed embeddings passed through
+    ``ip_adapter_image_embeds``. IP-Adapter and FaceID are mutually exclusive.
+    - Outputs are written as one or more image files plus a single JSON sidecar
+      for the node execution. In batch mode, the sidecar is shared across all
+      generated images.
     """
 
     spec: SpecInput = field(default_factory=dict)
@@ -275,6 +334,7 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
             pipe=pipe,
+            batch=ctx.batch,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
         )
@@ -307,33 +367,38 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             strength=ctx.strength,
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
-            generator=ctx.rng.gen,
+            generator=ctx.rng.generators,
             # TODO Check if size is really required for inpaint
             width=ctx.width,
             height=ctx.height,
+            num_images_per_prompt=ctx.batch,
             **pipe_kwargs
         )
 
         cuda_sync(ctx.model.device)
         dt_s = time.perf_counter() - t0
 
-        img = result.images[0]
+        images = result.images
+        if len(images) != len(ctx.rng.seeds):
+            raise ValueError(
+                f'Expected {len(ctx.rng.seeds)} output images, got {len(images)}'
+            )
 
         out_dir = ensure_out_dir(output_dir)
-        img_path = save_image(
+        img_paths = [save_image(
             out_dir,
             node_id=self.id,
-            seed=ctx.rng.seed,
+            seed=seed,
             img=img,
-        )
+        ) for img, seed in zip(images, ctx.rng.seeds)]
 
         mem = cuda_mem_stats(ctx.model.device)
 
         out = finalize_image_output(
             node_kind=str(self.op),
             node_id=self.id,
-            img_path=img_path,
-            seed=ctx.rng.seed,
+            img_path=img_paths,
+            seed=ctx.rng.seeds,
             params={
                 'steps': ctx.steps,
                 'guidance_scale': ctx.cfg,

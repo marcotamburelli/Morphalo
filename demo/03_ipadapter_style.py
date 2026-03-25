@@ -148,7 +148,7 @@ with DAG(
         subfolder='sdxl_models',
         weight_name='ip-adapter-plus_sdxl_vit-h.bin',
         # one value per reference image (matches STYLE_REFS length)
-        scale=[0.7, 0.7],
+        scale=0.7,
         key='style',
     )
 

@@ -11,7 +11,8 @@ from PIL import Image
 from stability.cache.models import get_insightface
 from stability.core.paths import make_node_output_path
 from stability.dag import NodeRef
-from stability.nodes.common.config_resolve import SpecInput, resolve_dtype, resolve_spec
+from stability.nodes.common.config_resolve import (SpecInput, resolve_dtype,
+                                                   resolve_spec)
 from stability.nodes.common.io import write_json_sidecar
 from stability.nodes.sdxl_resolve import resolve_image_paths
 
@@ -72,8 +73,9 @@ class FaceIdEmbedImage(NodeRef):
     (``normed_embedding``), optionally aggregates them, and saves the resulting
     tensor to disk in a format compatible with Diffusers IP-Adapter FaceID pipelines.
 
-    The saved tensor can be passed as ``ip_adapter_image_embeds`` for FaceID,
-    FaceID Plus, and FaceID PlusV2 adapters.
+    The saved tensor provides the identity embedding component used by Diffusers
+    FaceID pipelines. For FaceID Plus / PlusV2, the CLIP-based image component is
+    handled separately downstream.
 
     Input resolution
     ----------------
@@ -105,8 +107,8 @@ class FaceIdEmbedImage(NodeRef):
     Paired output
     -------------
     If ``params.paired`` is true, the output tensor contains a zero "negative"
-    embedding followed by the positive embedding, matching common Hugging Face
-    FaceID examples:
+    embedding followed by the positive embedding, matching common Diffusers / FaceID
+    usage patterns:
 
     - paired:  ``(2, 1, D)``  where index 0 is negative, index 1 is positive
     - unpaired: ``(1, 1, D)``
@@ -139,28 +141,47 @@ class FaceIdEmbedImage(NodeRef):
 
     Returns
     -------
-    dict with keys:
+    dict
+        Output dictionary containing at least:
 
-    - ``ok`` (bool): True if execution succeeds.
-    - ``node`` (str): operator name.
-    - ``id`` (str): node identifier.
-    - ``model`` (dict): resolved model settings (model_name, device, det_size).
-    - ``embeds`` (str): path to the saved ``.pt`` tensor.
-    - ``image`` (str | list[str]): original input image path(s).
-    - ``n_images`` (int): number of processed images.
-    - ``agg`` (str): aggregation strategy used.
-    - ``paired`` (bool): paired output flag.
-    - ``shape`` (list[int]): saved tensor shape.
-    - ``dtype`` (str): saved tensor dtype (torch dtype name without 'torch.').
-    - ``metadata`` (str): path to the JSON sidecar.
+        - ``ok`` (bool): True if execution succeeds.
+        - ``node`` (str): operator name.
+        - ``id`` (str): node identifier.
+        - ``model`` (dict): resolved model settings
+        (``model_name``, ``device``, ``det_size``).
+        - ``embeds`` (str): path to the saved ``.pt`` tensor.
+        - ``n_images`` (int): number of processed images.
+        - ``agg`` (str): aggregation strategy used.
+        - ``paired`` (bool): paired output flag.
+        - ``shape`` (list[int]): saved tensor shape.
+        - ``dtype`` (str): saved tensor dtype
+        (torch dtype name without ``'torch.'``).
+        - ``metadata`` (str): path to the JSON sidecar.
+
+        The node may expose either a single input image or multiple input images,
+        depending on how many filesystem paths were resolved.
+
+        **Single image output**
+
+        - ``image`` (str): absolute path to the input image.
+
+        **Multiple images output**
+
+        - ``images`` (list[str]): absolute paths to the input images.
+
+        The order of ``images`` is stable and corresponds to the resolved input
+        order.
 
     Notes
     -----
     - The visual (CLIP-based) component used by FaceID Plus / PlusV2 is not computed
-    here; image paths are forwarded for downstream CLIP embedding injection.
+      here; image paths are forwarded for downstream CLIP embedding injection.
     - ``det_size`` controls the resolution used during face detection (not the
-    embedding dimensionality). Larger values may improve detection robustness but
-    cost performance.
+      embedding dimensionality). Larger values may improve detection robustness but
+      cost performance.
+    - This node saves the computed identity embeddings to disk and also exposes
+      the original image path(s) in the output payload for downstream nodes that
+      may need to reuse the same references.
     """
 
     path: Union[str, Path, List[Union[str, Path]]] = None
@@ -247,13 +268,17 @@ class FaceIdEmbedImage(NodeRef):
                 'det_size': list(cfg.det_size),
             },
             'embeds': str(out_path),
-            'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0]),
             'n_images': len(paths),
             'agg': cfg.agg,
             'paired': cfg.paired,
             'shape': list(id_embeds.shape),
             'dtype': str(id_embeds.dtype).replace('torch.', ''),
         }
+
+        if len(paths) > 1:
+            out['images'] = [str(p) for p in paths]
+        else:
+            out['image'] = str(paths[0])
 
         meta_path = write_json_sidecar(out_path, out)
         out['metadata'] = str(meta_path)
