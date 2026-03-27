@@ -4,9 +4,9 @@ from typing import Any, Callable, Dict, Optional
 
 import pytest
 
-from stability.dag import DAG, Edge, get_entry_nodes
-from stability.dag.runner import Execution, _execute
-from stability.dag.validation import DagValidationError
+from morphalo.dag import DAG, Edge, get_entry_nodes
+from morphalo.dag.runner import Execution, _execute
+from morphalo.dag.validation import DagValidationError
 from tests.dag.nodes import MergeNode, NoneNode, PassNode, SourceNode
 
 
@@ -368,8 +368,8 @@ def test_execute_smoke_with_nodegroups_executes_all_nodes_once(tmp_path):
     ----------
     - All nodes run exactly once
     """
-    from stability.dag import DAG, NodeGroup, get_entry_nodes
-    from stability.dag.runner import Execution, _execute
+    from morphalo.dag import DAG, NodeGroup, get_entry_nodes
+    from morphalo.dag.runner import Execution, _execute
     from tests.dag.nodes import ExtractNode, MergeNode, PassNode, SourceNode
 
     with DAG('execute_groups_smoke', out_dir=tmp_path) as dag:

@@ -25,8 +25,8 @@ Inputs (local paths)
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FaceIdEmbedImage, FileImage, Inpaint, Prompt
+from morphalo.dag import DAG
+from morphalo.nodes import FaceIdEmbedImage, FileImage, Inpaint, Prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 

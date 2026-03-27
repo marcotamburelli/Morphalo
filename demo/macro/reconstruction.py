@@ -1,7 +1,7 @@
-from stability.dag import NodeGroup
-from stability.nodes import Img2Img, Tap, Txt2Img
-from stability.nodes.common.config_resolve import SpecInput
-from stability.nodes.preprocess import ImgAuxMap
+from morphalo.dag import NodeGroup
+from morphalo.nodes import Img2Img, Tap, Txt2Img
+from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.preprocess import ImgAuxMap
 
 
 def reconstruct_from_geometry_group(

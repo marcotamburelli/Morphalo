@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stability.dag import DAG, NodeGroup
+from morphalo.dag import DAG, NodeGroup
 from tests.dag.nodes import PassNode, SourceNode
 
 
@@ -20,7 +20,7 @@ def test_nodegroup_nested_injection_builds_expected_ids_and_edges(tmp_path):
     ------------------
       SRC -> g1.g2.A -> g1.g2.B -> g1.entry -> g1.out -> DST
     """
-    from stability.dag import DAG, NodeGroup
+    from morphalo.dag import DAG, NodeGroup
     from tests.dag.nodes import PassNode, SourceNode
 
     with DAG('root', out_dir=tmp_path) as dag:

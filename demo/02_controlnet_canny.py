@@ -39,12 +39,11 @@ Nothing prevents adding more, but these are the ones used/tested in the demos.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FileImage, Prompt, Txt2Img
-from stability.nodes.preprocess import ImgAuxMap
+from morphalo.dag import DAG
+from morphalo.nodes import FileImage, Prompt, Txt2Img
+from morphalo.nodes.preprocess import ImgAuxMap
 
 ROOT = Path(__file__).resolve().parents[1]
 

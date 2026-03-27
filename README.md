@@ -1,9 +1,9 @@
-# Stability
+# Morphalo
 
-Stability is a **local-first framework** for building reproducible **generative image and video workflows** as
+Morphalo is a **local-first framework** for building reproducible **generative image and video workflows** as
 **DAGs (Directed Acyclic Graphs)**.
 
-Instead of exposing the internal components of diffusion models, Stability treats
+Instead of exposing the internal components of diffusion models, Morphalo treats
 complete diffusion pipelines as **high-level operators** that can be composed into
 larger image-processing workflows.
 
@@ -16,7 +16,7 @@ The core idea is simple:
 - Each node materializes its output to disk (JSON sidecars + images), making runs **inspectable** and **restartable**.
 - A lightweight runner executes the graph deterministically.
 
-Under the hood, Stability focuses on wiring together modern diffusion tooling (Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter) along with useful preprocessors (aux maps, subject crop, etc.) in a way that is **composable**, **reproducible**, and **easy to iterate on**.
+Under the hood, Morphalo focuses on wiring together modern diffusion tooling (Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter) along with useful preprocessors (aux maps, subject crop, etc.) in a way that is **composable**, **reproducible**, and **easy to iterate on**.
 
 > **Status:** this repository is primarily intended for personal/local use for now. Expect breaking changes.
 
@@ -30,11 +30,11 @@ As pipelines grow more complex, they often turn into:
 - repeated preprocessing
 - runs that are difficult to reproduce or partially rerun
 
-Stability was created to address these issues while preserving the **fast iteration workflow** typical of experimental diffusion projects.
+Morphalo was created to address these issues while preserving the **fast iteration workflow** typical of experimental diffusion projects.
 
-At its core, Stability is a **Python interface built on top of Diffusers** that allows complex image generation workflows to be expressed as **explicit DAGs (Directed Acyclic Graphs)**.
+At its core, Morphalo is a **Python interface built on top of Diffusers** that allows complex image generation workflows to be expressed as **explicit DAGs (Directed Acyclic Graphs)**.
 
-In practice, this makes Stability a **programmable pipeline engine for generative workflows**.
+In practice, this makes Morphalo a **programmable pipeline engine for generative workflows**.
 
 This approach introduces a few key improvements:
 
@@ -57,23 +57,23 @@ This approach introduces a few key improvements:
 
 Several tools already exist for building diffusion workflows, most notably **ComfyUI**, which provides a graphical node-based interface.
 
-Stability takes a different approach:
+Morphalo takes a different approach:
 
 - **code-first rather than UI-first**
 - designed for **reproducible experimentation**
 - integrates naturally into **Python workflows and scripts**
 - favors **explicit configuration and version-controlled pipelines**
 
-While ComfyUI focuses on interactive visual experimentation, Stability focuses on **structured and programmable pipelines**.
+While ComfyUI focuses on interactive visual experimentation, Morphalo focuses on **structured and programmable pipelines**.
 
-In particular, Stability operates at a **higher abstraction level** than tools such as ComfyUI.
+In particular, Morphalo operates at a **higher abstraction level** than tools such as ComfyUI.
 
 In ComfyUI, users typically construct graphs that closely mirror the **internal structure of diffusion inference**. 
 Nodes often represent low-level components of the generation process (e.g. CLIP encoders, schedulers, samplers, VAE decoding, latent transformations), 
 and building a workflow means assembling these internal building blocks manually.
 
-Stability instead treats diffusion models as **high-level operators** by relying directly on ready-made pipelines provided by
-libraries such as Diffusers. Rather than exposing the internal model graph, Stability orchestrates complete generation steps such as:
+Morphalo instead treats diffusion models as **high-level operators** by relying directly on ready-made pipelines provided by
+libraries such as Diffusers. Rather than exposing the internal model graph, Morphalo orchestrates complete generation steps such as:
 
 - `Txt2Img`
 - `Img2Img`
@@ -89,13 +89,13 @@ This makes it natural to integrate diffusion with other processing stages, for e
 - running diffusion pipelines with prompts and conditioning signals
 - refining or reprocessing generated outputs
 
-In practice, a Stability workflow may combine components from several libraries—such as Diffusers, MediaPipe, Segment Anything (SAM), 
+In practice, a Morphalo workflow may combine components from several libraries—such as Diffusers, MediaPipe, Segment Anything (SAM), 
 or other preprocessing tools—to construct end-to-end generation pipelines driven by prompts, images, or both.
 
 The result is a system where diffusion pipelines become **building blocks in a broader image-processing DAG**, 
 rather than the graph itself.
 
-That said, the DAG model used by Stability is intentionally **UI-friendly**.  
+That said, the DAG model used by Morphalo is intentionally **UI-friendly**.  
 Because workflows are represented as graphs with explicit channels, it would be straightforward in the future to build a graphical editor that generates DAG definitions automatically.
 
 ## Features (high level)
@@ -160,7 +160,7 @@ Because workflows are represented as graphs with explicit channels, it would be 
 
 ## Conceptual model
 
-A Stability workflow is defined as a **directed acyclic graph (DAG)**.
+A Morphalo workflow is defined as a **directed acyclic graph (DAG)**.
 
 Each node produces artifacts on disk and can receive inputs through
 explicit channels. Nodes are connected using a wiring DSL that allows both
@@ -168,7 +168,7 @@ explicit channels. Nodes are connected using a wiring DSL that allows both
 
 ### Node model
 
-In Stability, each step of a workflow is represented by a **node**.
+In Morphalo, each step of a workflow is represented by a **node**.
 
 A node is a lightweight object that:
 
@@ -334,7 +334,7 @@ The repository is structured as a small execution engine plus optional local wor
 
 ### Core engine (version-controlled)
 
-- `stability/` - Core Python package. Contains:
+- `morphalo/` - Core Python package. Contains:
     - DAG engine and validation logic
     - CLI entrypoint
     - Node implementations (txt2img, img2img, inpaint, controlnet, ip_adapter, face_id, t2i_adapter, etc.)
@@ -420,10 +420,10 @@ Helper scripts are provided:
 
 ### CLI entrypoint
 
-The main CLI is `stability.cli`. The most common command is:
+The main CLI is `morphalo.cli`. The most common command is:
 
 ```bash
-python -m stability.cli run-dags <module> [--dag <name>] [--node <id>] [--downstream] [--force-upstream]
+python -m morphalo.cli run-dags <module> [--dag <name>] [--node <id>] [--downstream] [--force-upstream]
 ```
 
 The runner discovers DAGs **at import time** via `DagRegistry`, then executes them deterministically.
@@ -442,7 +442,7 @@ Example:
 ./run_dag.sh dags.demo_img
 ```
 
-This script calls `python -m stability.cli run-dags "$DAG_MODULE" "$@"`.
+This script calls `python -m morphalo.cli run-dags "$DAG_MODULE" "$@"`.
 
 ## Example: a simple txt2img DAG
 
@@ -451,9 +451,9 @@ Below is a minimal DAG you can drop into `dags/hello_txt2img.py`:
 ```python
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes.prompt import Prompt
-from stability.nodes.txt2img import Txt2Img
+from morphalo.dag import DAG
+from morphalo.nodes.prompt import Prompt
+from morphalo.nodes.txt2img import Txt2Img
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -498,7 +498,7 @@ Outputs are written under `outputs/hello_txt2img/` (image file + JSON metadata p
 
 ### Direct connections vs lateral wiring
 
-Stability distinguishes between two kinds of node connections.
+Morphalo distinguishes between two kinds of node connections.
 
 #### Direct connection (main artifact flow)
 
@@ -579,7 +579,7 @@ spec = [
 ]
 ```
 
-During execution, Stability resolves this specification into a single
+During execution, Morphalo resolves this specification into a single
 configuration dictionary.
 
 Resolution works as follows:
@@ -666,12 +666,12 @@ keeping configuration files compact and composable.
 
 ## CLI Usage and Execution Model
 
-Stability is designed around a small but flexible CLI runner that executes DAGs deterministically and supports partial execution.
+Morphalo is designed around a small but flexible CLI runner that executes DAGs deterministically and supports partial execution.
 
 The main entrypoint is:
 
 ```bash
-python -m stability.cli run-dags <module> [options]
+python -m morphalo.cli run-dags <module> [options]
 ```
 
 Where:
@@ -697,7 +697,7 @@ The CLI supports Make-like execution semantics.
 You can run a single node by ID:
 
 ```bash
-python -m stability.cli run-dags my_dags.some_pipeline \
+python -m morphalo.cli run-dags my_dags.some_pipeline \
     --dag my_dag_name \
     --node out
 ```
@@ -707,7 +707,7 @@ This requires that all upstream nodes have already materialized their outputs on
 If upstream artifacts are missing, you can force their execution:
 
 ```bash
-python -m stability.cli run-dags my_dags.some_pipeline \
+python -m morphalo.cli run-dags my_dags.some_pipeline \
     --dag my_dag_name \
     --node out \
     --force-upstream
@@ -716,7 +716,7 @@ python -m stability.cli run-dags my_dags.some_pipeline \
 You can also execute a node and everything downstream from it:
 
 ```bash
-python -m stability.cli run-dags my_dags.some_pipeline \
+python -m morphalo.cli run-dags my_dags.some_pipeline \
     --dag my_dag_name \
     --node some_node \
     --downstream \

@@ -54,9 +54,9 @@ Notes
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FileImage
-from stability.nodes.preprocess import SubjectCrop
+from morphalo.dag import DAG
+from morphalo.nodes import FileImage
+from morphalo.nodes.preprocess import SubjectCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 

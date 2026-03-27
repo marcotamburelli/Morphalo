@@ -30,11 +30,11 @@ How to run
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FileImage, Prompt
-from stability.nodes.ltx import FileVideo, Img2Video, Txt2Video
-from stability.nodes.ltx.preprocess import (VideoCannyMap, VideoDepthMap,
-                                            VideoPoseMap)
+from morphalo.dag import DAG
+from morphalo.nodes import FileImage, Prompt
+from morphalo.nodes.ltx import FileVideo, Img2Video, Txt2Video
+from morphalo.nodes.ltx.preprocess import (VideoCannyMap, VideoDepthMap,
+                                           VideoPoseMap)
 
 ROOT = Path(__file__).resolve().parents[1]
 

@@ -5,8 +5,8 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-from stability.dag import DAG
-from stability.dag.runner import Execution, SingleNodeRunner
+from morphalo.dag import DAG
+from morphalo.dag.runner import Execution, SingleNodeRunner
 from tests.dag.nodes import PassNode, SourceNode
 
 

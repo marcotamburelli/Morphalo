@@ -1,7 +1,7 @@
 '''
 Minimal txt2img DAG example.
 
-This example demonstrates the smallest possible Stability workflow.
+This example demonstrates the smallest possible Morphalo workflow.
 
 Concepts introduced
 -------------------
@@ -26,8 +26,8 @@ How to run
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import Prompt, Txt2Img
+from morphalo.dag import DAG
+from morphalo.nodes import Prompt, Txt2Img
 
 ROOT = Path(__file__).resolve().parents[1]
 

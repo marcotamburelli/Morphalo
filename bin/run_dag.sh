@@ -26,4 +26,4 @@ fi
 source "$VENV_DIR/bin/activate"
 
 # python -m "$DAG_MODULE" "$@"
-python -m stability.cli run-dags "$DAG_MODULE" "$@"
+python -m morphalo.cli run-dags "$DAG_MODULE" "$@"

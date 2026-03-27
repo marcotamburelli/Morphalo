@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from stability.dag import DAG, NodeGroup
+from morphalo.dag import DAG, NodeGroup
 from tests.dag.nodes import PassNode, SourceNode
 
 

@@ -1,8 +1,8 @@
-from stability.dag import NodeGroup
-from stability.nodes import Tap
-from stability.nodes.common.config_resolve import SpecInput
-from stability.nodes.img2img import Img2Img
-from stability.nodes.preprocess import SubjectCrop
+from morphalo.dag import NodeGroup
+from morphalo.nodes import Tap
+from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.img2img import Img2Img
+from morphalo.nodes.preprocess import SubjectCrop
 
 
 def stylize_subject_background_singlepass_group(

@@ -88,9 +88,9 @@ Notes
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FaceIdEmbedImage, FileImage, Prompt
-from stability.nodes.evaluate import FaceScorer, PersonScorer, PromptScorer
+from morphalo.dag import DAG
+from morphalo.nodes import FaceIdEmbedImage, FileImage, Prompt
+from morphalo.nodes.evaluate import FaceScorer, PersonScorer, PromptScorer
 
 ROOT = Path(__file__).resolve().parents[1]
 

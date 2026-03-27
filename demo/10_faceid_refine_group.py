@@ -39,10 +39,10 @@ from pathlib import Path
 # Import the macro that builds the NodeGroup.
 # Adjust the import path to match your repo layout.
 from demo.macro.faces import refine_face_group  # faces.py
-from stability.dag import DAG
-from stability.nodes.file_image import FileImage
-from stability.nodes.prompt import Prompt
-from stability.nodes.txt2img import Txt2Img
+from morphalo.dag import DAG
+from morphalo.nodes.file_image import FileImage
+from morphalo.nodes.prompt import Prompt
+from morphalo.nodes.txt2img import Txt2Img
 
 ROOT = Path(__file__).resolve().parents[1]
 

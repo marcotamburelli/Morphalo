@@ -39,8 +39,8 @@ Notes
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FaceIdEmbedImage, Prompt, Txt2Img
+from morphalo.dag import DAG
+from morphalo.nodes import FaceIdEmbedImage, Prompt, Txt2Img
 
 ROOT = Path(__file__).resolve().parents[1]
 

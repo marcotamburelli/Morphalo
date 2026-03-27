@@ -5,9 +5,9 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-import stability.dag.runner as runner_mod
-from stability.dag import DAG
-from stability.dag.runner import DAGRunner, Execution, SingleNodeRunner
+import morphalo.dag.runner as runner_mod
+from morphalo.dag import DAG
+from morphalo.dag.runner import DAGRunner, Execution, SingleNodeRunner
 from tests.dag.nodes import MergeNode, PassNode, SourceNode
 
 

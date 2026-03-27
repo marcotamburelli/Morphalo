@@ -62,10 +62,10 @@ Notes
 
 from pathlib import Path
 
-from stability.dag import DAG, NodeGroup
-from stability.nodes import FaceIdEmbedImage, FileImage, Img2Img, Prompt, Tap
-from stability.nodes.evaluate import FaceScorer, PersonScorer, PromptScorer
-from stability.nodes.preprocess import ImgAuxMap
+from morphalo.dag import DAG, NodeGroup
+from morphalo.nodes import FaceIdEmbedImage, FileImage, Img2Img, Prompt, Tap
+from morphalo.nodes.evaluate import FaceScorer, PersonScorer, PromptScorer
+from morphalo.nodes.preprocess import ImgAuxMap
 
 ROOT = Path(__file__).resolve().parents[1]
 

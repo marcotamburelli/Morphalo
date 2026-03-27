@@ -24,8 +24,8 @@ How to run
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FileImage, Img2Img, Prompt
+from morphalo.dag import DAG
+from morphalo.nodes import FileImage, Img2Img, Prompt
 
 ROOT = Path(__file__).resolve().parents[1]
 

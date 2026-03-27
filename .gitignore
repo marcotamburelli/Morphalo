@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 outputs/
 my_dags/
+.vscode/

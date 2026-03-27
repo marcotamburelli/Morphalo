@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from stability.dag import NodeGroup
-from stability.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
-from stability.nodes.common.config_resolve import SpecInput
-from stability.nodes.preprocess import ImageStack, SubjectCrop
+from morphalo.dag import NodeGroup
+from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
+from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.preprocess import ImageStack, SubjectCrop
 
 FineRegion = Literal['face', 'eyes', 'left-eye', 'right-eye', 'head']
 

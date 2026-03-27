@@ -16,9 +16,9 @@ How to run
 
 from pathlib import Path
 
-from stability.dag import DAG
-from stability.nodes import FileImage, Prompt
-from stability.nodes.foundation import OmniGen, QwenImage, QwenImageEdit
+from morphalo.dag import DAG
+from morphalo.nodes import FileImage, Prompt
+from morphalo.nodes.foundation import OmniGen, QwenImage, QwenImageEdit
 
 ROOT = Path(__file__).resolve().parents[1]
 
