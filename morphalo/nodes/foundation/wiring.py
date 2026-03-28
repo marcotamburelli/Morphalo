@@ -174,10 +174,12 @@ class OmniGenImageBundle:
                     f"Missing OmniGen image input for '{in_id}'. Did you wire an image node into it?"
                 )
 
-            payload = upstream.get('image') or upstream.get('path')
+            payload = upstream.get('image') or \
+                upstream.get('images') or \
+                upstream.get('path')
             if not payload:
                 raise ValueError(
-                    f"Upstream output for '{in_id}' does not contain 'image' (or 'path')."
+                    f"Upstream output for '{in_id}' does not contain 'image', 'images' (or 'path')."
                 )
 
             if isinstance(payload, list):

@@ -48,8 +48,23 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
     Prompt text may reference wired images using templated placeholders that are
     expanded at runtime:
 
-    - ``{{img:<key>}}``        -> first image for the key
-    - ``{{img:<key>[idx]}}``   -> idx-th image for the key (0-based)
+    - ``{{img:<key>}}``
+        Shorthand for the *first* image associated with ``<key>``.
+        Equivalent to ``{{img:<key>[0]}}``.
+
+        Use this form when a key is expected to receive a single image, or
+        when only the first image is relevant.
+
+    - ``{{img:<key>[idx]}}``
+        Select the *idx-th* image (0-based) among the images associated with
+        ``<key>``.
+
+        Use this form when multiple images are wired to the same key and you
+        need to explicitly reference a specific one.
+
+        Examples:
+        - ``{{img:ref[0]}}`` -> first reference image
+        - ``{{img:ref[1]}}`` -> second reference image
 
     At execution time, all wired images are flattened into a single list
     (``input_images``) passed to OmniGen, and placeholders are expanded to OmniGen

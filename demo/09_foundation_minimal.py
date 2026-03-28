@@ -11,7 +11,7 @@ How to run
 ----------
     ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_min
     ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_edit_min
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag omnigen_one_image_min
+    ./bin/run_dag.sh demo.09_foundation_minimal --dag omnigen_style_transfer_min
 '''
 
 from pathlib import Path
@@ -23,6 +23,7 @@ from morphalo.nodes.foundation import OmniGen, QwenImage, QwenImageEdit
 ROOT = Path(__file__).resolve().parents[1]
 
 SOURCE_IMG = '~/images/input_img.png'
+STYLE_REF = '~/images/style_ref_03.jpg'
 
 
 # -----------------------------------------------------------------------------
@@ -155,21 +156,22 @@ with DAG(
 
 
 # -----------------------------------------------------------------------------
-# 3) OmniGen (one wired image + prompt reference)
+# 3) OmniGen (main image + style reference)
 # -----------------------------------------------------------------------------
 #
-# OmniGen supports multimodal image inputs wired via `omnigen.image.add(key=...)`.
-# The prompt MUST reference wired images using placeholders:
+# This demo uses:
+# - one MAIN image that provides subject, pose, and composition
+# - one STYLE reference image that provides character design, outfit, and style
 #
-#   {{img:<key>}}        -> first image for that key
-#   {{img:<key>[idx]}}   -> idx-th image for that key (0-based)
-#
-# If images are wired but not referenced, OmniGen may raise an error to avoid
-# silent conditioning loss.
+# The goal is not a strict pixel-preserving edit, but a guided multimodal
+# transformation:
+# - keep the subject layout from the main image
+# - transfer the character look, clothing design, and visual style from the
+#   style reference
 #
 with DAG(
-    name='omnigen_one_image_min',
-    out_dir=ROOT / 'outputs' / 'omnigen_one_image_min',
+    name='omnigen_style_transfer_min',
+    out_dir=ROOT / 'outputs' / 'omnigen_style_transfer_min',
 ):
 
     main_img = FileImage(
@@ -177,15 +179,20 @@ with DAG(
         path=SOURCE_IMG,
     )
 
+    style_img = FileImage(
+        name='style_img',
+        path=STYLE_REF,
+    )
+
     prompt = Prompt(
         name='prompt',
         spec={
             'lang': 'eng_Latn',
             'prompt': [
-                'In image {{img:main}} convert the subject into a live-action cinematic frame.',
-                'Preserve the original pose, proportions, and composition.',
-                'Natural skin texture, cinematic lighting, sharp focus.',
-                '35mm film look, shallow depth of field, subtle grain.',
+                'In image {{img:main}}, transform the main subject using the character design and outfit style from {{img:style}}.',
+                'Preserve the original pose, body proportions, framing, and overall composition.',
+                'Transfer the hairstyle, clothing, costume details, materials, and overall visual identity.',
+                'Keep the scene cinematic, with natural skin texture, sharp focus, realistic lighting, shallow depth of field, and subtle film grain.',
             ],
         },
     )
@@ -204,15 +211,18 @@ with DAG(
                 'guidance_scale': 2.0,
                 'img_guidance_scale': 1.6,
 
-                # If True, uses input image size as output size for image editing.
-                # 'img_size_as_out': True,
+                # For edit-like workflows, keeping the input resolution is often useful.
+                'img_size_as_out': True,
             },
             'seed': 1234,
         },
     )
 
-    # Wire one image under key 'main'
+    # Wire the structural source image.
     main_img >> out.image.add(key='main')
+
+    # Wire the style / character reference image.
+    style_img >> out.image.add(key='style')
 
     # Lateral: prompt -> OmniGen
     prompt >> out.prompt()
