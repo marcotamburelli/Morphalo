@@ -262,6 +262,17 @@ def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPip
     return ModelCache.put(key, omg)
 
 
+def evict_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPipeline:
+    key = CacheKey(
+        kind='omnigen',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype)
+    )
+
+    return ModelCache.pop(key)
+
+
 def get_qwen_image(
     *,
     model_id: str,
@@ -306,6 +317,22 @@ def get_qwen_image(
     return ModelCache.put(key, pipe)
 
 
+def evict_qwen_image(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> DiffusionPipeline:
+    key = CacheKey(
+        kind='qwen_image',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    return ModelCache.pop(key)
+
+
 def get_qwen_image_edit_pipe(
     *,
     model_id: str,
@@ -333,6 +360,22 @@ def get_qwen_image_edit_pipe(
     )
 
     return ModelCache.put(key, pipe)
+
+
+def evict_qwen_image_edit_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> QwenImageEditPipeline:
+    key = CacheKey(
+        kind='qwen_image_edit',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    return ModelCache.pop(key)
 
 
 def get_yolo(*, model_name: str, device: str) -> YOLOModel:

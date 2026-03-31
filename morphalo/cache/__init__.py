@@ -29,5 +29,5 @@ class ModelCache:
         cls._store.clear()
 
     @classmethod
-    def pop(cls, key: CacheKey) -> None:
-        cls._store.pop(key, None)
+    def pop(cls, key: CacheKey) -> Optional[Any]:
+        return cls._store.pop(key, None)

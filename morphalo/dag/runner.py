@@ -43,6 +43,9 @@ def _execute(
 
     executed: set[str] = set()
 
+    # A node is executable only when all upstream outputs required by its
+    # incoming edges have already been materialized, either in memory or
+    # via `load_output`.
     while entries:
         debug_iter += 1
 
@@ -60,7 +63,11 @@ def _execute(
                 pending.add(node_id)
                 continue
 
+            # Post-run hook for runtime cleanup (e.g. optional model cache eviction).
+            # Most nodes implement it as a no-op.
             out = node.run(out_dir, input=in_ups)
+            # Call post-run hook only after successful execution.
+            node.post_run()
             if out is None:
                 raise DagValidationError(f"No output for node '{node_id}'")
 
@@ -214,10 +221,15 @@ class SingleNodeRunner:
                 ex.edge.input_id: ex.output for ex in upstream_executions
             }
 
-            out = self.nodes_by_id[node_id].run(
+            node = self.nodes_by_id[node_id]
+            # Post-run hook for runtime cleanup (e.g. optional model cache eviction).
+            # Most nodes implement it as a no-op.
+            out = node.run(
                 self.__dag.out_dir,
                 input=input_map
             )
+            # Call post-run hook only after successful execution.
+            node.post_run()
             if out is None:
                 raise RuntimeError(f'No output for node {node_id!r}')
 
@@ -267,15 +279,17 @@ class SingleNodeRunner:
                     R.add(u)
                     q.append(u)
 
-        # Detect initial nodes
+        # Build the induced subgraph over R.
         nodes_R = [
             n for n in self.__dag.nodes if n.id in R
         ]
         edges_R = [
             e for e in self.__dag.edges if e.node_from in R and e.node_to in R
         ]
-        # All edges entering R: needed to hydrate inputs of nodes in R,
-        # including lateral/cached dependencies coming from outside R.
+
+        # Keep all executions whose destination is in R so inputs for nodes in R
+        # can still be hydrated, including lateral dependencies resolved from cache
+        # outside the induced execution subgraph.
         executions_R = [
             ex for ex in self._executions
             if ex.edge.node_to in R

@@ -341,7 +341,7 @@ class SubjectCrop(NodeRef):
 
     Parameters
     ----------
-    id : str, optional
+    name : str, optional
         Node identifier within the DAG.
 
     path : str or Path, optional

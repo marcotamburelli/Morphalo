@@ -826,6 +826,10 @@ class NodeRef:
         """
         pass
 
+    def post_run(self) -> None:
+        """Optional hook executed after run()."""
+        pass
+
 
 @dataclass
 class AttachmentSink:

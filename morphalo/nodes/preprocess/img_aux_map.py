@@ -51,7 +51,7 @@ class ImgAuxMap(NodeRef):
 
     Parameters
     ----------
-    id : str, optional
+    name : str, optional
         Unique node identifier within the DAG. If not provided, it is auto-generated
         by the enclosing DAG/NodeRef implementation.
     spec : dict or str or pathlib.Path or sequence of (dict or str or pathlib.Path)
