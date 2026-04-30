@@ -7,6 +7,7 @@ from morphalo.nodes import Img2Img, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import ImageStack, ImgAuxMap, SubjectCrop
 from morphalo.nodes.preprocess.image_stack import ResizeMode
+from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
 
 def cutout_stack_img2img_group(
@@ -402,7 +403,6 @@ def cutout_stack_pose_img2img_group(
     Pattern
     -------
     foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
-    background -------------------> ImageStack.layer(0)
     ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
@@ -411,8 +411,6 @@ def cutout_stack_pose_img2img_group(
     -----
     - 'foreground' (Tap)
         Image containing the subject to extract.
-    - 'background' (Tap)
-        Background image used for the composition.
     - 'prompt' (Tap)
         Prompt payload wired to the final Img2Img pass.
 
@@ -513,5 +511,184 @@ def cutout_stack_pose_img2img_group(
         # Register ports
         # -------------------
         g.register_ports(fg, prompt)
+
+    return g
+
+
+def cutout_stack_depth_ip_img2img_group(
+    name: str,
+    *,
+    out_spec: SpecInput,
+    style_scale: IpAdapterScale,
+    fg_layer_feather: int | str = '0.5%',
+    fg_layer_position: str = 'center',
+    fg_layer_resize: Optional[ResizeMode] = None,
+    depth_detect_long_side: int = 1024,
+    depth_conditioning_scale: float = 0.7,
+    ip_adapter_model_id: str = 'h94/IP-Adapter',
+    ip_adapter_subfolder: str = 'sdxl_models',
+    ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+) -> NodeGroup:
+    """
+    Compose a trimmed cut-out subject over a background, derive a depth map
+    from the composite, then harmonize the composite with Img2Img using both
+    Depth ControlNet and IP-Adapter style conditioning.
+
+    Pattern
+    -------
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
+    background -------------------> ImageStack.layer(0)
+    ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
+    ImageStack -------------------> Img2Img(default)
+    prompt -----------------------> Img2Img(prompt)
+    style ------------------------> Img2Img.ip_adapter
+
+    Ports
+    -----
+    - 'foreground' (Tap)
+        Image containing the subject to extract.
+    - 'background' (Tap)
+        Background image used for the composition.
+    - 'prompt' (Tap)
+        Prompt payload wired to the final Img2Img pass.
+    - 'style' (Tap)
+        IP-Adapter reference image(s) used to guide the final Img2Img pass.
+
+    Output
+    ------
+    The group output is the internal Img2Img node named 'out'.
+
+    Parameters
+    ----------
+    name : str
+        Group name.
+
+    out_spec : SpecInput
+        Configuration for the final Img2Img harmonization pass.
+
+    style_scale : IpAdapterScale
+        IP-Adapter scale configuration for the style reference.
+
+    fg_layer_feather : int | str, optional
+        Feather applied to the subject layer in the stack.
+
+    fg_layer_position : str, optional
+        Subject placement anchor/position for ``stack.image(...)``.
+
+    fg_layer_resize : ResizeMode, optional
+        Optional resize parameter for the subject layer.
+
+    depth_detect_long_side : int, optional
+        Long-side resolution used when computing the depth map.
+
+    depth_conditioning_scale : float, optional
+        Conditioning scale used for the Depth ControlNet.
+
+    ip_adapter_model_id : str, optional
+        Hugging Face repository identifier for the IP-Adapter model.
+
+    ip_adapter_subfolder : str, optional
+        Repository subfolder containing the IP-Adapter weights.
+
+    ip_adapter_weight_name : str, optional
+        IP-Adapter weight file name.
+
+    Notes
+    -----
+    - The depth map is computed from the stacked composite, not from the
+      original foreground or background alone.
+    - The final pass is a real Img2Img pass: the stack is wired as the init image.
+    - The IP-Adapter is configurable through model id, subfolder, and weight name.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        fg = Tap(name='foreground')
+        bg = Tap(name='background')
+        prompt = Tap(name='prompt', strict=False)
+        style = Tap(name='style')
+
+        # -------------------
+        # Subject cut-out
+        # -------------------
+        crop = SubjectCrop(
+            name='cutout',
+            spec={
+                'model': {
+                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+                },
+                'params': {
+                    'target': 'person',
+                    'mode': 'default',
+                    'crop_mode': 'trim',
+                },
+            },
+        )
+
+        # -------------------
+        # Stack (composite)
+        # -------------------
+        stack = ImageStack(
+            name='stack',
+            spec={
+                'params': {},
+            },
+        )
+
+        bg >> stack.image(0)
+
+        fg >> crop
+        fg_layer = stack.image(
+            1,
+            position=fg_layer_position,
+            resize=fg_layer_resize,
+            feather=fg_layer_feather,
+        )
+        crop >> fg_layer
+
+        # -------------------
+        # Depth control image
+        # -------------------
+        depth = ImgAuxMap(
+            name='depth',
+            spec={
+                'processor': 'depth_midas',
+                'detect_long_side': depth_detect_long_side,
+            },
+        )
+
+        stack >> depth
+
+        # -------------------
+        # Harmonize pass
+        # -------------------
+        out = Img2Img(
+            name='out',
+            spec=out_spec,
+        )
+
+        stack >> out
+        prompt >> out.prompt()
+
+        depth >> out.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale,
+            key='depth',
+        )
+
+        style >> out.ip_adapter.add(
+            ip_adapter_model_id,
+            subfolder=ip_adapter_subfolder,
+            weight_name=ip_adapter_weight_name,
+            scale=style_scale,
+            key='style',
+        )
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(fg, bg, prompt, style)
 
     return g

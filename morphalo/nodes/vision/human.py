@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -867,5 +868,420 @@ def eye_mask_from_landmarks(
             (2 * radius + 1, 2 * radius + 1),
         )
         mask = cv2.dilate(mask, k, iterations=1)
+
+    return (mask > 0)
+
+
+def hand_bbox_xyxy(
+    hand_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    expansion: float = 1.0,
+) -> tuple[int, int, int, int]:
+    """
+    Compute a hand bounding box from a single hand landmark set.
+
+    Parameters
+    ----------
+    hand_xy : np.ndarray
+        Hand landmark coordinates with shape ``(21, 2)`` in pixel space.
+        Invalid landmarks must be encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Image shape. Only the first two dimensions are used as ``(H, W)``.
+    expansion : float, optional
+        Multiplicative expansion factor applied to the raw landmark bbox.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Bounding box ``(x1, y1, x2, y2)`` in end-exclusive image coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If the hand landmarks do not contain enough valid points to define a bbox.
+    ValueError
+        If the input shape is invalid or ``expansion < 0``.
+    """
+    if hand_xy.ndim != 2 or hand_xy.shape != (21, 2):
+        raise ValueError(
+            f'Invalid hand landmark shape {hand_xy.shape!r}; expected (21, 2).'
+        )
+
+    if expansion < 0:
+        raise ValueError(
+            f'Invalid expansion={expansion!r}; expected >= 0.'
+        )
+
+    h, w = image_shape[:2]
+
+    valid = (
+        (hand_xy[:, 0] >= 0) &
+        (hand_xy[:, 1] >= 0)
+    )
+
+    pts = hand_xy[valid]
+    if pts.shape[0] < 2:
+        raise RuntimeError('Not enough valid hand landmarks to define a bbox.')
+
+    x1 = int(np.min(pts[:, 0]))
+    y1 = int(np.min(pts[:, 1]))
+    x2 = int(np.max(pts[:, 0])) + 1
+    y2 = int(np.max(pts[:, 1])) + 1
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid raw hand bbox.')
+
+    bw = x2 - x1
+    bh = y2 - y1
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    bw = max(1.0, float(bw) * float(expansion))
+    bh = max(1.0, float(bh) * float(expansion))
+
+    ex1 = int(math.floor(cx - bw / 2.0))
+    ey1 = int(math.floor(cy - bh / 2.0))
+    ex2 = int(math.ceil(cx + bw / 2.0))
+    ey2 = int(math.ceil(cy + bh / 2.0))
+
+    ex1 = max(0, min(w - 1, ex1))
+    ey1 = max(0, min(h - 1, ey1))
+    ex2 = max(ex1 + 1, min(w, ex2))
+    ey2 = max(ey1 + 1, min(h, ey2))
+
+    if ex2 <= ex1 or ey2 <= ey1:
+        raise RuntimeError('Invalid expanded hand bbox.')
+
+    return ex1, ey1, ex2, ey2
+
+
+def _select_hand_indices(
+    hands: HandLandmarksResult,
+    *,
+    which: str,
+) -> list[int]:
+    """
+    Select hand indices using observer-side semantics with a conservative fallback.
+
+    Selection strategy
+    ------------------
+    - ``which='both'``:
+      return all detected hands.
+    - ``which='left'`` or ``which='right'``:
+      first try MediaPipe handedness (which follows subject perspective and is
+      therefore mapped to observer perspective here).
+
+      If handedness does not yield a match, fall back to horizontal image
+      position **only when at least two hands are available**. In that case,
+      the leftmost hand in the image is treated as observer-left and the
+      rightmost hand as observer-right.
+
+      If fewer than two hands are available and handedness does not match,
+      selection fails rather than returning a potentially wrong hand.
+
+    Parameters
+    ----------
+    hands : HandLandmarksResult
+        Rich MediaPipe hand result.
+    which : {'left', 'right', 'both'}
+        Requested hand selection in observer/image perspective.
+
+    Returns
+    -------
+    list[int]
+        Selected indices into ``hands.xy``.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no suitable hand can be selected.
+    """
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    n_hands = hands.xy.shape[0]
+    if n_hands == 0:
+        raise RuntimeError('No hand landmarks available.')
+
+    if which == 'both':
+        return list(range(n_hands))
+
+    labels = [str(h).lower() for h in hands.handedness]
+
+    target_label = {
+        'left': 'right',   # observer -> subject
+        'right': 'left',
+    }[which]
+
+    selected: list[int] = []
+
+    # First pass: handedness-based selection.
+    for i, label in enumerate(labels):
+        if label == target_label:
+            selected.append(i)
+
+    if selected:
+        return selected
+
+    # Fallback: use horizontal image position only if at least two hands
+    # are geometrically available. With a single detected hand, returning it
+    # would be ambiguous and could silently select the wrong side.
+    centers: list[tuple[int, float]] = []
+
+    for i in range(n_hands):
+        hand_xy = hands.xy[i]
+        valid = (
+            (hand_xy[:, 0] >= 0) &
+            (hand_xy[:, 1] >= 0)
+        )
+        pts = hand_xy[valid]
+        if pts.shape[0] == 0:
+            continue
+
+        cx = float(np.mean(pts[:, 0]))
+        centers.append((i, cx))
+
+    if len(centers) < 2:
+        raise RuntimeError(
+            f'Could not reliably select a hand for which={which!r}: '
+            'handedness did not match and fewer than two hands were detected.'
+        )
+
+    centers.sort(key=lambda t: t[1])
+
+    if which == 'left':
+        return [centers[0][0]]
+
+    return [centers[-1][0]]
+
+
+def hands_bbox_xyxy_from_landmarks(
+    hands: HandLandmarksResult,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.0,
+) -> tuple[int, int, int, int]:
+    """
+    Compute a bounding box covering one or more detected hands.
+
+    Parameters
+    ----------
+    hands : HandLandmarksResult
+        Rich MediaPipe hand result.
+    image_shape : tuple[int, ...]
+        Image shape. Only the first two dimensions are used as ``(H, W)``.
+    which : {'left', 'right', 'both'}
+        Which hand(s) to include.
+
+        - ``'left'``:
+          subject's left hand
+        - ``'right'``:
+          subject's right hand
+        - ``'both'``:
+          union of all detected valid hands
+    expansion : float, optional
+        Multiplicative expansion factor applied to each per-hand bbox before
+        union.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Bounding box ``(x1, y1, x2, y2)`` in end-exclusive image coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If no matching hand can be found.
+    ValueError
+        If ``which`` is invalid.
+    """
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    n_hands = hands.xy.shape[0]
+    if n_hands == 0:
+        raise RuntimeError('No hand landmarks available.')
+
+    boxes: list[tuple[int, int, int, int]] = []
+
+    selected_indices = _select_hand_indices(
+        hands,
+        which=which,
+    )
+
+    boxes: list[tuple[int, int, int, int]] = []
+
+    for i in selected_indices:
+        try:
+            box = hand_bbox_xyxy(
+                hands.xy[i],
+                image_shape,
+                expansion=expansion,
+            )
+        except RuntimeError:
+            continue
+
+        boxes.append(box)
+
+    if not boxes:
+        raise RuntimeError(
+            f'Could not derive a hand bbox for which={which!r}.'
+        )
+
+    x1 = min(b[0] for b in boxes)
+    y1 = min(b[1] for b in boxes)
+    x2 = max(b[2] for b in boxes)
+    y2 = max(b[3] for b in boxes)
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid combined hand bbox.')
+
+    return x1, y1, x2, y2
+
+
+def hands_mask_from_landmarks(
+    hands: HandLandmarksResult,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.0,
+) -> np.ndarray:
+    """
+    Build a hand mask from one or more detected hand landmark sets.
+
+    The mask is derived geometrically from MediaPipe hand landmarks by filling
+    the convex hull of each selected hand. When multiple hands are selected,
+    their hull masks are merged with logical OR.
+
+    Parameters
+    ----------
+    hands : HandLandmarksResult
+        Rich MediaPipe hand result.
+    image_shape : tuple[int, ...]
+        Image shape. Only the first two dimensions are used as ``(H, W)``.
+    which : {'left', 'right', 'both'}
+        Which hand(s) to include.
+
+        - ``'left'``:
+          subject's left hand
+        - ``'right'``:
+          subject's right hand
+        - ``'both'``:
+          union of all detected valid hands
+    expansion : float, optional
+        Optional geometric expansion of the hand mask.
+
+        A minimal dilation is always applied because the convex hull of hand
+        landmarks is typically tighter than the true visible hand silhouette.
+        When ``expansion > 1.0``, additional dilation is applied on top of the
+        size-aware base dilation.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with shape ``(H, W)``.
+
+    Raises
+    ------
+    RuntimeError
+        If no matching hand can be found or no valid mask can be built.
+    ValueError
+        If ``which`` is invalid.
+    """
+    import cv2
+
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    if expansion < 0:
+        raise ValueError(
+            f'Invalid expansion={expansion!r}; expected >= 0.'
+        )
+
+    h, w = image_shape[:2]
+
+    if hands.xy.ndim != 3 or hands.xy.shape[1:] != (21, 2):
+        raise ValueError(
+            f'Invalid hands.xy shape {hands.xy.shape!r}; expected (H, 21, 2).'
+        )
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    selected = 0
+
+    selected_indices = _select_hand_indices(
+        hands,
+        which=which,
+    )
+
+    for i in selected_indices:
+        hand_xy = hands.xy[i]
+        valid = (
+            (hand_xy[:, 0] >= 0) &
+            (hand_xy[:, 1] >= 0)
+        )
+
+        pts = hand_xy[valid]
+        if pts.shape[0] < 3:
+            continue
+
+        pts = pts.astype(np.int32, copy=False)
+        pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+
+        hull = cv2.convexHull(pts)
+        if hull is None or len(hull) < 3:
+            continue
+
+        # Build a per-hand local mask first so dilation can depend on
+        # the size of this specific hand.
+        local_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(local_mask, hull, 255)
+
+        x1 = int(np.min(pts[:, 0]))
+        y1 = int(np.min(pts[:, 1]))
+        x2 = int(np.max(pts[:, 0])) + 1
+        y2 = int(np.max(pts[:, 1])) + 1
+
+        bw = x2 - x1
+        bh = y2 - y1
+        hand_size = max(bw, bh)
+
+        # Always apply a minimal size-aware dilation because the landmark hull
+        # tends to under-cover the visible hand silhouette.
+        base_radius = max(1, int(round(0.05 * hand_size)))
+
+        # Expansion adds extra dilation on top of the structural base padding.
+        extra_radius = max(
+            0,
+            int(round(max(0.0, float(expansion) - 1.0) * 0.08 * hand_size))
+        )
+
+        radius = base_radius + extra_radius
+
+        if radius > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * radius + 1, 2 * radius + 1),
+            )
+            local_mask = cv2.dilate(local_mask, k, iterations=1)
+
+        # Merge the per-hand mask into the final union mask.
+        mask = np.maximum(mask, local_mask)
+        selected += 1
+
+    if selected == 0:
+        raise RuntimeError(
+            f'Could not derive a hand mask for which={which!r}.'
+        )
 
     return (mask > 0)

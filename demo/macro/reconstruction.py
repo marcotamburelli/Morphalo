@@ -1,5 +1,5 @@
 from morphalo.dag import NodeGroup
-from morphalo.nodes import Img2Img, Tap, Txt2Img
+from morphalo.nodes import Img2Img, Inpaint, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import ImgAuxMap
 
@@ -233,7 +233,7 @@ def reconstruct_from_geometry_img2img_group(
         # Ports
         # -------------------
         tap_image = Tap(name='in_image')
-        tap_prompt = Tap(name='in_prompt')
+        tap_prompt = Tap(name='in_prompt', strict=False)
         tap_style_image = Tap(name='in_style')
 
         # -------------------
@@ -299,5 +299,213 @@ def reconstruct_from_geometry_img2img_group(
         # Register ports
         # -------------------
         g.register_ports(tap_image, tap_prompt, tap_style_image)
+
+    return g
+
+
+def reconstruct_masked_region_from_geometry_inpaint_group(
+    name: str,
+    *,
+    inpaint_spec: SpecInput,
+    canny_conditioning_scale: float,
+    depth_conditioning_scale: float,
+    adapter_scale: float,
+    canny_detect_long_side: int = 1024,
+    depth_detect_long_side: int = 1024,
+    ip_adapter_model_id: str = 'h94/IP-Adapter',
+    ip_adapter_subfolder: str = 'sdxl_models',
+    ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+) -> NodeGroup:
+    """
+    Reconstruct a masked region in a base image using external geometric and
+    stylistic references.
+
+    This NodeGroup implements a reference-guided inpainting pattern:
+
+    - ``in_image`` provides the base image to be edited.
+    - ``in_mask`` defines the editable region.
+    - ``in_geometry_image`` provides geometric guidance:
+      - Canny edges for fine 2D contours.
+      - Depth map for coarse 3D structure.
+    - ``in_style`` provides the IP-Adapter reference image.
+    - ``in_prompt`` provides semantic and stylistic text conditioning.
+
+    The intent is to replace or reinterpret only the masked region of the base
+    image while borrowing shape/pose/layout cues from a separate geometry image
+    and visual appearance cues from a separate style image.
+
+    Typical use case
+    ----------------
+    Given two partially aligned images:
+
+    - image A: target/base image;
+    - image B: reference image containing the desired shape or structure;
+
+    this macro can inpaint a masked area of image A using Canny/depth extracted
+    from image B, while optionally using a third image as style reference.
+
+    Pipeline
+    --------
+    Geometry preprocessing:
+        - ``canny`` is computed from ``in_geometry_image``.
+        - ``depth_midas`` is computed from ``in_geometry_image``.
+
+    Inpainting:
+        - ``out`` takes ``in_image`` as base image.
+        - ``out`` takes ``in_mask`` as inpainting mask.
+        - ``out`` uses ``in_prompt`` as prompt conditioning.
+        - ``out`` uses Canny ControlNet from ``in_geometry_image``.
+        - ``out`` uses Depth ControlNet from ``in_geometry_image``.
+        - ``out`` uses IP-Adapter reference from ``in_style``.
+
+    Ports
+    -----
+    in_image
+        Base image to be edited by inpainting.
+
+    in_geometry_image
+        Reference image used only to compute geometric conditioning maps
+        through Canny and depth preprocessing.
+
+    in_mask
+        Inpainting mask. White areas are repainted; black areas are preserved.
+
+    in_prompt
+        Prompt payload wired to ``Inpaint.prompt()``.
+
+    in_style
+        Style reference image or images wired to the IP-Adapter sink.
+
+    Output
+    ------
+    The group output corresponds to the internal node ``out``.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name used as scope prefix for internal node ids.
+
+    inpaint_spec : SpecInput
+        Configuration for the internal :class:`Inpaint` node. This should include
+        model/runtime settings and generation parameters such as strength, CFG,
+        steps, scheduler, and output resolution.
+
+    canny_conditioning_scale : float
+        ControlNet conditioning strength for the Canny branch.
+
+    depth_conditioning_scale : float
+        ControlNet conditioning strength for the Depth branch.
+
+    adapter_scale : float
+        IP-Adapter scale controlling how strongly ``in_style`` influences the
+        generated region.
+
+    canny_detect_long_side : int, optional
+        Long-side resolution used by the Canny preprocessor.
+
+    depth_detect_long_side : int, optional
+        Long-side resolution used by the depth preprocessor.
+
+    ip_adapter_model_id : str, optional
+        Hugging Face repository identifier or local path for the IP-Adapter model.
+
+    ip_adapter_subfolder : str, optional
+        Repository subfolder containing the IP-Adapter weights.
+
+    ip_adapter_weight_name : str, optional
+        IP-Adapter weight file name.
+
+    Returns
+    -------
+    NodeGroup
+        Constructed group. The output node is the internal ``Inpaint`` node
+        named ``out``.
+
+    Notes
+    -----
+    - Geometry and style are intentionally separated:
+      ``in_geometry_image`` controls Canny/depth, while ``in_style`` controls
+      IP-Adapter appearance guidance.
+    - The base image is not used to compute ControlNet maps in this macro.
+    - The mask is external, so this macro can be composed with ``SubjectCrop``,
+      ``FileImage``, or custom mask-producing nodes.
+    - The IP-Adapter weight is configurable; by default this uses
+      ``ip-adapter_sdxl_vit-h.bin``.
+    """
+
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_geometry_image = Tap(name='in_geometry_image')
+        tap_mask = Tap(name='in_mask')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style_image = Tap(name='in_style')
+
+        # -------------------
+        # Geometry extraction
+        # -------------------
+        canny = ImgAuxMap(
+            name='canny',
+            spec={
+                'processor': 'canny',
+                'detect_long_side': canny_detect_long_side,
+            },
+        )
+
+        depth = ImgAuxMap(
+            name='depth_midas',
+            spec={
+                'processor': 'depth_midas',
+                'detect_long_side': depth_detect_long_side,
+            },
+        )
+
+        tap_geometry_image >> canny
+        tap_geometry_image >> depth
+
+        # -------------------
+        # Inpaint with ControlNets + IP-Adapter
+        # -------------------
+        out = Inpaint(
+            name='out',
+            spec=inpaint_spec,
+        )
+
+        tap_image >> out
+        tap_mask >> out.mask()
+        tap_prompt >> out.prompt()
+
+        canny >> out.controlnet.add(
+            'diffusers/controlnet-canny-sdxl-1.0',
+            conditioning_scale=canny_conditioning_scale,
+            key='canny',
+        )
+
+        depth >> out.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale,
+            key='depth',
+        )
+
+        tap_style_image >> out.ip_adapter.add(
+            ip_adapter_model_id,
+            subfolder=ip_adapter_subfolder,
+            weight_name=ip_adapter_weight_name,
+            scale=adapter_scale,
+            key='style',
+        )
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(
+            tap_image,
+            tap_geometry_image,
+            tap_mask,
+            tap_prompt,
+            tap_style_image,
+        )
 
     return g

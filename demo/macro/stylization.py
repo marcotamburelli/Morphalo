@@ -3,7 +3,8 @@ from morphalo.nodes import Tap
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.evaluate import PersonScorer, PromptScorer
 from morphalo.nodes.img2img import Img2Img
-from morphalo.nodes.preprocess import ImgAuxMap, SubjectCrop
+from morphalo.nodes.preprocess import (BoxCrop, ImageStack, ImgAuxMap,
+                                       SubjectCrop)
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
 
@@ -76,6 +77,7 @@ def stylize_subject_background_singlepass_group(
             spec={
                 'model': {
                     'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
                     'mode': 'negative-mask',
@@ -635,6 +637,341 @@ def two_stage_style_canny_group(
             tap_prompt,
             tap_style_1,
             tap_style_2,
+        )
+
+    return g
+
+
+def two_stage_style_depth_group(
+    name: str,
+    *,
+    img1_spec: SpecInput,
+    img2_spec: SpecInput,
+    style1_scale: IpAdapterScale,
+    style2_scale: IpAdapterScale,
+    depth_detect_long_side: int = 1024,
+    depth_conditioning_scale_1: float = 0.7,
+    depth_conditioning_scale_2: float = 0.7,
+) -> NodeGroup:
+    """
+    Two-stage Img2Img refinement with two sequential style applications and a
+    shared depth ControlNet derived from the input image.
+
+    This macro builds a ``NodeGroup`` composed of two ``Img2Img`` nodes in
+    sequence. Each stage reuses the same main prompt but applies a different
+    IP-Adapter style reference.
+
+    In addition, a depth map is computed once from ``in_image`` via MiDaS and
+    wired as ControlNet conditioning into both stages.
+
+    Pipeline
+    --------
+    Shared preprocessing:
+        - ``depth`` is computed from ``in_image`` via ``ImgAuxMap``
+
+    Stage 1:
+        - ``img_1`` takes ``in_image`` as init image
+        - uses ``in_prompt`` as text conditioning
+        - applies ``style_1`` through IP-Adapter
+        - applies shared depth ControlNet
+
+    Stage 2:
+        - ``img_2`` takes the output of ``img_1`` as init image
+        - reuses the same ``in_prompt``
+        - applies ``style_2`` through IP-Adapter
+        - reuses the same shared depth ControlNet
+
+    Input ports
+    -----------
+    in_image
+        Base image for the first Img2Img stage and source image for the depth map.
+
+    in_prompt
+        Main prompt used by both Img2Img stages.
+
+    style_1
+        Style reference image(s) for the first Img2Img stage.
+
+    style_2
+        Style reference image(s) for the second Img2Img stage.
+
+    Output
+    ------
+    The group output corresponds to the internal node ``img_2``.
+
+    Parameters
+    ----------
+    name : str
+        Name of the NodeGroup.
+
+    img1_spec : SpecInput
+        Configuration for the first Img2Img stage.
+
+    img2_spec : SpecInput
+        Configuration for the second Img2Img stage.
+
+    style1_scale : IpAdapterScale
+        IP-Adapter scale configuration for the first stage.
+
+    style2_scale : IpAdapterScale
+        IP-Adapter scale configuration for the second stage.
+
+    depth_detect_long_side : int, optional
+        Long-side resolution used when computing the depth map.
+
+    depth_conditioning_scale_1 : float, optional
+        ControlNet conditioning scale for stage 1.
+
+    depth_conditioning_scale_2 : float, optional
+        ControlNet conditioning scale for stage 2.
+
+    Notes
+    -----
+    - The depth map is computed once from ``in_image`` and reused in both stages.
+    - This keeps structural guidance stable across the full two-stage refinement.
+    - Both stages reuse the same generation prompt.
+    - IP-Adapter and ControlNet are attached declaratively through the node
+      registries exposed by ``Img2Img``.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style_1 = Tap(name='style_1')
+        tap_style_2 = Tap(name='style_2')
+
+        # -------------------
+        # Shared structural conditioning
+        # -------------------
+        depth = ImgAuxMap(
+            name='depth',
+            spec={
+                'processor': 'depth_midas',
+                'detect_long_side': depth_detect_long_side,
+            },
+        )
+
+        tap_image >> depth
+
+        # -------------------
+        # Stage 1
+        # -------------------
+        img_1 = Img2Img(
+            name='img_1',
+            spec=img1_spec,
+        )
+
+        tap_image >> img_1
+        tap_prompt >> img_1.prompt()
+
+        tap_style_1 >> img_1.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name='ip-adapter_sdxl_vit-h.bin',
+            scale=style1_scale,
+            key='style_1',
+        )
+
+        depth >> img_1.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale_1,
+            key='depth',
+        )
+
+        # -------------------
+        # Stage 2
+        # -------------------
+        img_2 = Img2Img(
+            name='img_2',
+            spec=img2_spec,
+        )
+
+        img_1 >> img_2
+        tap_prompt >> img_2.prompt()
+
+        tap_style_2 >> img_2.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name='ip-adapter_sdxl_vit-h.bin',
+            scale=style2_scale,
+            key='style_2',
+        )
+
+        depth >> img_2.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale_2,
+            key='depth',
+        )
+
+        # -------------------
+        # Ports
+        # -------------------
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style_1,
+            tap_style_2,
+        )
+
+    return g
+
+
+def refine_region_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    stack_spec: SpecInput = {},
+    bbox: tuple[int, ...],
+    bbox_format: str = 'xyxy',
+    style_scale: IpAdapterScale,
+    layer_feather: int | str = 30,
+    layer_corner_radius: int | str = 50,
+) -> NodeGroup:
+    """
+    Create a reusable NodeGroup that refines a manually selected rectangular region.
+
+    The group crops a fixed rectangular region from the input image, refines that
+    crop with Img2Img using an IP-Adapter style reference, and overlays the refined
+    crop back onto the original image using the crop metadata emitted by BoxCrop.
+
+    Ports
+    -----
+    in_image
+        Base image used both as stack background and crop source.
+
+    in_style
+        Style reference image wired into the IP-Adapter slot of the internal
+        Img2Img node.
+
+    in_prompt
+        Optional prompt payload wired into the internal Img2Img prompt sink.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name.
+
+    refine_spec : SpecInput
+        Spec for the internal Img2Img refinement node.
+
+    stack_spec : SpecInput, optional
+        Spec for ImageStack.
+
+    bbox : tuple[int, ...]
+        Manual crop box values interpreted according to ``bbox_format``.
+
+    bbox_format : {'xyxy', 'xywh', 'xyl'}, optional
+        Format of ``bbox``. Default is ``'xyxy'``.
+
+    style_scale : IpAdapterScale
+        IP-Adapter scale for the style reference.
+
+    layer_feather : int or str, optional
+        Feather applied when compositing the refined crop.
+
+    layer_corner_radius : int or str, optional
+        Corner radius applied to the refined crop mask.
+
+    Input Ports
+    -----
+    in_image : Tap
+        Base image used both as:
+        1) background layer for ``ImageStack``;
+        2) source image for ``BoxCrop``.
+
+    in_style : Tap
+        Style reference image, or reference image list, wired into the internal
+        IP-Adapter slot of ``refine_region``.
+
+    in_prompt : Tap
+        Optional prompt payload wired into the prompt sink of ``refine_region``.
+        The port uses ``strict=False``, so the group can run without an external
+        prompt input when ``refine_spec`` already provides the prompt.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed region-refinement group.
+
+    Notes
+    -----
+    This group is the manual-box counterpart of ``refine_face_group``: it does
+    not run semantic detection and relies entirely on the provided coordinates.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style = Tap(name='in_style')
+
+        # -------------------
+        # Internal nodes
+        # -------------------
+        crop_region = BoxCrop(
+            name='crop_region',
+            spec={
+                'params': {
+                    'bbox_format': bbox_format,
+                    'bbox': list(bbox),
+                },
+            },
+        )
+
+        refine_region = Img2Img(
+            name='refine_region',
+            spec=refine_spec,
+        )
+
+        style_sink = refine_region.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name='ip-adapter_sdxl_vit-h.bin',
+            scale=style_scale,
+            key='style',
+        )
+
+        stack = ImageStack(
+            name='out',
+            spec=stack_spec,
+        )
+
+        # -------------------
+        # Wiring
+        # -------------------
+
+        # 1) Base image as background.
+        tap_image >> stack.image(0)
+
+        # 2) Crop manual region from base image.
+        tap_image >> crop_region
+
+        # 3) Refine cropped region.
+        crop_region >> refine_region
+        tap_prompt >> refine_region.prompt()
+        tap_style >> style_sink
+
+        # 4) Overlay refined crop using BoxCrop transform metadata.
+        layer1 = stack.image(
+            1,
+            position='center',
+            feather=layer_feather,
+            corner_radius=layer_corner_radius,
+        )
+
+        refine_region >> layer1
+        crop_region >> layer1.transform()
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style,
         )
 
     return g

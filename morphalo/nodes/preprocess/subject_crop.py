@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
@@ -7,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from morphalo.cache.models import (get_mediapipe_face_landmarker,
+                                   get_mediapipe_hand_landmarker,
                                    get_mediapipe_pose_landmarker, get_sam,
                                    get_yolo)
 from morphalo.core.paths import make_node_output_path
@@ -21,12 +23,39 @@ from morphalo.nodes.vision.face_region import (crop_head_area_from_pose,
 from morphalo.nodes.vision.human import (eye_bbox_xyxy_from_landmarks,
                                          eye_mask_from_landmarks,
                                          face_bbox_xyxy_from_landmarks,
+                                         hands_bbox_xyxy_from_landmarks,
+                                         hands_mask_from_landmarks,
                                          mp_face_landmarks,
+                                         mp_hand_landmarks_full,
                                          mp_pose_landmarks_xy,
                                          person_bboxes_xyxy,
                                          select_person_bbox_xyxy)
 
-CropMode = Literal['bbox', 'trim', 'full_frame']
+CropModeName = Literal['bbox', 'trim', 'full_frame']
+
+
+@dataclass(frozen=True)
+class CropModeSpec:
+    """
+    Normalized crop-mode configuration.
+
+    Parameters
+    ----------
+    mode : {'bbox', 'trim', 'full_frame'}
+        Base crop mode.
+    ratio : tuple[int, int] | None, optional
+        Desired aspect ratio for bbox-guided crops, expressed as ``(w, h)``.
+
+        This is only meaningful when ``mode == 'bbox'``.
+        The ratio is a target, not a hard constraint: the final crop is expanded
+        toward the requested ratio as much as possible while keeping the target
+        fully inside the crop and staying within image bounds.
+    raw : str
+        Original user-provided crop-mode string, preserved for reporting.
+    """
+    mode: CropModeName
+    ratio: Optional[tuple[int, int]] = None
+    raw: str = 'trim'
 
 
 def _tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
@@ -56,7 +85,204 @@ def _tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
     y1 = int(ys.min())
     x2 = int(xs.max()) + 1
     y2 = int(ys.max()) + 1
+
     return x1, y1, x2, y2
+
+
+def _parse_crop_mode(value: Any, *, node_id: str) -> CropModeSpec:
+    """
+    Parse and validate the crop-mode configuration.
+
+    Supported forms
+    ---------------
+    - 'bbox'
+    - 'bbox[w:h]'
+    - 'trim'
+    - 'full_frame'
+
+    Notes
+    -----
+    ``bbox[w:h]`` requests a bbox crop expanded toward the given aspect ratio.
+    The requested ratio is not guaranteed exactly if the source image bounds do
+    not provide enough room.
+    """
+    s = str(value).strip().lower()
+
+    if s in ('bbox', 'trim', 'full_frame'):
+        return CropModeSpec(
+            mode=s,
+            ratio=None,
+            raw=s,
+        )
+
+    m = re.fullmatch(r'bbox\[(\d+):(\d+)\]', s)
+    if m is None:
+        raise ValueError(
+            f"'{node_id}': invalid crop_mode={value!r} "
+            "(expected 'bbox', 'bbox[w:h]', 'trim', or 'full_frame')"
+        )
+
+    rw = int(m.group(1))
+    rh = int(m.group(2))
+
+    if rw <= 0 or rh <= 0:
+        raise ValueError(
+            f"'{node_id}': invalid crop_mode={value!r} "
+            '(ratio terms must be > 0)'
+        )
+
+    return CropModeSpec(
+        mode='bbox',
+        ratio=(rw, rh),
+        raw=s,
+    )
+
+
+def _expand_bbox_toward_ratio(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    *,
+    full_w: int,
+    full_h: int,
+    ratio: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """
+    Expand a bounding box toward a desired aspect ratio within image bounds.
+
+    The input bbox is preserved entirely inside the returned crop. Expansion is
+    attempted symmetrically around the bbox center first; when the crop hits an
+    image border, the remaining expansion is compensated asymmetrically on the
+    opposite side. If the source image is too constrained, the returned crop may
+    deviate from the requested ratio.
+
+    Parameters
+    ----------
+    x1, y1, x2, y2 : int
+        End-exclusive source bbox coordinates.
+    full_w, full_h : int
+        Full source image size.
+    ratio : tuple[int, int]
+        Desired aspect ratio as ``(w, h)``.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Expanded end-exclusive crop box within source-image bounds.
+    """
+    x1 = int(x1)
+    y1 = int(y1)
+    x2 = int(x2)
+    y2 = int(y2)
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError(f'Invalid bbox: {(x1, y1, x2, y2)!r}')
+
+    rw, rh = ratio
+    target_ratio = float(rw) / float(rh)
+
+    bw = int(x2 - x1)
+    bh = int(y2 - y1)
+
+    if bw <= 0 or bh <= 0:
+        raise RuntimeError(f'Invalid bbox size: {(bw, bh)!r}')
+
+    current_ratio = float(bw) / float(bh)
+
+    # Compute the ideal size that would contain the original bbox exactly.
+    if current_ratio >= target_ratio:
+        crop_w = bw
+        crop_h = int(math.ceil(float(crop_w) / target_ratio))
+    else:
+        crop_h = bh
+        crop_w = int(math.ceil(float(crop_h) * target_ratio))
+
+    crop_w = max(crop_w, bw)
+    crop_h = max(crop_h, bh)
+
+    # If the ideal size does not fit inside the source image, clamp it.
+    crop_w = min(crop_w, full_w)
+    crop_h = min(crop_h, full_h)
+
+    # Center the crop on the original bbox center first.
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    out_x1 = int(math.floor(cx - crop_w / 2.0))
+    out_y1 = int(math.floor(cy - crop_h / 2.0))
+    out_x2 = out_x1 + crop_w
+    out_y2 = out_y1 + crop_h
+
+    # Shift horizontally into bounds without changing width.
+    if out_x1 < 0:
+        out_x2 -= out_x1
+        out_x1 = 0
+    if out_x2 > full_w:
+        shift = out_x2 - full_w
+        out_x1 -= shift
+        out_x2 = full_w
+
+    # Shift vertically into bounds without changing height.
+    if out_y1 < 0:
+        out_y2 -= out_y1
+        out_y1 = 0
+    if out_y2 > full_h:
+        shift = out_y2 - full_h
+        out_y1 -= shift
+        out_y2 = full_h
+
+    # Final clamp for numerical safety.
+    out_x1 = max(0, out_x1)
+    out_y1 = max(0, out_y1)
+    out_x2 = min(full_w, out_x2)
+    out_y2 = min(full_h, out_y2)
+
+    # Ensure containment. If the clamped box still does not fully contain the
+    # original bbox, expand toward the available side as much as possible.
+    if out_x1 > x1:
+        needed = out_x1 - x1
+        grow = min(needed, full_w - out_x2)
+        out_x1 -= needed
+        out_x2 += grow
+        out_x1 = max(0, out_x1)
+        out_x2 = min(full_w, out_x2)
+
+    if out_x2 < x2:
+        needed = x2 - out_x2
+        grow = min(needed, out_x1)
+        out_x2 += needed
+        out_x1 -= grow
+        out_x1 = max(0, out_x1)
+        out_x2 = min(full_w, out_x2)
+
+    if out_y1 > y1:
+        needed = out_y1 - y1
+        grow = min(needed, full_h - out_y2)
+        out_y1 -= needed
+        out_y2 += grow
+        out_y1 = max(0, out_y1)
+        out_y2 = min(full_h, out_y2)
+
+    if out_y2 < y2:
+        needed = y2 - out_y2
+        grow = min(needed, out_y1)
+        out_y2 += needed
+        out_y1 -= grow
+        out_y1 = max(0, out_y1)
+        out_y2 = min(full_h, out_y2)
+
+    if out_x2 <= out_x1 or out_y2 <= out_y1:
+        raise RuntimeError(
+            f'Failed to derive a valid expanded crop bbox from {(x1, y1, x2, y2)!r}.'
+        )
+
+    if not (out_x1 <= x1 and x2 <= out_x2 and out_y1 <= y1 and y2 <= out_y2):
+        raise RuntimeError(
+            'Expanded crop bbox does not fully contain the original bbox.'
+        )
+
+    return int(out_x1), int(out_y1), int(out_x2), int(out_y2)
 
 
 @dataclass
@@ -66,7 +292,7 @@ class Config:
     sam_checkpoint: Optional[str]
     sam_model_type: Optional[str]
     mode: str
-    crop_mode: Optional[CropMode]
+    crop_mode: Optional[CropModeSpec]
     conf: float
     box_margin: float
     multimask: bool
@@ -76,6 +302,7 @@ class Config:
     target: str
     expansion: float
     face_landmarker_task: Optional[str]
+    hand_landmarker_task: Optional[str]
     pose_landmarker_task: str
     smoothing_radius: int
 
@@ -85,13 +312,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     params = spec.get('params', {})
     debug = spec.get('debug', {})
 
-    # sam_checkpoint = model.get('sam_checkpoint')
     device = model.get('device', 'cuda')
-
-    # if not sam_checkpoint:
-    #     raise ValueError(
-    #         f"'{node_id}': Missing 'sam_checkpoint' from model configuration."
-    #     )
 
     sam_model_type = model.get('sam_model_type')
 
@@ -101,12 +322,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     # It should apply only when mode='default'
     if mode == 'default':
-        crop_mode = str(params.get('crop_mode', 'trim'))
-        if crop_mode not in ('bbox', 'trim', 'full_frame'):
-            raise ValueError(
-                f"'{node_id}': invalid crop_mode={crop_mode!r} "
-                "(expected 'bbox', 'trim', or 'full_frame')"
-            )
+        crop_mode = _parse_crop_mode(
+            params.get('crop_mode', 'trim'),
+            node_id=node_id,
+        )
     else:
         crop_mode = None
 
@@ -119,9 +338,20 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     smoothing_radius = int(params.get('smoothing_radius', 0))
 
     target = str(params.get('target', 'person'))
-    if target not in ('person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'):
+    if target not in (
+        'person',
+        'face',
+        'head',
+        'eyes',
+        'left-eye',
+        'right-eye',
+        'hands',
+        'left-hand',
+        'right-hand',
+    ):
         raise ValueError(
-            f"'{node_id}': invalid target={target!r} (expected 'person', 'face', 'head', 'eyes', 'left-eye', or 'right-eye')"
+            f"'{node_id}': invalid target={target!r} (expected 'person', 'face', 'head', 'eyes', 'left-eye',"
+            " 'right-eye', 'hands', 'left-hand' or 'right-hand')"
         )
 
     needs_sam = target not in ('eyes', 'left-eye', 'right-eye')
@@ -141,6 +371,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     save_debug = bool(debug.get('save_debug', False))
 
     face_landmarker_task = None
+    hand_landmarker_task = None
     yolo_model = None
 
     pose_landmarker_task = model.get('pose_landmarker_task')
@@ -150,7 +381,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         )
     pose_landmarker_task = str(pose_landmarker_task)
 
-    if target in ('person', 'head'):
+    if target in ('person', 'head', 'hands', 'left-hand', 'right-hand'):
         yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
 
     if target in ('face', 'head', 'eyes', 'left-eye', 'right-eye'):
@@ -161,6 +392,14 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
                 f"'{node_id}': target={target!r} requires model.face_landmarker_task (MediaPipe .task path)"
             )
         face_landmarker_task = str(face_landmarker_task)
+
+    if target in ('hands', 'left-hand', 'right-hand'):
+        hand_landmarker_task = model.get('hand_landmarker_task')
+        if not hand_landmarker_task:
+            raise ValueError(
+                f"'{node_id}': target={target!r} requires model.hand_landmarker_task (MediaPipe .task path)"
+            )
+        hand_landmarker_task = str(hand_landmarker_task)
 
     return Config(
         device=device,
@@ -178,6 +417,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         target=target,
         expansion=expansion,
         face_landmarker_task=face_landmarker_task,
+        hand_landmarker_task=hand_landmarker_task,
         pose_landmarker_task=pose_landmarker_task,
         smoothing_radius=smoothing_radius,
     )
@@ -239,10 +479,11 @@ def _infer_sam_model_type(ckpt: Path, sam_model_type: Optional[str]) -> str:
 @dataclass
 class SubjectCrop(NodeRef):
     """
-    Subject-aware cutout and inpaint-mask generator using YOLO / MediaPipe / SAM.
+    Subject-aware crop and inpaint-mask generator using YOLO, MediaPipe, and SAM.
 
-    ``SubjectCrop`` detects a region of interest (person / face / head / eyes) and
-    produces either:
+    ``SubjectCrop`` detects a region of interest
+    (``person``, ``face``, ``head``, ``eyes``, ``left-eye``, ``right-eye``,
+    ``hands``, ``left-hand``, ``right-hand``) and produces either:
 
     - an RGBA cutout (``mode='default'``), or
     - a full-frame inpaint mask aligned to the input image (``mode='mask'`` or
@@ -256,6 +497,13 @@ class SubjectCrop(NodeRef):
     - refining a small region by cropping, processing it separately, and reinserting
       it at the original coordinates.
 
+    Side-specific targets use image/viewer perspective:
+    - ``left-eye`` / ``left-hand`` refer to the region on the left side of the image.
+    - ``right-eye`` / ``right-hand`` refer to the region on the right side of the image.
+
+    This is intentionally different from MediaPipe handedness labels, which follow
+    anatomical subject perspective and are mapped internally when needed.
+
     Pipeline
     --------
     The node combines several models to robustly localize a subject region:
@@ -265,21 +513,27 @@ class SubjectCrop(NodeRef):
       and estimating the head region.
 
     - YOLO (COCO class 0) proposes candidate person bounding boxes when
-      ``target`` is ``'person'`` or ``'head'``.
+    ``target`` is ``'person'``, ``'head'``, ``'hands'``,
+    ``'left-hand'``, or ``'right-hand'``.
 
     - Pose landmarks are used to select the most plausible person bounding
-      box among YOLO detections.
+    box among YOLO detections.
 
     - A coarse *head area* is derived from the pose landmarks. This region
-      approximates the subject head location and is used to improve the
-      robustness of face and eye detection when the face is small relative
-      to the full image.
+    approximates the subject head location and is used to improve the
+    robustness of face and eye detection when the face is small relative
+    to the full image.
 
     - MediaPipe Face Landmarker is executed inside the head area to obtain
-      accurate face or eye landmarks.
+    accurate face or eye landmarks.
+
+    - MediaPipe Hand Landmarker is executed on the full image for hand targets
+    and is used to derive hand-local bounding boxes and landmark-based masks.
 
     - Segment Anything (SAM) is used to produce segmentation masks when
-      needed (person / face / head targets).
+    needed. For hand targets, SAM is guided by the selected person bbox,
+    then intersected with a landmark-derived hand mask to keep only the
+    hand-local portion of the subject mask.
 
     ``target='person'``
         - MediaPipe Pose landmarks are computed for the full image.
@@ -316,18 +570,66 @@ class SubjectCrop(NodeRef):
     ``target='left-eye'``
         - MediaPipe derives face landmarks.
         - A bounding box is computed from landmark indices corresponding to the
-          subject's left eye (subject perspective, not viewer).
+          eye on the left side of the image.
         - The box is optionally expanded via ``expansion``.
         - A landmark-derived mask is used directly; SAM is skipped.
-        - The final crop region isolates only the left eye.
+        - The final crop region isolates only the left eye in image/viewer
+          perspective.
 
     ``target='right-eye'``
         - MediaPipe derives face landmarks.
         - A bounding box is computed from landmark indices corresponding to the
-          subject's right eye (subject perspective, not viewer).
+          eye on the right side of the image.
         - The box is optionally expanded via ``expansion``.
         - A landmark-derived mask is used directly; SAM is skipped.
-        - The final crop region isolates only the right eye.
+        - The final crop region isolates only the right eye in image/viewer
+          perspective.
+
+    ``target='hands'``
+        - MediaPipe Pose landmarks are computed.
+        - YOLO proposes person bounding boxes.
+        - Pose landmarks select the most plausible person bbox.
+        - MediaPipe Hand Landmarker detects reliable hands in the full image.
+        - Expanded hand bounding boxes are merged into a single crop box.
+        - A landmark-derived hand mask is constructed for all selected hands.
+        - SAM segmentation is guided by the selected person bbox for robustness.
+        - The final mask is the intersection of the SAM subject mask and the
+        landmark-derived hand mask.
+        - The final crop region isolates one or more visible hands.
+
+    ``target='left-hand'``
+        - MediaPipe Pose landmarks are computed.
+        - YOLO proposes person bounding boxes.
+        - Pose landmarks select the most plausible person bbox.
+        - MediaPipe Hand Landmarker detects reliable hands in the full image.
+        - The hand on the left side of the image is selected.
+        - MediaPipe handedness labels are mapped internally because they follow
+          anatomical subject perspective.
+        - A hand-local bbox is computed from landmarks and optionally expanded via
+          ``expansion``.
+        - A landmark-derived hand mask is constructed for the selected hand.
+        - SAM segmentation is guided by the selected person bbox for robustness.
+        - The final mask is the intersection of the SAM subject mask and the
+          landmark-derived hand mask.
+        - The final crop region isolates only the left hand in image/viewer
+          perspective.
+
+    ``target='right-hand'``
+        - MediaPipe Pose landmarks are computed.
+        - YOLO proposes person bounding boxes.
+        - Pose landmarks select the most plausible person bbox.
+        - MediaPipe Hand Landmarker detects reliable hands in the full image.
+        - The hand on the right side of the image is selected.
+        - MediaPipe handedness labels are mapped internally because they follow
+          anatomical subject perspective.
+        - A hand-local bbox is computed from landmarks and optionally expanded via
+          ``expansion``.
+        - A landmark-derived hand mask is constructed for the selected hand.
+        - SAM segmentation is guided by the selected person bbox for robustness.
+        - The final mask is the intersection of the SAM subject mask and the
+          landmark-derived hand mask.
+        - The final crop region isolates only the right hand in image/viewer
+          perspective.
 
     Head crop geometry
     ------------------
@@ -364,7 +666,9 @@ class SubjectCrop(NodeRef):
                 Inference device (e.g. ``'cuda'``, ``'cuda:0'``, ``'cpu'``).
                 Default: ``'cuda'``.
             ``yolo_model`` : str, optional
-                YOLO weights. Required for ``target='person'`` and ``target='head'``.
+                YOLO weights. Required for ``target='person'``,
+                ``target='head'``, ``target='hands'``,
+                ``target='left-hand'``, and ``target='right-hand'``.
             ``face_landmarker_task`` : str, optional
                 MediaPipe FaceLandmarker ``.task`` path. Required for
                 ``target='face'``, ``target='eyes'``, ``target='left-eye'``,
@@ -373,9 +677,14 @@ class SubjectCrop(NodeRef):
                 MediaPipe PoseLandmarker ``.task`` path.
                 This model is required because pose landmarks are used to derive
                 head regions and to select the correct person bbox.
+            ``hand_landmarker_task`` : str, optional
+                MediaPipe HandLandmarker ``.task`` path. Required for
+                ``target='hands'``, ``target='left-hand'``, and
+                ``target='right-hand'``.
 
         ``params`` : dict
-            ``target`` : {'person', 'face', 'head', 'eyes', 'left-eye', 'right-eye'}, optional
+            ``target`` : {'person', 'face', 'head', 'eyes', 'left-eye', 'right-eye',
+                'hands', 'left-hand', 'right-hand'}, optional
                 Region to extract. Default: ``'person'``.
 
             ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -385,14 +694,25 @@ class SubjectCrop(NodeRef):
                 - ``'negative-mask'``: inverted full-frame mask (white = background).
                 Default: ``'default'``.
 
-            ``crop_mode`` : {'bbox', 'trim', 'full_frame'}, optional
+            ``crop_mode`` : {'bbox', 'bbox[w:h]', 'trim', 'full_frame'}, optional
                 Applies only when ``mode='default'`` and controls the spatial layout
-                of the RGBA cutout:
+                of the RGBA cutout.
+
+                Supported forms are:
 
                 - ``'bbox'``:
-                    Output is the rectangular crop inside the selected bounding box,
+                    Output is the rectangular crop inside the selected crop box,
                     including the original background; alpha is fully opaque
                     (255 everywhere).
+
+                - ``'bbox[w:h]'``:
+                    Same as ``'bbox'``, but the selected crop box is expanded toward
+                    the requested aspect ratio ``w:h`` while keeping the target fully
+                    inside the crop and staying within source-image bounds.
+
+                    The requested ratio is treated as a target, not a hard constraint.
+                    If the source image does not provide enough room near the borders,
+                    the final crop may deviate from the requested ratio.
 
                 - ``'trim'``:
                     Output is an RGBA cutout cropped to the selected bounding box,
@@ -421,25 +741,81 @@ class SubjectCrop(NodeRef):
                 SAM score. Default: True.
 
             ``expansion`` : float, optional
-                Head square expansion multiplier for ``target='head'`` and box
-                expansion factor for eye targets. Default: 1.0.
+                Expansion factor applied to target-local crop geometry.
+
+                - for ``target='head'``:
+                  controls the derived square head crop size
+                - for eye targets:
+                  expands the landmark-derived eye bbox / mask
+                - for hand targets:
+                  expands the landmark-derived hand bbox / mask
+
+                Default: ``1.0``.
 
             ``dilate_radius`` : int, optional
-                Mask dilation radius in pixels (mask modes only).
-                Useful to avoid edge artifacts in inpainting. Default: 0.
+                Mask dilation radius in pixels.
+                In ``mode='mask'``, dilation expands the repaintable selected region.
+                In ``mode='negative-mask'``, dilation is applied before inversion,
+                so it expands the protected subject region and creates a safety margin
+                between the subject and the repaintable background.
+                Default: 0.
 
             ``close_radius`` : int, optional
-                Morphological closing radius in pixels (mask modes only).
-                Fills small holes and gaps. Default: 0.
+                Morphological closing radius in pixels.
+                Closing is applied before optional inversion. It fills small holes and
+                gaps in the selected subject mask. This is often useful for stable
+                inpainting, but in ``mode='negative-mask'`` it also means that small
+                background holes inside the subject silhouette become protected after
+                inversion. Set this to 0 when those internal holes should remain
+                repaintable background.
+                Default: 0.
 
             ``smoothing_radius`` : int, optional
-                Gaussian smoothing radius in pixels (mask modes only).
-                Produces softer mask edges. Default: 0.
+                Gaussian smoothing radius in pixels.
+                Smoothing is applied before optional inversion. In ``mode='mask'``
+                it softens the repaintable selected region. In ``mode='negative-mask'``
+                it softens the protected subject boundary before inversion, producing a
+                feathered transition between protected subject and repaintable background.
+                Default: 0.
 
         ``debug`` : dict
             ``save_debug`` : bool, optional
                 If True, saves a debug image with the selected SAM bbox overlay.
                 Default: False.
+
+    Mask post-processing
+    --------------------
+    When ``mode`` is ``'mask'`` or ``'negative-mask'``, the detected subject mask is
+    post-processed before it is written to disk.
+
+    Post-processing is always applied to the positive subject mask first, before any
+    optional polarity inversion:
+
+    1. the selected subject region is assembled as a full-frame positive mask;
+    2. ``close_radius``, ``dilate_radius``, and ``smoothing_radius`` are applied;
+    3. if ``mode='negative-mask'``, the post-processed subject mask is inverted.
+
+    This ordering is intentional.
+
+    For ``mode='mask'``, the output mask directly marks the selected subject region
+    as repaintable. Dilation and smoothing therefore expand and soften the subject
+    region itself, which is useful when repainting or refining the selected target.
+
+    For ``mode='negative-mask'``, the output mask marks the background as repaintable
+    and protects the selected subject. Applying dilation and smoothing before
+    inversion creates a protected safety band around the subject. This prevents the
+    background inpaint area from bleeding into the subject boundary.
+
+    In other words, with ``mode='negative-mask'``:
+
+    - ``dilate_radius`` expands the protected subject area before inversion;
+    - ``smoothing_radius`` feathers the transition around the protected subject;
+    - ``close_radius`` closes small holes inside the protected subject area before
+    inversion.
+
+    If preserving holes inside the subject mask is important, for example gaps
+    between arms, fingers, hair strands, or other background-visible openings,
+    prefer setting ``close_radius=0``.
 
     Returns
     -------
@@ -458,18 +834,17 @@ class SubjectCrop(NodeRef):
             Output mode.
         ``image`` : str
             Output file path (RGBA cutout or mask).
-        ``bbox_xyxy`` : list[int]
-            Bounding box used to run SAM.
         ``params`` : dict
             Configuration parameters.
         ``crop`` : dict
             Crop metadata useful for reinsertion/compositing:
-
             ``anchor_xy`` : list[int]
-                Center of the selected crop box in absolute source-image coordinates.
+                Center of the effective crop box in absolute source-image coordinates.
             ``bbox_size`` : list[int]
-                Width and height of the crop box in pixels: ``[b_width, b_height]``.
-
+                Width and height of the effective crop box in pixels.
+            ``bbox_xyxy`` : list[int]
+                Effective end-exclusive crop box ``[x1, y1, x2, y2]`` in source-image
+                coordinates.
         ``metadata`` : str
             JSON sidecar path.
 
@@ -480,13 +855,23 @@ class SubjectCrop(NodeRef):
       region is the derived head box.
     - For eye targets, the mask is derived directly from face landmarks and SAM is
       skipped.
-    - 'left-eye' and 'right-eye' refer to the subject perspective.
-      In mirrored images this may appear inverted to the viewer.
+    - ``left-eye`` and ``right-eye`` refer to image/viewer perspective:
+      left means left side of the image, right means right side of the image.
     - Heavy models (YOLO, SAM, MediaPipe Tasks) are retrieved via the global model
       cache where available.
     - The SAM predictor is created per run because it stores per-image state.
     - If you change code or spec and need fresh outputs, delete the existing sidecar
       JSON to avoid reusing cached results.
+    - For hand targets, the final mask is obtained by intersecting the
+      landmark-derived hand mask with the SAM subject mask.
+    - For ``target='hands'``, multiple disconnected hand components may be
+      preserved inside the same crop.
+    - ``left-hand`` and ``right-hand`` refer to image/viewer perspective:
+      left means left side of the image, right means right side of the image.
+      MediaPipe handedness labels are mapped internally to preserve this convention.
+    - For ``crop_mode='bbox[w:h]'``, the requested aspect ratio is treated as a
+      target, not a hard guarantee. Near the image boundaries the final crop may
+      deviate from the requested ratio.
     """
 
     # Either pass a path explicitly, or wire an upstream image into default input.
@@ -531,6 +916,8 @@ class SubjectCrop(NodeRef):
 
         eye_which: Optional[str] = None
         eye_mask: Optional[np.ndarray] = None
+        hand_which: Optional[str] = None
+        hand_mask: Optional[np.ndarray] = None
 
         pose_landmarker = get_mediapipe_pose_landmarker(
             model_asset_path=cfg.pose_landmarker_task,
@@ -677,9 +1064,70 @@ class SubjectCrop(NodeRef):
             eye_h, eye_w = local_eye_mask.shape
             eye_mask[a_y:a_y + eye_h, a_x:a_x + eye_w] = local_eye_mask
 
+        elif cfg.target in ('hands', 'left-hand', 'right-hand'):
+            # --------------------------------------------------
+            # Resolve the subject bbox first.
+            # This bbox is used only to guide SAM toward the correct person.
+            # --------------------------------------------------
+
+            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
+            res = yolo.predict(
+                img_rgb,
+                conf=float(cfg.conf),
+                verbose=False,
+                device=cfg.device,
+            )[0]
+
+            person_boxes_xyxy = person_bboxes_xyxy(res, node_id)
+
+            bx1, by1, bx2, by2 = select_person_bbox_xyxy(
+                person_boxes_xyxy,
+                pose_xy=pose_xy,
+            )
+
+            # --------------------------------------------------
+            # Resolve the hand-local geometry from hand landmarks.
+            #
+            # - h* bbox defines the final crop region
+            # - hand_mask is later intersected with the SAM subject mask
+            #   so the final alpha stays hand-focused and background-free
+            # --------------------------------------------------
+            hand_landmarker = get_mediapipe_hand_landmarker(
+                model_asset_path=cfg.hand_landmarker_task,
+                device=cfg.device,
+            )
+
+            hands_res = mp_hand_landmarks_full(
+                img_rgb=img_rgb,
+                hand_landmarker=hand_landmarker,
+            )
+
+            hand_which = {
+                'hands': 'both',
+                'left-hand': 'left',
+                'right-hand': 'right',
+            }[cfg.target]
+
+            hx1, hy1, hx2, hy2 = hands_bbox_xyxy_from_landmarks(
+                hands_res,
+                img_rgb.shape,
+                which=hand_which,
+                expansion=max(1.0, float(cfg.expansion)),
+            )
+
+            hand_mask = hands_mask_from_landmarks(
+                hands_res,
+                img_rgb.shape,
+                which=hand_which,
+                expansion=max(1.0, float(cfg.expansion)),
+            )
+
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
 
+        # Expand the SAM prompt bbox when applicable.
+        # For hand targets this expands the person bbox used to guide SAM,
+        # not the final hand crop bbox.
         if cfg.box_margin > 0 and cfg.target not in ('eyes', 'left-eye', 'right-eye'):
             bx1, by1, bx2, by2 = expand_clip_bbox(
                 bx1, by1, bx2, by2, w, h, cfg.box_margin
@@ -698,7 +1146,10 @@ class SubjectCrop(NodeRef):
             ckpt = None
             model_type = None
         else:
-            # Default path: SAM box-guided segmentation
+            # Default segmentation path:
+            # - SAM is guided by the resolved prompt bbox
+            # - for hand targets, the SAM subject mask is later intersected
+            #   with a landmark-derived hand mask
             ckpt = Path(str(cfg.sam_checkpoint)).expanduser().resolve()
             if not ckpt.exists() or not ckpt.is_file():
                 raise FileNotFoundError(
@@ -790,6 +1241,8 @@ class SubjectCrop(NodeRef):
             elif cfg.target == 'face':
                 min_inside = 1
             else:
+                # Hand targets still use the pose-guided subject test here because SAM is
+                # prompted with the person bbox, not with a hand-local bbox.
                 min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
 
             if inside < min_inside:
@@ -800,6 +1253,16 @@ class SubjectCrop(NodeRef):
                 new_mask[by1:by2, bx1:bx2] = inv[by1:by2, bx1:bx2]
                 mask = new_mask
 
+            if cfg.target in ('hands', 'left-hand', 'right-hand'):
+                if hand_mask is None:
+                    raise RuntimeError(
+                        f"SubjectCrop node '{node_id}': hand_mask not computed."
+                    )
+                # Keep only the hand-local part of the SAM subject mask.
+                # SAM separates subject vs background; the landmark mask constrains the
+                # result to the selected hand region(s).
+                mask = mask & hand_mask
+
         # --------------------------------------------------
         # Select crop region depending on target
         # --------------------------------------------------
@@ -807,9 +1270,24 @@ class SubjectCrop(NodeRef):
         if cfg.target == 'head':
             # crop strictly around face/head bbox (full-image coordinates)
             crop_x1, crop_y1, crop_x2, crop_y2 = fx1, fy1, fx2, fy2
+        elif cfg.target in ('hands', 'left-hand', 'right-hand'):
+            # crop including one or both hands
+            crop_x1, crop_y1, crop_x2, crop_y2 = hx1, hy1, hx2, hy2
         else:
-            # person mode
+            # Default crop region: use the target bbox already resolved above.
             crop_x1, crop_y1, crop_x2, crop_y2 = bx1, by1, bx2, by2
+
+        if cfg.mode == 'default' and cfg.crop_mode is not None:
+            if cfg.crop_mode.mode == 'bbox' and cfg.crop_mode.ratio is not None:
+                crop_x1, crop_y1, crop_x2, crop_y2 = _expand_bbox_toward_ratio(
+                    crop_x1,
+                    crop_y1,
+                    crop_x2,
+                    crop_y2,
+                    full_w=w,
+                    full_h=h,
+                    ratio=cfg.crop_mode.ratio,
+                )
 
         crop_mask = mask[crop_y1:crop_y2, crop_x1:crop_x2]
         if crop_mask.size == 0:
@@ -823,10 +1301,11 @@ class SubjectCrop(NodeRef):
         )
 
         if num > 1:
-            if cfg.target in ('eyes', 'left-eye', 'right-eye'):
+            if cfg.target in ('eyes', 'left-eye', 'right-eye', 'hands'):
                 # Keep all components in the crop.
-                # For 'eyes' this preserves both eyes (two disjoint blobs).
-                # For 'left-eye'/'right-eye' the crop box is expected to isolate a single eye.
+                # - For 'eyes', this preserves both eyes as two disjoint blobs.
+                # - For 'left-eye'/'right-eye', the crop is expected to isolate a single eye.
+                # - For 'hands', this preserves multiple visible hands inside one shared crop.
                 crop_mask = (labels != 0)
 
             else:
@@ -857,7 +1336,12 @@ class SubjectCrop(NodeRef):
             crop_h = int(crop_y2 - crop_y1)
             crop_w = int(crop_x2 - crop_x1)
 
-            if cfg.crop_mode == 'bbox':
+            if cfg.crop_mode is None:
+                raise ValueError(
+                    f"{self.id}: crop_mode must be defined when mode='default'"
+                )
+
+            if cfg.crop_mode.mode == 'bbox':
                 # Include the original background inside the crop; alpha is fully opaque.
                 alpha = np.full((crop_h, crop_w), 255, dtype=np.uint8)
                 crop_rgba = np.dstack([crop_rgb, alpha])
@@ -865,10 +1349,10 @@ class SubjectCrop(NodeRef):
 
             else:
                 # 'trim' and 'full_frame' -> alpha of mask
-                alpha = (crop_mask.astype(np.uint8) * 255)
+                alpha = crop_mask.astype(np.uint8) * 255
                 crop_rgba = np.dstack([crop_rgb, alpha])
 
-                if cfg.crop_mode == 'trim':
+                if cfg.crop_mode.mode == 'trim':
                     tx1, ty1, tx2, ty2 = _tight_alpha_bbox(alpha)
                     crop_rgba = crop_rgba[ty1:ty2, tx1:tx2, :]
 
@@ -879,7 +1363,7 @@ class SubjectCrop(NodeRef):
 
                     Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
-                elif cfg.crop_mode == 'full_frame':
+                elif cfg.crop_mode.mode == 'full_frame':
                     full_rgba = np.zeros((h, w, 4), dtype=np.uint8)
                     full_rgba[crop_y1:crop_y2, crop_x1:crop_x2, :] = crop_rgba
 
@@ -891,28 +1375,35 @@ class SubjectCrop(NodeRef):
                     out_y2 = h
 
                     Image.fromarray(full_rgba, mode='RGBA').save(out_path)
+
                 else:
                     raise ValueError(
-                        f'{self.id}: invalid crop_mode={cfg.crop_mode!r}')
+                        f'{self.id}: invalid crop_mode={cfg.crop_mode!r}'
+                    )
 
         else:
-            # build full-frame mask (same size as source image)
+            # build full-frame positive subject mask
             full_mask = np.zeros((h, w), dtype=np.uint8)
 
-            # put cropped mask back into absolute position
-            full_mask[crop_y1:crop_y2, crop_x1:crop_x2] = crop_mask.astype(
-                np.uint8) * 255
+            full_mask[crop_y1:crop_y2, crop_x1:crop_x2] = (
+                crop_mask.astype(np.uint8) * 255
+            )
 
-            if cfg.mode == 'negative-mask':
-                full_mask = 255 - full_mask
-
-            # post-process (expand + close + smooth)
+            # Post-process the selected subject mask before polarity conversion.
+            #
+            # For mode='mask', this expands/softens the repaint region itself.
+            # For mode='negative-mask', this expands/softens the protected subject region
+            # before inversion, creating a safety band around the subject instead of letting
+            # the background mask bleed into it.
             full_mask = postprocess_mask(
                 full_mask,
                 dilate_radius=cfg.dilate_radius,
                 close_radius=cfg.close_radius,
                 smoothing_radius=cfg.smoothing_radius,
             )
+
+            if cfg.mode == 'negative-mask':
+                full_mask = 255 - full_mask
 
             Image.fromarray(full_mask, mode='L').save(out_path)
 
@@ -923,6 +1414,8 @@ class SubjectCrop(NodeRef):
             dbg_x1, dbg_y1, dbg_x2, dbg_y2 = bx1, by1, bx2, by2
             if cfg.target == 'head':
                 dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
+            elif cfg.target in ('hands', 'left-hand', 'right-hand'):
+                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = hx1, hy1, hx2, hy2
             cv2.rectangle(
                 dbg,
                 (dbg_x1, dbg_y1),
@@ -945,7 +1438,6 @@ class SubjectCrop(NodeRef):
             'input_image': str(img_path),
             'mode': cfg.mode,
             'image': str(out_path),
-            'selected_bbox_xyxy': [int(bx1), int(by1), int(bx2), int(by2)],
             'model': {
                 **({} if cfg.yolo_model is None else {'yolo': cfg.yolo_model}),
                 **({} if ckpt is None else {
@@ -960,12 +1452,15 @@ class SubjectCrop(NodeRef):
                 **({} if cfg.pose_landmarker_task is None else {
                     'pose_landmarker_task': cfg.pose_landmarker_task,
                 }),
+                **({} if cfg.hand_landmarker_task is None else {
+                    'hand_landmarker_task': cfg.hand_landmarker_task,
+                }),
                 'device': cfg.device,
             },
             'params': {
                 'target': cfg.target,
                 'mode': cfg.mode,
-                'crop_mode': cfg.crop_mode,
+                'crop_mode': None if cfg.crop_mode is None else cfg.crop_mode.raw,
                 'conf': cfg.conf,
                 'box_margin': cfg.box_margin,
                 'multimask': cfg.multimask,
@@ -977,6 +1472,7 @@ class SubjectCrop(NodeRef):
             'crop': {
                 'anchor_xy': [anchor_x, anchor_y],
                 'bbox_size': [b_width, b_height],
+                'bbox_xyxy': [int(out_x1), int(out_y1), int(out_x2), int(out_y2)],
             }
         }
         if dbg_path is not None:
