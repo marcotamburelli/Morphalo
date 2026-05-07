@@ -1,8 +1,7 @@
 from morphalo.dag import NodeGroup
-from morphalo.nodes import Tap
+from morphalo.nodes import Img2Img, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.evaluate import PersonScorer, PromptScorer
-from morphalo.nodes.img2img import Img2Img
 from morphalo.nodes.preprocess import (BoxCrop, ImageStack, ImgAuxMap,
                                        SubjectCrop)
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
@@ -637,6 +636,161 @@ def two_stage_style_canny_group(
             tap_prompt,
             tap_style_1,
             tap_style_2,
+        )
+
+    return g
+
+
+def style_depth_txt2img_group(
+    name: str,
+    *,
+    txt2img_spec: SpecInput,
+    style_scale: IpAdapterScale,
+    depth_detect_long_side: int = 1024,
+    depth_conditioning_scale: float = 0.7,
+    ip_adapter_model_id: str = 'h94/IP-Adapter',
+    ip_adapter_subfolder: str = 'sdxl_models',
+    ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+) -> NodeGroup:
+    """
+    Single-stage Txt2Img generation with one style reference and one shared
+    depth ControlNet derived from an external image.
+
+    This macro builds a ``NodeGroup`` composed of:
+
+    - one ``Txt2Img`` node;
+    - one ``ImgAuxMap`` node computing a depth map from ``in_image``.
+
+    The generated image is driven by:
+
+    - ``in_prompt`` for semantic and stylistic text conditioning;
+    - ``in_style`` through IP-Adapter for appearance/style transfer;
+    - a depth map extracted from ``in_image`` through ControlNet for
+      structural guidance.
+
+    Unlike an Img2Img-based pattern, the input image is **not** used as an
+    init image for generation. It is used only as the source from which the
+    depth conditioning map is computed.
+
+    Pipeline
+    --------
+    Shared preprocessing:
+        - ``depth`` is computed from ``in_image`` via ``ImgAuxMap``
+
+    Generation:
+        - ``out`` is a ``Txt2Img`` node
+        - ``out`` uses ``in_prompt`` as text conditioning
+        - ``out`` applies ``in_style`` through IP-Adapter
+        - ``out`` applies the shared depth ControlNet derived from ``in_image``
+
+    Input ports
+    -----------
+    in_image
+        Source image used only to compute the depth map for ControlNet guidance.
+
+    in_prompt
+        Main prompt used by the ``Txt2Img`` node.
+
+    in_style
+        Style reference image or images for the IP-Adapter branch.
+
+    Output
+    ------
+    The group output corresponds to the internal node ``out``.
+
+    Parameters
+    ----------
+    name : str
+        Name of the NodeGroup.
+
+    txt2img_spec : SpecInput
+        Configuration for the internal ``Txt2Img`` node.
+
+    style_scale : IpAdapterScale
+        IP-Adapter scale configuration for the style branch.
+
+    depth_detect_long_side : int, optional
+        Long-side resolution used when computing the depth map.
+
+    depth_conditioning_scale : float, optional
+        ControlNet conditioning scale for the depth branch.
+
+    ip_adapter_model_id : str, optional
+        Hugging Face repository identifier for the IP-Adapter model.
+
+    ip_adapter_subfolder : str, optional
+        Repository subfolder containing the IP-Adapter weights.
+
+    ip_adapter_weight_name : str, optional
+        IP-Adapter weight file name.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed group.
+
+    Notes
+    -----
+    - The depth map is computed once from ``in_image`` and used only as
+      ControlNet conditioning.
+    - ``in_image`` is not passed directly to the ``Txt2Img`` node.
+    - Structural guidance is provided by ControlNet depth, while visual style
+      guidance is provided by IP-Adapter.
+    - The IP-Adapter is configurable through model id, subfolder, and weight
+      name.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style = Tap(name='in_style')
+
+        # -------------------
+        # Shared structural conditioning
+        # -------------------
+        depth = ImgAuxMap(
+            name='depth',
+            spec={
+                'processor': 'depth_midas',
+                'detect_long_side': depth_detect_long_side,
+            },
+        )
+
+        tap_image >> depth
+
+        # -------------------
+        # Single generation stage
+        # -------------------
+        out = Txt2Img(
+            name='out',
+            spec=txt2img_spec,
+        )
+
+        tap_prompt >> out.prompt()
+
+        tap_style >> out.ip_adapter.add(
+            ip_adapter_model_id,
+            subfolder=ip_adapter_subfolder,
+            weight_name=ip_adapter_weight_name,
+            scale=style_scale,
+            key='style',
+        )
+
+        depth >> out.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale,
+            key='depth',
+        )
+
+        # -------------------
+        # Ports
+        # -------------------
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style,
         )
 
     return g

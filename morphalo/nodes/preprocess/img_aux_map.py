@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import cv2
 import numpy as np
@@ -14,6 +14,7 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
                                              resize_long_side_rgb, round_up)
+from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 
 
@@ -54,6 +55,12 @@ class ImgAuxMap(NodeRef):
     name : str, optional
         Unique node identifier within the DAG. If not provided, it is auto-generated
         by the enclosing DAG/NodeRef implementation.
+
+    path : str or Path, optional
+        Input image path. If omitted, the node resolves the upstream default input
+        (``input['default']['images']``, ``input['default']['image']`` or
+        ``input['default']['path']``).
+
     spec : dict or str or pathlib.Path or sequence of (dict or str or pathlib.Path)
         Node configuration specification.
 
@@ -145,6 +152,7 @@ class ImgAuxMap(NodeRef):
     available out-of-the-box in all environments.
     """
 
+    path: Union[str, Path, List[Union[str, Path]]] = None
     spec: SpecInput = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -173,17 +181,11 @@ class ImgAuxMap(NodeRef):
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         t0 = time.perf_counter()
 
-        input = input or {}
-        upstream = input.get('default')
-        if upstream is None:
-            raise ValueError(
-                'ImgAuxMap requires an input image wired to the default input.')
-
-        in_path = upstream.get('image') or upstream.get('path')
-        if not in_path:
-            raise ValueError(
-                'Upstream output does not contain an image path (image/path).')
-
+        in_path = resolve_single_image_path(
+            node_id=self.id,
+            path=self.path,
+            input=input,
+        )
         spec = resolve_spec(self.spec)
 
         processor = spec.get('processor', 'openpose_full')

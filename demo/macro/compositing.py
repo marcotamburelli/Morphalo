@@ -515,6 +515,169 @@ def cutout_stack_pose_img2img_group(
     return g
 
 
+def cutout_stack_ip_img2img_group(
+    name: str,
+    *,
+    out_spec: SpecInput,
+    style_scale: IpAdapterScale,
+    fg_layer_feather: int | str = '0.5%',
+    fg_layer_position: str = 'center',
+    fg_layer_resize: Optional[ResizeMode] = None,
+    ip_adapter_model_id: str = 'h94/IP-Adapter',
+    ip_adapter_subfolder: str = 'sdxl_models',
+    ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+) -> NodeGroup:
+    """
+    Compose a trimmed cut-out subject over a background, then harmonize the
+    composite with Img2Img using only IP-Adapter style conditioning.
+
+    This NodeGroup implements a simple compositing + harmonization pattern:
+
+    - a foreground image is cut out with ``SubjectCrop``;
+    - the cut-out is placed over a background using ``ImageStack``;
+    - the stacked composite is passed as the init image to ``Img2Img``;
+    - an external style image is attached through IP-Adapter;
+    - an optional prompt controls semantic/style refinement during the final pass.
+
+    Pattern
+    -------
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
+    background -------------------> ImageStack.layer(0)
+    ImageStack -------------------> Img2Img(default)
+    prompt -----------------------> Img2Img(prompt)
+    style ------------------------> Img2Img.ip_adapter
+
+    Ports
+    -----
+    foreground
+        Image containing the subject to extract.
+
+    background
+        Background image used for the composition.
+
+    prompt
+        Prompt payload wired to the final Img2Img pass.
+
+    style
+        IP-Adapter reference image or images used to guide the final Img2Img pass.
+
+    Output
+    ------
+    The group output corresponds to the internal node ``out``.
+
+    Parameters
+    ----------
+    name : str
+        Group name.
+
+    out_spec : SpecInput
+        Configuration for the final Img2Img harmonization pass.
+
+    style_scale : IpAdapterScale
+        IP-Adapter scale configuration for the style reference.
+
+    fg_layer_feather : int | str, optional
+        Feather applied to the subject layer in the stack.
+
+    fg_layer_position : str, optional
+        Subject placement anchor/position for ``stack.image(...)``.
+
+    fg_layer_resize : ResizeMode, optional
+        Optional resize parameter for the subject layer.
+
+    ip_adapter_model_id : str, optional
+        Hugging Face repository identifier for the IP-Adapter model.
+
+    ip_adapter_subfolder : str, optional
+        Repository subfolder containing the IP-Adapter weights.
+
+    ip_adapter_weight_name : str, optional
+        IP-Adapter weight file name.
+
+    Notes
+    -----
+    - This macro does not use ControlNet.
+    - The final pass is a true Img2Img pass: the stacked composite is used as
+      the init image.
+    - Structural fidelity comes only from the init image itself, while style
+      guidance is provided by IP-Adapter.
+    - The IP-Adapter is configurable through model id, subfolder, and weight name.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        fg = Tap(name='foreground')
+        bg = Tap(name='background')
+        prompt = Tap(name='prompt', strict=False)
+        style = Tap(name='style')
+
+        # -------------------
+        # Subject cut-out
+        # -------------------
+        crop = SubjectCrop(
+            name='cutout',
+            spec={
+                'model': {
+                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+                },
+                'params': {
+                    'target': 'person',
+                    'mode': 'default',
+                    'crop_mode': 'trim',
+                },
+            },
+        )
+
+        # -------------------
+        # Stack (composite)
+        # -------------------
+        stack = ImageStack(
+            name='stack',
+            spec={
+                'params': {},
+            },
+        )
+
+        bg >> stack.image(0)
+
+        fg >> crop
+        fg_layer = stack.image(
+            1,
+            position=fg_layer_position,
+            resize=fg_layer_resize,
+            feather=fg_layer_feather,
+        )
+        crop >> fg_layer
+
+        # -------------------
+        # Harmonize pass
+        # -------------------
+        out = Img2Img(
+            name='out',
+            spec=out_spec,
+        )
+
+        stack >> out
+        prompt >> out.prompt()
+
+        style >> out.ip_adapter.add(
+            ip_adapter_model_id,
+            subfolder=ip_adapter_subfolder,
+            weight_name=ip_adapter_weight_name,
+            scale=style_scale,
+            key='style',
+        )
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(fg, bg, prompt, style)
+
+    return g
+
+
 def cutout_stack_depth_ip_img2img_group(
     name: str,
     *,

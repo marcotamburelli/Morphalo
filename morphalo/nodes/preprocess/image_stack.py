@@ -1,3 +1,4 @@
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ class LayerSpec:
     idx: int
     position: Pos = 'center'
     resize: ResizeMode = None
+    rotation: float = 0.0
     feather: int | str = 0
     corner_radius: Optional[int | str] = None
 
@@ -294,6 +296,36 @@ def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: 
     patch = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     patch.alpha_composite(layer_crop, (ix0, iy0))
     canvas.alpha_composite(patch)
+
+
+def _apply_rotation(img: Image.Image, rotation: float) -> Image.Image:
+    """
+    Rotate an RGBA layer around its center.
+
+    Parameters
+    ----------
+    img : PIL.Image.Image
+        Input layer image. It is expected to be in ``RGBA`` mode.
+    rotation : float
+        Counter-clockwise rotation angle in degrees. Values equivalent to
+        ``0`` modulo ``360`` leave the image unchanged.
+
+    Returns
+    -------
+    PIL.Image.Image
+        Rotated image. The output canvas is expanded to preserve the full rotated
+        content, and newly exposed pixels are transparent.
+    """
+    angle = float(rotation) % 360.0
+    if abs(angle) < 1e-9 or abs(angle - 360.0) < 1e-9:
+        return img
+
+    return img.rotate(
+        angle,
+        resample=Image.Resampling.BICUBIC,
+        expand=True,
+        fillcolor=(0, 0, 0, 0),
+    )
 
 
 def _apply_resize(img: Image.Image, resize: ResizeMode, canvas_w: int, canvas_h: int) -> Image.Image:
@@ -657,9 +689,9 @@ class ImageStack(NodeRef):
     - placing subject cutouts onto new backgrounds,
     - reconstructing refined regions back into their original frame,
     - assembling multiple extracted elements into a single image,
-    - layering logos, UI elements, masks or overlays procedurally.
+    - layering logos, UI elements, masks, or overlays procedurally.
 
-    Layer Model
+    Layer model
     -----------
     Each upstream connection declared via :meth:`image` defines a *layer*.
 
@@ -670,11 +702,18 @@ class ImageStack(NodeRef):
 
     For each layer, the following pipeline is executed:
 
-    1. Load upstream image and convert to ``RGBA``.
-    2. Apply optional resizing (``resize``).
-    3. Optionally soften the layer edges (``feather``).
-    4. Resolve placement center (``position``) on the canvas.
-    5. Alpha-composite the layer onto the canvas.
+    1. Load the upstream image and convert it to ``RGBA``.
+    2. Apply optional rotation (``rotation``) around the layer center.
+    3. Apply optional resizing (``resize``) to the rotated layer.
+    4. Optionally soften the layer edges (``feather``).
+    5. Resolve layer placement (``position``) on the canvas.
+    6. Alpha-composite the transformed layer onto the canvas.
+
+    This execution order is important:
+
+    - rotation is applied *before* resizing,
+    - therefore ``resize`` refers to the final rotated layer bounding box,
+    not to the original unrotated image size.
 
     Canvas
     ------
@@ -682,33 +721,68 @@ class ImageStack(NodeRef):
     The canvas is always constructed in ``RGBA`` mode and may be initialized as:
 
     - fully transparent (``background = null``),
-    - a named PIL color (e.g. ``'white'``),
+    - a named PIL color (for example ``'white'``),
     - an explicit RGB or RGBA tuple.
 
     Final output color mode is controlled by ``params.out_mode``:
 
-    - ``'RGBA'`` → preserve alpha channel,
-    - ``'RGB'`` → drop alpha before saving.
+    - ``'RGBA'`` → preserve the alpha channel,
+    - ``'RGB'`` → drop the alpha channel before saving.
+
+    Rotation
+    --------
+    Each layer may optionally be rotated before resizing and placement using
+    ``rotation``.
+
+    - ``0.0``:
+        No rotation.
+    - ``float``:
+        Counter-clockwise rotation angle in degrees.
+
+    Rotation is applied around the center of the layer. The rotated canvas is
+    expanded so that the full rotated content is preserved, and newly exposed
+    pixels are filled with transparency.
+
+    Since rotation is applied before resizing, any subsequent ``resize`` operation
+    acts on the rotated layer as a whole.
 
     Resizing
     --------
     Each layer may be resized prior to placement using ``resize``:
 
     - ``None``:
-        Preserve original size.
+        Preserve the current layer size.
     - ``(W, H)``:
-        Force exact dimensions in pixels.
+        Force exact dimensions.
     - ``(W, None)``:
         Set width to ``W`` and preserve aspect ratio.
     - ``(None, H)``:
         Set height to ``H`` and preserve aspect ratio.
     - ``'fit'``:
-        Isotropic resize to the largest size that fits entirely inside
-        the canvas without distortion.
+        Isotropic resize to the largest size that fits entirely inside the
+        canvas without distortion.
     - ``'cover'``:
         Isotropic resize to the smallest size that fully covers the canvas
-        without distortion. The layer may extend beyond canvas bounds and
-        is clipped during compositing.
+        without distortion. The layer may extend beyond canvas bounds and is
+        clipped during compositing.
+
+    Each component in tuple mode may be:
+
+    - ``int``:
+        Explicit size in pixels.
+    - ``'<number>px'``:
+        Explicit size in pixels.
+    - ``'<number>%'``:
+        Percentage of the canvas dimension
+        (width for ``W``, height for ``H``).
+    - ``None``:
+        Preserve aspect ratio on that axis.
+
+    Examples:
+
+    - ``(512, 512)`` → force exact size,
+    - ``('50%', None)`` → width = 50% of canvas, height scaled proportionally,
+    - ``(None, '30%')`` → height = 30% of canvas, width scaled proportionally.
 
     Positioning
     -----------
@@ -727,19 +801,19 @@ class ImageStack(NodeRef):
     - ``'top-left'``, ``'top-right'``, ``'bottom-left'``, ``'bottom-right'``
     - ``'center-top'``, ``'center-bottom'``, ``'center-left'``, ``'center-right'``
 
-    Anchor resolution depends on both canvas dimensions and the current
-    layer dimensions (after resizing). This logic is implemented by
+    Anchor resolution depends on both canvas dimensions and the current layer
+    dimensions after rotation and resizing. This logic is implemented by
     ``_resolve_center_xy``.
 
-    Transform Input (Crop-driven reconstruction)
+    Transform input (crop-driven reconstruction)
     --------------------------------------------
     A layer may optionally declare an additional transform input via
     :meth:`ImageLayerAttachmentSink.transform`.
 
-    If a compatible upstream node (e.g. ``SubjectCrop``) is wired into
+    If a compatible upstream node (for example ``SubjectCrop``) is wired into
     ``transform:{idx}``, the layer geometry is automatically overridden:
 
-    - ``position`` is derived from ``crop.anchor_xy``.
+    - ``position`` is derived from ``crop.anchor_xy``,
     - ``resize`` is derived from ``crop.bbox_size``.
 
     This enables declarative reconstruction workflows:
@@ -748,18 +822,26 @@ class ImageStack(NodeRef):
     2. Refine or upsample the cropped region independently.
     3. Reinsert it into a stack at the original spatial location.
 
-    If no transform input is provided, the layer uses the geometry
-    declared explicitly via :meth:`image`.
+    The transform input overrides only *geometric reconstruction* parameters:
+
+    - ``position``
+    - ``resize``
+
+    It does **not** override ``rotation``. Rotation remains an explicit property
+    of the declared layer and affects only the attached image content.
+
+    If no transform input is provided, the layer uses the geometry declared
+    explicitly via :meth:`image`.
 
     Feathering
     ----------
     ``feather`` softens layer edges before compositing.
 
-    Accepted formats:
+    Accepted formats are:
 
     - ``int`` → feather width in pixels
-    - ``"<number>px"`` → explicit pixel units
-    - ``"<number>%"`` → percentage of the layer size
+    - ``'<number>px'`` → explicit pixel units
+    - ``'<number>%'`` → percentage of the layer size
 
     The behavior depends on the alpha channel of the layer.
 
@@ -772,7 +854,7 @@ class ImageStack(NodeRef):
     - When a percentage is used, the feather width is resolved
       independently for the horizontal and vertical axes.
 
-    **Non-uniform alpha (e.g. segmentation masks or subject cutouts):**
+    **Non-uniform alpha (for example segmentation masks or subject cutouts):**
 
     - The existing alpha channel is preserved.
     - The existing alpha channel is refined and softened using a small
@@ -793,14 +875,41 @@ class ImageStack(NodeRef):
             Output canvas width in pixels.
         ``height`` : int
             Output canvas height in pixels.
-        ``background`` : str or (r, g, b) or (r, g, b, a) or null
+        ``background`` : str or RGB/RGBA sequence or null
             Initial canvas background.
+
+            Accepted forms are:
+
+            - ``null`` / ``None``:
+              Create a fully transparent canvas.
+
+            - ``str``:
+              Named color or CSS-style color string accepted by PIL, such as
+              ``'white'``, ``'black'``, ``'#ffffff'``, ``'#000000'``,
+              or ``'#ffcc00'``.
+
+            - RGB sequence:
+              A list or tuple of three integers ``[r, g, b]`` or
+              ``(r, g, b)``. The alpha channel is assumed to be fully opaque.
+
+            - RGBA sequence:
+              A list or tuple of four integers ``[r, g, b, a]`` or
+              ``(r, g, b, a)``.
+
+            Channel values must be in the ``0..255`` range.
         ``out_mode`` : {'RGBA', 'RGB'}
             Output color mode.
 
     Methods
     -------
-    image(idx: int, position='center', resize=None, feather=0)
+    image(
+        idx: int,
+        position='center',
+        resize=None,
+        rotation=0.0,
+        feather=0,
+        corner_radius=None,
+    )
         Declare a compositing layer and return an :class:`AttachmentSink`
         for wiring.
 
@@ -820,7 +929,7 @@ class ImageStack(NodeRef):
         ``image`` : str
             Path to the composited output image.
         ``metadata`` : str
-            Path to JSON sidecar.
+            Path to the JSON sidecar.
 
     Notes
     -----
@@ -845,6 +954,7 @@ class ImageStack(NodeRef):
         *,
         position: Pos = 'center',
         resize: ResizeMode = None,
+        rotation: float = 0.0,
         feather: int | str = 0,
         corner_radius: Optional[int | str] = None,
     ) -> ImageLayerAttachmentSink:
@@ -921,6 +1031,21 @@ class ImageStack(NodeRef):
             - ``("50%", None)`` → width = 50% of canvas, height scaled to preserve aspect ratio
             - ``(None, "30%")`` → height = 30% of canvas, width scaled proportionally
 
+        rotation : float, optional
+            Counter-clockwise rotation angle in degrees applied to the layer before
+            resizing, feathering, and placement.
+
+            The layer is rotated around its center. The rotated canvas is expanded to
+            preserve the full rotated content, and newly exposed pixels are transparent.
+
+            Since resizing is applied after rotation, ``resize`` refers to the final
+            rotated layer bounding box, not to the original unrotated image size.
+
+            Since placement is resolved after rotation and resizing, tuple positions and
+            anchor strings refer to the center / bounding box of the transformed layer.
+
+            Default: ``0.0``.
+
         feather : int or str, optional
             Feathering applied to the layer edges before compositing.
 
@@ -979,11 +1104,14 @@ class ImageStack(NodeRef):
 
         Notes
         -----
-        - The layer transformation is purely geometric (resize + placement).
+        - The layer transformation is purely geometric and includes rotation,
+          resizing, and placement.
         - No automatic color matching, lighting harmonization, or shadow
         synthesis is performed.
         - ``idx`` must be unique; attempting to reuse an index raises an error.
         """
+
+        idx = int(idx)
         if idx < 0:
             raise ValueError(f'{self.id}: idx must be >= 0, got {idx}')
 
@@ -1021,6 +1149,12 @@ class ImageStack(NodeRef):
                     f'{self.id}: resize must be None, tuple or str, got {type(resize)}'
                 )
 
+        rotation = float(rotation)
+        if not math.isfinite(rotation):
+            raise ValueError(
+                f'{self.id}: rotation must be a finite number, got {rotation!r}'
+            )
+
         idx = int(idx)
 
         if idx in self._layers:
@@ -1038,6 +1172,7 @@ class ImageStack(NodeRef):
             idx=idx,
             position=position,
             resize=resize,
+            rotation=rotation,
             feather=feather,
             corner_radius=corner_radius,
         )
@@ -1118,6 +1253,7 @@ class ImageStack(NodeRef):
                 position = layer_spec.position
                 resize = layer_spec.resize
 
+            layer = _apply_rotation(layer, layer_spec.rotation)
             layer = _apply_resize(
                 layer, resize, cfg.width, cfg.height
             )
@@ -1219,6 +1355,7 @@ class ImageStack(NodeRef):
                         'idx': ls.idx,
                         'position': ls.position,
                         'resize': ls.resize,
+                        'rotation': ls.rotation,
                         'feather': ls.feather,
                         'corner_radius': ls.corner_radius,
                     }

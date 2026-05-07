@@ -1,11 +1,12 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Union
 
 from diffusers import (StableDiffusionXLAdapterPipeline,
                        StableDiffusionXLControlNetPipeline,
                        StableDiffusionXLPipeline)
+from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
 from morphalo.core.paths import ensure_out_dir
@@ -22,6 +23,185 @@ from morphalo.nodes.wiring.conditioning import apply_ip_adapter
 from morphalo.nodes.wiring.mixins import (ControlNetMixin, PromptMixin,
                                           T2IAdapterMixin)
 from morphalo.nodes.wiring.prompt import PromptBundle
+
+
+def _first_image(
+    image_or_images: Union[Image.Image, list[Image.Image], None],
+) -> Optional[Image.Image]:
+    """
+    Return the first PIL image from a single image or image list.
+
+    Parameters
+    ----------
+    image_or_images : PIL.Image.Image or list[PIL.Image.Image] or None
+        Conditioning image payload.
+
+    Returns
+    -------
+    PIL.Image.Image or None
+        First image, or ``None`` when no image is available.
+    """
+    if image_or_images is None:
+        return None
+
+    if isinstance(image_or_images, list):
+        return image_or_images[0] if image_or_images else None
+
+    return image_or_images
+
+
+def _first_conditioning_image(
+    *,
+    cn_bundle: Any,
+    t2i_bundle: Any,
+) -> Optional[Image.Image]:
+    """
+    Return the first available conditioning image.
+
+    ControlNet has priority over T2I-Adapter because Txt2Img already enforces
+    that they cannot be active together.
+
+    Parameters
+    ----------
+    cn_bundle : Any
+        ControlNet bundle exposing ``has_controlnet`` and ``control_image_arg``.
+
+    t2i_bundle : Any
+        T2I-Adapter bundle exposing ``has_t2i_adapter`` and ``adapter_image_arg``.
+
+    Returns
+    -------
+    PIL.Image.Image or None
+        First conditioning image, or ``None`` if no conditioning is active.
+    """
+    if cn_bundle.has_controlnet:
+        return _first_image(cn_bundle.control_image_arg)
+
+    if t2i_bundle.has_t2i_adapter:
+        return _first_image(t2i_bundle.adapter_image_arg)
+
+    return None
+
+
+def _resolve_long_side_size(
+    *,
+    image: Image.Image,
+    long_side: int,
+    multiple: int = 8,
+) -> Tuple[int, int]:
+    """
+    Resolve a proportional output size from a reference image.
+
+    The longest side is scaled to ``long_side`` while preserving the reference
+    image aspect ratio. The resulting dimensions are rounded down to a multiple
+    of ``multiple``.
+
+    Parameters
+    ----------
+    image : PIL.Image.Image
+        Reference image used to infer aspect ratio.
+
+    long_side : int
+        Target size for the longest side.
+
+    multiple : int, default=8
+        Alignment multiple for SDXL-compatible dimensions.
+
+    Returns
+    -------
+    tuple[int, int]
+        Resolved ``(width, height)``.
+    """
+    if long_side <= 0:
+        raise ValueError(f"'long_side' must be > 0, got {long_side}")
+
+    src_w, src_h = image.size
+
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError(f'Invalid conditioning image size {src_w}x{src_h}')
+
+    if src_w >= src_h:
+        width = int(long_side)
+        height = int(round(src_h * (width / src_w)))
+    else:
+        height = int(long_side)
+        width = int(round(src_w * (height / src_h)))
+
+    if multiple > 1:
+        width = max(multiple, (width // multiple) * multiple)
+        height = max(multiple, (height // multiple) * multiple)
+
+    return width, height
+
+
+def _resolve_txt2img_size(
+    *,
+    width: int,
+    height: int,
+    long_side: Optional[int],
+    cn_bundle: Any,
+    t2i_bundle: Any,
+    multiple: int = 8,
+) -> Tuple[int, int]:
+    """
+    Resolve effective Txt2Img generation size.
+
+    If ``long_side`` is provided, the aspect ratio is inferred from the first
+    available ControlNet or T2I-Adapter conditioning image.
+
+    Otherwise, the already-resolved ``width`` and ``height`` values are used.
+
+    Parameters
+    ----------
+    width : int
+        Resolved width from the node configuration.
+
+    height : int
+        Resolved height from the node configuration.
+
+    long_side : int or None
+        Optional target long side. When provided, overrides ``width`` and
+        ``height`` using the first conditioning image aspect ratio.
+
+    cn_bundle : Any
+        ControlNet bundle.
+
+    t2i_bundle : Any
+        T2I-Adapter bundle.
+
+    multiple : int, default=8
+        Alignment multiple for generated dimensions.
+
+    Returns
+    -------
+    tuple[int, int]
+        Effective ``(width, height)``.
+
+    Raises
+    ------
+    ValueError
+        If ``long_side`` is provided but no ControlNet or T2I-Adapter image is
+        available.
+    """
+    if long_side is None:
+        return int(width), int(height)
+
+    conditioning_image = _first_conditioning_image(
+        cn_bundle=cn_bundle,
+        t2i_bundle=t2i_bundle,
+    )
+
+    if conditioning_image is None:
+        raise ValueError(
+            "Txt2Img params 'long_side' requires at least one ControlNet or "
+            'T2I-Adapter conditioning image.'
+        )
+
+    return _resolve_long_side_size(
+        image=conditioning_image,
+        long_side=int(long_side),
+        multiple=multiple,
+    )
 
 
 @dataclass
@@ -104,6 +284,14 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             Output width (default: 1024).
         - ``params.height`` : int, optional
             Output height (default: 1024).
+        - ``params.long_side`` : int, optional
+            If provided, overrides ``params.width`` and ``params.height`` by
+            deriving the aspect ratio from the first available ControlNet or
+            T2I-Adapter conditioning image and scaling the longest side to this
+            value.
+
+            If both ControlNet and T2I-Adapter are absent, using
+            ``params.long_side`` raises an error.
 
         **Batch and randomness**
 
@@ -280,6 +468,14 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
         else:
             pipe = StableDiffusionXLPipeline(**base.components)
 
+        width, height = _resolve_txt2img_size(
+            width=ctx.width,
+            height=ctx.height,
+            long_side=ctx.long_side,
+            cn_bundle=cn_bundle,
+            t2i_bundle=t2i_bundle,
+        )
+
         prompt_bundle = PromptBundle(spec=ctx.spec, input=input)
 
         cuda_prerun(ctx.model.device)
@@ -299,8 +495,8 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             t2i_bundle=t2i_bundle,
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
-            height=ctx.height,
-            width=ctx.width,
+            height=height,
+            width=width,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
         )
@@ -319,8 +515,8 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
             generator=ctx.rng.generators,
-            width=ctx.width,
-            height=ctx.height,
+            width=width,
+            height=height,
             num_images_per_prompt=ctx.batch,
             ** pipe_kwargs,
         )

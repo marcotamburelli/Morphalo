@@ -558,6 +558,137 @@ def person_bboxes_xyxy(res, node_id: str) -> list[tuple[int, int, int, int]]:
     return out
 
 
+def person_bbox_xyxy_from_pose(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    expansion: float = 1.5,
+    min_points: int = 5,
+) -> tuple[int, int, int, int]:
+    """
+    Infer a coarse person bbox from MediaPipe pose landmarks.
+
+    This is intended as a fallback when the object detector fails to return
+    a usable person box.
+
+    The bbox is based on valid pose landmarks, then expanded to approximate
+    the full visible person silhouette. It is intentionally conservative:
+    it may include extra background, but should avoid crashing the DAG.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        Pose landmarks with shape ``(33, 2)`` in full-image coordinates.
+        Missing landmarks are encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    expansion : float, optional
+        Multiplicative bbox expansion factor.
+    min_points : int, optional
+        Minimum number of valid landmarks required.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive bbox ``(x1, y1, x2, y2)``.
+
+    Raises
+    ------
+    RuntimeError
+        If there are not enough valid pose landmarks.
+    """
+    if pose_xy is None:
+        raise RuntimeError('Cannot infer person bbox: pose_xy is None.')
+
+    if pose_xy.ndim != 2 or pose_xy.shape[1] != 2:
+        raise RuntimeError(
+            f'Invalid pose landmark shape {pose_xy.shape!r}; expected (N, 2).'
+        )
+
+    h, w = image_shape[:2]
+
+    valid = (
+        (pose_xy[:, 0] >= 0) &
+        (pose_xy[:, 1] >= 0)
+    )
+    pts = pose_xy[valid]
+
+    if pts.shape[0] < int(min_points):
+        raise RuntimeError(
+            f'Cannot infer person bbox from pose: only {pts.shape[0]} valid landmarks.'
+        )
+
+    x1 = int(np.min(pts[:, 0]))
+    y1 = int(np.min(pts[:, 1]))
+    x2 = int(np.max(pts[:, 0])) + 1
+    y2 = int(np.max(pts[:, 1])) + 1
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid raw pose-derived person bbox.')
+
+    bw = x2 - x1
+    bh = y2 - y1
+
+    # Landmarks usually sit inside the body silhouette, not on its contour.
+    # Expand more vertically than horizontally, and bias upward slightly to
+    # preserve head / hair.
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    ex = max(1.0, float(expansion))
+    ey = max(1.0, float(expansion) * 1.15)
+
+    out_w = max(1.0, bw * ex)
+    out_h = max(1.0, bh * ey)
+
+    # Upward bias: useful when feet/legs are missing but head must be preserved.
+    cy -= 0.06 * out_h
+
+    ox1 = int(math.floor(cx - out_w / 2.0))
+    ox2 = int(math.ceil(cx + out_w / 2.0))
+    oy1 = int(math.floor(cy - out_h / 2.0))
+    oy2 = int(math.ceil(cy + out_h / 2.0))
+
+    ox1 = max(0, min(w - 1, ox1))
+    oy1 = max(0, min(h - 1, oy1))
+    ox2 = max(ox1 + 1, min(w, ox2))
+    oy2 = max(oy1 + 1, min(h, oy2))
+
+    if ox2 <= ox1 or oy2 <= oy1:
+        raise RuntimeError('Invalid expanded pose-derived person bbox.')
+
+    return ox1, oy1, ox2, oy2
+
+
+def resolve_person_bbox_xyxy(
+    res,
+    node_id: str,
+    *,
+    pose_xy: Optional[np.ndarray],
+    image_shape: tuple[int, ...],
+    pose_fallback_expansion: float = 1.35,
+) -> tuple[int, int, int, int]:
+    """
+    Resolve a person bbox using YOLO first, then MediaPipe Pose fallback.
+
+    YOLO is preferred when available because it usually estimates the visible
+    person silhouette better. If YOLO fails, pose landmarks are used to infer
+    a coarse bbox.
+    """
+    try:
+        person_boxes = person_bboxes_xyxy(res, node_id)
+        return select_person_bbox_xyxy(
+            person_boxes,
+            pose_xy=pose_xy,
+        )
+    except RuntimeError as exc:
+        return person_bbox_xyxy_from_pose(
+            pose_xy,
+            image_shape,
+            expansion=pose_fallback_expansion,
+        )
+
+
 def score_bbox_with_pose(
     bbox_xyxy: tuple[int, int, int, int],
     *,

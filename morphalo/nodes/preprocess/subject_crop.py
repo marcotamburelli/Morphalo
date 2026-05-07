@@ -28,8 +28,7 @@ from morphalo.nodes.vision.human import (eye_bbox_xyxy_from_landmarks,
                                          mp_face_landmarks,
                                          mp_hand_landmarks_full,
                                          mp_pose_landmarks_xy,
-                                         person_bboxes_xyxy,
-                                         select_person_bbox_xyxy)
+                                         resolve_person_bbox_xyxy)
 
 CropModeName = Literal['bbox', 'trim', 'full_frame']
 
@@ -648,7 +647,8 @@ class SubjectCrop(NodeRef):
 
     path : str or Path, optional
         Input image path. If omitted, the node resolves the upstream default input
-        (``input['default']['image']`` or ``input['default']['path']``).
+        (``input['default']['images']``, ``input['default']['image']`` or
+        ``input['default']['path']``).
 
     spec : dict or str or Path, optional
         Node specification (inline dict or path to a config file), resolved via
@@ -940,11 +940,11 @@ class SubjectCrop(NodeRef):
                 device=cfg.device
             )[0]
 
-            person_boxes_xyxy = person_bboxes_xyxy(res, node_id)
-
-            bx1, by1, bx2, by2 = select_person_bbox_xyxy(
-                person_boxes_xyxy,
+            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
+                res,
+                node_id,
                 pose_xy=pose_xy,
+                image_shape=img_rgb.shape,
             )
 
         elif cfg.target == 'head':
@@ -956,11 +956,11 @@ class SubjectCrop(NodeRef):
                 device=cfg.device,
             )[0]
 
-            person_boxes_xyxy = person_bboxes_xyxy(res, node_id)
-
-            bx1, by1, bx2, by2 = select_person_bbox_xyxy(
-                person_boxes_xyxy,
+            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
+                res,
+                node_id,
                 pose_xy=pose_xy,
+                image_shape=img_rgb.shape,
             )
 
             landmarker = get_mediapipe_face_landmarker(
@@ -1078,11 +1078,11 @@ class SubjectCrop(NodeRef):
                 device=cfg.device,
             )[0]
 
-            person_boxes_xyxy = person_bboxes_xyxy(res, node_id)
-
-            bx1, by1, bx2, by2 = select_person_bbox_xyxy(
-                person_boxes_xyxy,
+            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
+                res,
+                node_id,
                 pose_xy=pose_xy,
+                image_shape=img_rgb.shape,
             )
 
             # --------------------------------------------------

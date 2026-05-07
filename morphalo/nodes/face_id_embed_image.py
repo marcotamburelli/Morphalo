@@ -85,7 +85,8 @@ class FaceIdEmbedImage(NodeRef):
     - it may be a single path (str/Path) or a list of paths.
 
     2) Otherwise, the node reads the upstream default input:
-    - ``input['default']['image']`` or ``input['default']['path']``.
+    - ``input['default']['image']``, `input['default']['images']`` or
+      ``input['default']['path']``.
     - the upstream value may be a single path or a list of paths.
 
     Only filesystem paths are supported here (the node does not accept in-memory
