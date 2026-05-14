@@ -495,3 +495,166 @@ def fine_face_details_group(
             g.register_ports(tap_image, tap_prompt)
 
     return g
+
+
+HandSide = Literal['left', 'right']
+
+
+def refine_hand_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    stack_spec: SpecInput = {},
+    hand: HandSide = 'right',
+    default_prompt: str = 'well formed hand, anatomically correct fingers, natural hand pose',
+    hand_crop_mode: str = 'bbox[1:1]',
+    hand_expansion: float = 1.8,
+    hand_box_margin: float = 0.20,
+    layer_feather: int | str = 25,
+    layer_corner_radius: int | str = 40,
+) -> NodeGroup:
+    """
+    Create a reusable NodeGroup that refines one hand and overlays it back.
+
+    The group crops a single subject hand, refines the crop with ``Img2Img``,
+    and composites the refined crop back over the original image.
+
+    The selected hand follows ``SubjectCrop`` semantics: ``left`` and ``right``
+    refer to the subject perspective, not the viewer perspective.
+
+    Ports
+    -----
+    in_image
+        Base image used both as background and as source for the hand crop.
+
+    in_prompt
+        Optional prompt payload for the internal ``Img2Img`` node. If omitted,
+        the macro falls back to ``default_prompt``.
+
+    Output
+    ------
+    The group output corresponds to the internal ``ImageStack`` node ``out``.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name.
+
+    refine_spec : SpecInput
+        Spec for the internal ``Img2Img`` node.
+
+    stack_spec : SpecInput, optional
+        Spec for ``ImageStack``. Usually defines canvas size, background, and
+        output mode.
+
+    hand : {'left', 'right'}, optional
+        Hand to refine, using subject-perspective semantics.
+
+    default_prompt : str, optional
+        Fallback prompt used when no external ``in_prompt`` is wired.
+
+    hand_crop_mode : str, optional
+        Crop mode forwarded to ``SubjectCrop``. A ratio crop such as
+        ``'bbox[1:1]'`` is useful for giving the model enough local context.
+
+    hand_expansion : float, optional
+        Expansion factor for the hand crop.
+
+    hand_box_margin : float, optional
+        Additional margin around the detected hand region.
+
+    layer_feather : int or str, optional
+        Feather applied when compositing the refined hand crop.
+
+    layer_corner_radius : int or str, optional
+        Corner radius applied to the refined layer mask.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed group.
+    """
+
+    if hand not in ('left', 'right'):
+        raise ValueError(
+            f'{name}: invalid hand={hand!r}. Expected "left" or "right".'
+        )
+
+    target = f'{hand}-hand'
+
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+
+        # -------------------
+        # Crop one hand
+        # -------------------
+        crop_hand = SubjectCrop(
+            name='crop_hand',
+            spec={
+                'model': {
+                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+                    'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
+                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+                },
+                'params': {
+                    'target': target,
+                    'mode': 'default',
+                    'crop_mode': hand_crop_mode,
+                    'box_margin': hand_box_margin,
+                    'expansion': hand_expansion,
+                },
+            },
+        )
+
+        # -------------------
+        # Refine hand crop
+        # -------------------
+        refine_hand = Img2Img(
+            name='refine_hand',
+            spec=[
+                refine_spec,
+                {
+                    'prompt': default_prompt,
+                },
+            ],
+        )
+
+        # -------------------
+        # Composite back
+        # -------------------
+        stack = ImageStack(
+            name='out',
+            spec=stack_spec,
+        )
+
+        # Base image as background.
+        tap_image >> stack.image(0)
+
+        # Crop selected hand.
+        tap_image >> crop_hand
+
+        # Refine cropped hand.
+        crop_hand >> refine_hand
+        tap_prompt >> refine_hand.prompt()
+
+        # Overlay refined crop using crop metadata.
+        layer = stack.image(
+            1,
+            position='center',
+            feather=layer_feather,
+            corner_radius=layer_corner_radius,
+        )
+
+        refine_hand >> layer
+        crop_hand >> layer.transform()
+
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+        )
+
+    return g

@@ -16,7 +16,6 @@ class ControlNetMixin:
         super().__post_init__()
         self.controlnet = ControlNetRegistry(owner=self)
         self.ip_adapter = IpAdapterRegistry(owner=self)
-        self.ip_adapter = IpAdapterRegistry(owner=self)
         self.face_id = FaceIdRegistry(owner=self)
 
     def build_control_bundles(self, input, device, dtype):

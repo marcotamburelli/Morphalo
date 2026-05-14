@@ -2,11 +2,13 @@ from typing import List, Optional, Sequence, Union
 
 import torch
 from diffusers import DiffusionPipeline
-from diffusers.loaders import IPAdapterMixin
+from diffusers.loaders import IPAdapterMixin, StableDiffusionXLLoraLoaderMixin
 from PIL import Image
 
 from morphalo.nodes.wiring.face_id import FaceIdBundle
 from morphalo.nodes.wiring.ip_adapter import IpAdapterBundle
+
+SDXLPipeline = DiffusionPipeline | IPAdapterMixin | StableDiffusionXLLoraLoaderMixin
 
 
 def _as_image_list(x: Union[Image.Image, Sequence[Image.Image]]) -> List[Image.Image]:
@@ -83,10 +85,35 @@ def _aggregate_slot_clip_embeds(
     return out
 
 
+def _clear_faceid_clip_state(pipe: SDXLPipeline) -> None:
+    """
+    Clear manually injected FaceID Plus / PlusV2 CLIP state without guessing
+    layer defaults.
+
+    Notes
+    -----
+    This helper intentionally clears only ``clip_embeds``. It does not reset
+    ``shortcut`` because the correct default may depend on the projection layer
+    implementation and adapter variant. The subsequent ``unload_ip_adapter()``
+    call removes the projection layers themselves.
+    """
+    encoder_hid_proj = getattr(pipe.unet, 'encoder_hid_proj', None)
+    if encoder_hid_proj is None:
+        return
+
+    layers = getattr(encoder_hid_proj, 'image_projection_layers', None)
+    if not layers:
+        return
+
+    for layer in layers:
+        if hasattr(layer, 'clip_embeds'):
+            layer.clip_embeds = None
+
+
 def apply_ip_adapter(
     ip_bundle: IpAdapterBundle,
     face_bundle: FaceIdBundle,
-    pipe: DiffusionPipeline | IPAdapterMixin,
+    pipe: SDXLPipeline,
     batch: int,
     device: str,
     dtype: torch.dtype,
@@ -101,8 +128,8 @@ def apply_ip_adapter(
     - FaceID conditioning (including optional CLIP-based conditioning for
       Plus / PlusV2 variants).
 
-    The two modes are mutually exclusive:
-    if both bundles are present, IP-Adapter takes precedence.
+    The two modes are mutually exclusive. Passing both bundles as active
+    is an error.
 
     Parameters
     ----------
@@ -116,7 +143,7 @@ def apply_ip_adapter(
         standard IP-Adapter is active. Supports both base FaceID and
         Plus / PlusV2 variants.
 
-    pipe : DiffusionPipeline | IPAdapterMixin
+    pipe : DiffusionPipeline | IPAdapterMixin | StableDiffusionXLLoraLoaderMixin
         Diffusers pipeline instance to be configured. This function
         mutates the pipeline in-place by loading adapter weights and
         registering required modules.
@@ -137,20 +164,23 @@ def apply_ip_adapter(
 
     Behavior
     --------
+    - Always clears manually injected FaceID CLIP state, unloads any previously
+      configured IP-Adapter state, and unloads LoRA weights that may have been
+      loaded as FaceID side effects before applying new conditioning.
+
     - If ``ip_bundle.has_ip_adapter`` is True:
+        - registers the corresponding image encoder
         - loads IP-Adapter weights via ``load_ip_adapter``
         - sets adapter scale via ``set_ip_adapter_scale``
-        - registers the corresponding image encoder
 
     - Else if ``face_bundle.has_face_id`` is True:
-        - loads FaceID weights via ``load_ip_adapter`` (FaceID-compatible)
+        - optionally registers the CLIP image encoder for Plus / PlusV2
+        - loads FaceID weights via ``load_ip_adapter``
         - sets FaceID scale configuration
-        - optionally registers the CLIP image encoder (for Plus / PlusV2)
-        - applies CLIP-based conditioning via ``apply_faceid_clip``,
-          using ``batch`` to correctly expand embeddings
+        - applies CLIP-based conditioning via ``apply_faceid_clip``
 
     - Else:
-        - unloads any previously configured IP-Adapter from the pipeline
+        - leaves the pipeline with no active IP-Adapter / FaceID conditioning.
 
     Notes
     -----
@@ -161,6 +191,25 @@ def apply_ip_adapter(
     - IP-Adapter and FaceID conditioning are treated as mutually exclusive
       to avoid conflicts in adapter loading and projection layers.
     """
+
+    if ip_bundle.has_ip_adapter and face_bundle.has_face_id:
+        raise ValueError(
+            'IP-Adapter and IP-Adapter-FaceID are mutually exclusive.'
+        )
+
+    # Always reset adapter state before loading a new adapter configuration.
+    # Diffusers IP-Adapter loading mutates the pipeline in-place, FaceID Plus /
+    # PlusV2 injects runtime CLIP tensors into projection layers, and some
+    # FaceID variants may load auxiliary LoRA adapters.
+    _clear_faceid_clip_state(pipe)
+    pipe.unload_ip_adapter()
+    # TODO: Revisit this when Morphalo adds first-class LoRA support.
+    # ``unload_lora_weights()`` clears all LoRA adapters, not only FaceID
+    # side-effect LoRAs. This is acceptable for now because Morphalo does not
+    # yet expose LoRA as an independent conditioning mechanism. Once it does,
+    # LoRA cleanup should become selective or move into the LoRA-specific
+    # configuration block.
+    pipe.unload_lora_weights()
 
     if ip_bundle.has_ip_adapter:
         pipe.register_modules(image_encoder=ip_bundle.image_encoder)
@@ -190,14 +239,11 @@ def apply_ip_adapter(
             num_images=batch,
         )
 
-    else:
-        pipe.unload_ip_adapter()
-
 
 def apply_faceid_clip(
     *,
     face_bundle: FaceIdBundle,
-    pipe: DiffusionPipeline | IPAdapterMixin,
+    pipe: SDXLPipeline,
     device: torch.device,
     dtype: torch.dtype,
     num_images: int = 1
@@ -259,10 +305,10 @@ def apply_faceid_clip(
 
     if n_layers != len(face_bundle.weight_names_arg):
         raise RuntimeError(
-            f"FaceID adapters/layers mismatch: layers={n_layers} but face weights={len(face_bundle.weight_names_arg)}."
+            f'FaceID adapters/layers mismatch: layers={n_layers} but face weights={len(face_bundle.weight_names_arg)}.'
         )
 
-    blank = Image.new("RGB", (224, 224), (0, 0, 0))
+    blank = Image.new('RGB', (224, 224), (0, 0, 0))
 
     # Build a baseline image list of length == n_layers (ONE image per slot).
     #

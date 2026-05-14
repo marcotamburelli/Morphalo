@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from diffusers import (StableDiffusionXLControlNetInpaintPipeline,
                        StableDiffusionXLInpaintPipeline)
@@ -15,12 +15,84 @@ from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
+from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.sdxl_pipe_builder import build_pipe_kwargs
-from morphalo.nodes.sdxl_resolve import resolve_common
+from morphalo.nodes.sdxl_resolve import ImageGenerationContext, resolve_common
 from morphalo.nodes.wiring.conditioning import apply_ip_adapter
 from morphalo.nodes.wiring.mixins import ControlNetMixin, PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
+
+ImageMode = Literal['RGB', 'L']
+
+
+def _load_resize_image(
+    image_path: str,
+    *,
+    mode: ImageMode,
+    width: int,
+    height: int,
+    resample: Image.Resampling = Image.Resampling.LANCZOS,
+) -> Image.Image:
+    """
+    Load an image, convert it to the requested PIL mode, and resize it.
+
+    Parameters
+    ----------
+    image_path : str
+        Filesystem path to the image.
+    mode : {'RGB', 'L'}
+        Target PIL image mode.
+
+        Use ``'RGB'`` for init images and ``'L'`` for inpaint masks.
+    width : int
+        Target output width.
+    height : int
+        Target output height.
+    resample : PIL.Image.Resampling, optional
+        Resampling filter used during resize.
+
+    Returns
+    -------
+    PIL.Image.Image
+        Loaded, converted, and resized image.
+    """
+    with Image.open(image_path) as im:
+        image = im.convert(mode)
+
+    return image.resize((width, height), resample=resample)
+
+
+def _resolve_inpaint_size(
+    ctx: ImageGenerationContext,
+    init_path: str,
+) -> tuple[int, int]:
+    """
+    Resolve the inpaint generation size from the init image.
+
+    Parameters
+    ----------
+    ctx : ImageGenerationContext
+        Resolved generation context.
+    init_path : str
+        Filesystem path to the init image.
+
+    Returns
+    -------
+    tuple[int, int]
+        Resolved ``(width, height)``.
+    """
+    if ctx.long_side is None:
+        return ctx.width, ctx.height
+
+    with Image.open(init_path) as im:
+        image = im.convert('RGB')
+
+    return resolve_long_side_size(
+        image=image,
+        long_side=ctx.long_side,
+        multiple=8,
+    )
 
 
 @dataclass
@@ -83,6 +155,10 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             Output width (default: 1024).
         - ``params.height`` : int, optional
             Output height (default: 1024).
+        - ``params.long_side`` : int, optional
+            If provided, overrides ``params.width`` and ``params.height`` and
+            resolves the generation size proportionally from the input image so
+            that its longest side matches this value.
 
         **Batch and randomness**
         - ``batch`` : int, optional
@@ -198,23 +274,23 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
     - The init image is resized to the resolved ``width`` and ``height`` before
       being passed to the pipeline. The mask is expected to be aligned with the
       init image and is resized accordingly.
-    - ControlNet and T2I-Adapter inputs are collected from DAG wiring through
-      their respective registries and resolved into runtime bundles before
-      pipeline construction.
-    - ControlNet and T2I-Adapter are mutually exclusive within the same node.
-      Attempting to enable both results in an error.
+    - ControlNet inputs are collected from DAG wiring through the ControlNet
+      registry and resolved into a runtime bundle before pipeline construction.
     - For ``StableDiffusionXLControlNetInpaintPipeline``, ControlNet conditioning
-      images are passed via the pipeline ``image`` argument together with
-    ``controlnet_conditioning_scale`` (via :func:`build_pipe_kwargs`).
-    - For ``StableDiffusionXLAdapterPipeline`` (inpaint), adapter conditioning
-      images are passed via the pipeline ``image`` argument together with
-    ``adapter_conditioning_scale`` (via :func:`build_pipe_kwargs`).
+      images are passed through the pipeline kwargs built by
+      :func:`build_pipe_kwargs`.
+    - IP-Adapter and FaceID inputs are collected from DAG wiring through their
+      respective registries and resolved into runtime bundles before pipeline
+      invocation.
     - IP-Adapter conditioning uses one or more reference images passed through
-    ``ip_adapter_image``; FaceID uses precomputed embeddings passed through
-    ``ip_adapter_image_embeds``. IP-Adapter and FaceID are mutually exclusive.
+      ``ip_adapter_image``; FaceID uses precomputed embeddings passed through
+      ``ip_adapter_image_embeds``. IP-Adapter and FaceID are mutually exclusive.
     - Outputs are written as one or more image files plus a single JSON sidecar
       for the node execution. In batch mode, the sidecar is shared across all
       generated images.
+      The effective generation size is resolved either from ``params.width`` /
+      ``params.height`` or, when ``params.long_side`` is provided, from the
+      input image aspect ratio.
     """
 
     spec: SpecInput = field(default_factory=dict)
@@ -272,11 +348,20 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
         init_path = init_up.get('image') or init_up.get('path')
         if not init_path:
             raise ValueError(
-                "Init image upstream output must contain 'image' (path).")
+                "Init image upstream output must contain 'image' or 'path'.")
 
-        init_image = Image.open(init_path) \
-            .convert('RGB') \
-            .resize((ctx.width, ctx.height))
+        width, height = _resolve_inpaint_size(
+            ctx=ctx,
+            init_path=init_path,
+        )
+
+        init_image = _load_resize_image(
+            init_path,
+            mode='RGB',
+            width=width,
+            height=height,
+            resample=Image.Resampling.LANCZOS,
+        )
 
         # 2) mask image (mask)
         mask_up = input.get('mask')
@@ -288,12 +373,16 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
         mask_path = mask_up.get('image') or mask_up.get('path')
         if not mask_path:
             raise ValueError(
-                "Mask upstream output must contain 'image' (path).")
+                "Mask upstream output must contain 'image' or 'path'.")
 
         # keep mask as single channel for sanity; resize to match
-        mask_image = Image.open(mask_path) \
-            .convert('L') \
-            .resize((ctx.width, ctx.height))
+        mask_image = _load_resize_image(
+            mask_path,
+            mode='L',
+            width=width,
+            height=height,
+            resample=Image.Resampling.NEAREST,
+        )
 
         # --- resolve conditioning bundles from DAG wiring ---
         cn_bundle, ip_bundle, face_bundle = self.build_control_bundles(
@@ -343,8 +432,8 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             cn_bundle=cn_bundle,
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
-            height=ctx.height,
-            width=ctx.width,
+            height=height,
+            width=width,
             device=ctx.model.device,
             dtype=ctx.model.dtype,
             init_image_already_passed=True,
@@ -352,10 +441,15 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
 
         # sanity-check ip-adapter masks length if present
         if 'cross_attention_kwargs' in pipe_kwargs:
-            l = len(ip_bundle.weight_names_arg) + \
+            expected = len(ip_bundle.weight_names_arg) + \
                 len(face_bundle.weight_names_arg)
             masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']
-            assert len(masks) == l
+
+            if len(masks) != expected:
+                raise ValueError(
+                    f'Invalid IP-Adapter mask count: expected {expected}, '
+                    f'got {len(masks)}.'
+                )
 
         result = pipe(
             prompt=prompt_bundle.prompt,
@@ -368,9 +462,8 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
             num_inference_steps=ctx.steps,
             guidance_scale=ctx.cfg,
             generator=ctx.rng.generators,
-            # TODO Check if size is really required for inpaint
-            width=ctx.width,
-            height=ctx.height,
+            width=width,
+            height=height,
             num_images_per_prompt=ctx.batch,
             **pipe_kwargs
         )
@@ -403,8 +496,9 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
                 'steps': ctx.steps,
                 'guidance_scale': ctx.cfg,
                 'strength': ctx.strength,
-                'width': ctx.width,
-                'height': ctx.height,
+                'width': width,
+                'height': height,
+                **({'long_side': ctx.long_side} if ctx.long_side is not None else {}),
             },
             dt_s=dt_s,
             cuda_mem=mem,

@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
                        StableDiffusionXLImg2ImgPipeline)
@@ -15,61 +15,13 @@ from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
+from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from morphalo.nodes.sdxl_resolve import resolve_common
 from morphalo.nodes.wiring.conditioning import apply_ip_adapter
 from morphalo.nodes.wiring.mixins import ControlNetMixin, PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
-
-
-def _resolve_long_side_size(
-    *,
-    image: Image.Image,
-    long_side: int,
-    multiple: int = 8,
-) -> Tuple[int, int]:
-    """
-    Resolve a proportional output size from an input image.
-
-    The longest side is scaled toward ``long_side`` and then aligned to the
-    specified ``multiple`` and the shorter side is scaled proportionally
-    from the input image aspect ratio.
-
-    Parameters
-    ----------
-    image : PIL.Image.Image
-        Input image.
-    long_side : int
-        Target size for the longest side.
-    multiple : int, default=8
-        Round each resolved dimension down to a multiple of this value.
-
-    Returns
-    -------
-    tuple[int, int]
-        Resolved ``(width, height)``.
-    """
-    if long_side <= 0:
-        raise ValueError(f"'long_side' must be > 0, got {long_side}")
-
-    src_w, src_h = image.size
-
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError(f'invalid input image size {src_w}x{src_h}')
-
-    if src_w >= src_h:
-        width = int(long_side)
-        height = int(round(src_h * (width / src_w)))
-    else:
-        height = int(long_side)
-        width = int(round(src_w * (height / src_h)))
-
-    if multiple > 1:
-        width = max(multiple, (width // multiple) * multiple)
-        height = max(multiple, (height // multiple) * multiple)
-
-    return width, height
 
 
 @dataclass
@@ -304,7 +256,7 @@ class Img2Img(ControlNetMixin, PromptMixin, NodeRef):
         long_side = ctx.long_side
 
         if long_side is not None:
-            width, height = _resolve_long_side_size(
+            width, height = resolve_long_side_size(
                 image=init_image,
                 long_side=long_side,
                 multiple=8,

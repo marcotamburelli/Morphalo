@@ -16,6 +16,7 @@ from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
+from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from morphalo.nodes.sdxl_resolve import resolve_common
@@ -83,57 +84,6 @@ def _first_conditioning_image(
     return None
 
 
-def _resolve_long_side_size(
-    *,
-    image: Image.Image,
-    long_side: int,
-    multiple: int = 8,
-) -> Tuple[int, int]:
-    """
-    Resolve a proportional output size from a reference image.
-
-    The longest side is scaled to ``long_side`` while preserving the reference
-    image aspect ratio. The resulting dimensions are rounded down to a multiple
-    of ``multiple``.
-
-    Parameters
-    ----------
-    image : PIL.Image.Image
-        Reference image used to infer aspect ratio.
-
-    long_side : int
-        Target size for the longest side.
-
-    multiple : int, default=8
-        Alignment multiple for SDXL-compatible dimensions.
-
-    Returns
-    -------
-    tuple[int, int]
-        Resolved ``(width, height)``.
-    """
-    if long_side <= 0:
-        raise ValueError(f"'long_side' must be > 0, got {long_side}")
-
-    src_w, src_h = image.size
-
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError(f'Invalid conditioning image size {src_w}x{src_h}')
-
-    if src_w >= src_h:
-        width = int(long_side)
-        height = int(round(src_h * (width / src_w)))
-    else:
-        height = int(long_side)
-        width = int(round(src_w * (height / src_h)))
-
-    if multiple > 1:
-        width = max(multiple, (width // multiple) * multiple)
-        height = max(multiple, (height // multiple) * multiple)
-
-    return width, height
-
-
 def _resolve_txt2img_size(
     *,
     width: int,
@@ -197,7 +147,7 @@ def _resolve_txt2img_size(
             'T2I-Adapter conditioning image.'
         )
 
-    return _resolve_long_side_size(
+    return resolve_long_side_size(
         image=conditioning_image,
         long_side=int(long_side),
         multiple=multiple,

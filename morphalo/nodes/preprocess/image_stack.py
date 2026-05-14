@@ -11,10 +11,70 @@ from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 
+SizeExpr = int | str
 Pos = Union[Tuple[int, int], str]
 ResizeMode = Tuple[Optional[int | str], Optional[int | str]] \
     | Literal['fit', 'cover'] \
     | None
+CornerDelta = tuple[SizeExpr, SizeExpr] | None
+
+
+@dataclass(frozen=True)
+class CornerOffsets:
+    """
+    Optional per-corner displacement used to warp a layer in local image space.
+
+    Each corner offset is expressed as ``(dx, dy)`` and is applied before layer
+    resizing and placement.
+
+    Offset components support:
+
+    - ``int``:
+        Absolute displacement in pixels.
+    - ``'<number>px'``:
+        Absolute displacement in pixels.
+    - ``'<number>%'``:
+        Percentage displacement relative to the current layer size.
+        Horizontal components are resolved against layer width, vertical
+        components against layer height.
+
+    A ``None`` value means no displacement for that corner.
+    """
+    top_left: CornerDelta = None
+    top_right: CornerDelta = None
+    bottom_right: CornerDelta = None
+    bottom_left: CornerDelta = None
+
+    def resolved(
+        self,
+        *,
+        width: int,
+        height: int,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+        """
+        Resolve all corner offsets to pixel deltas.
+
+        Parameters
+        ----------
+        width : int
+            Current layer width.
+        height : int
+            Current layer height.
+
+        Returns
+        -------
+        tuple[tuple[int, int], tuple[int, int],
+            tuple[int, int], tuple[int, int]]
+            Resolved offsets in clockwise order:
+            ``top_left``, ``top_right``, ``bottom_right``, ``bottom_left``.
+        """
+        return (
+            resolve_corner_delta(self.top_left, width=width, height=height),
+            resolve_corner_delta(self.top_right, width=width, height=height),
+            resolve_corner_delta(
+                self.bottom_right, width=width, height=height),
+            resolve_corner_delta(self.bottom_left, width=width, height=height),
+        )
 
 
 @dataclass(frozen=True)
@@ -23,6 +83,7 @@ class LayerSpec:
     position: Pos = 'center'
     resize: ResizeMode = None
     rotation: float = 0.0
+    corner_offsets: Optional[CornerOffsets] = None
     feather: int | str = 0
     corner_radius: Optional[int | str] = None
 
@@ -158,6 +219,91 @@ def resolve_feather_radius(
 
     # I think that feather, if defined non zero, should always be at least 1
     return max(1, int(round(mean_dim * pct)))
+
+
+def resolve_delta_expr(value: int | str, *, max_size: int) -> int:
+    """
+    Resolve a displacement expression to pixels.
+
+    Parameters
+    ----------
+    value : int or str
+        Displacement expression.
+
+        Supported formats are:
+
+        - ``int``:
+            Absolute displacement in pixels.
+        - ``'<number>px'``:
+            Absolute displacement in pixels.
+        - ``'<number>%'``:
+            Percentage of ``max_size``.
+
+        Negative values are allowed.
+
+    max_size : int
+        Reference size used to resolve percentage expressions.
+
+    Returns
+    -------
+    int
+        Resolved displacement in pixels.
+    """
+    if isinstance(value, int):
+        return value
+
+    if not isinstance(value, str):
+        raise TypeError(
+            f'Invalid delta expression type {type(value).__name__}; '
+            'expected int or str.'
+        )
+
+    s = value.strip().lower()
+
+    if s.endswith('px'):
+        return int(round(float(s[:-2])))
+
+    if s.endswith('%'):
+        return int(round(max_size * float(s[:-1]) / 100.0))
+
+    raise ValueError(
+        f'Invalid delta expression {value!r}. '
+        'Expected int, "<number>px", or "<number>%".'
+    )
+
+
+def resolve_corner_delta(
+    delta: CornerDelta,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    """
+    Resolve an optional corner delta to pixel offsets.
+
+    Parameters
+    ----------
+    delta : tuple[int | str, int | str] or None
+        Optional ``(dx, dy)`` displacement.
+    width : int
+        Current layer width.
+    height : int
+        Current layer height.
+
+    Returns
+    -------
+    tuple[int, int]
+        Resolved ``(dx, dy)`` in pixels.
+    """
+    if delta is None:
+        return 0, 0
+
+    dx, dy = delta
+
+    return (
+        resolve_delta_expr(dx, max_size=width),
+        resolve_delta_expr(dy, max_size=height),
+    )
 
 
 def feather_is_nonzero(feather: int | str) -> bool:
@@ -296,6 +442,100 @@ def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: 
     patch = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     patch.alpha_composite(layer_crop, (ix0, iy0))
     canvas.alpha_composite(patch)
+
+
+def _apply_corner_offsets(
+    img: Image.Image,
+    corner_offsets: Optional[CornerOffsets],
+) -> Image.Image:
+    """
+    Apply a local perspective warp by moving layer corners.
+
+    The transformation is applied in the layer local coordinate space, before
+    rotation, resizing, feathering, and placement.
+
+    Corner offsets are resolved against the current layer size:
+
+    - horizontal deltas use layer width as percentage reference;
+    - vertical deltas use layer height as percentage reference.
+
+    The output canvas is expanded to preserve the full warped content.
+
+    Parameters
+    ----------
+    img : PIL.Image.Image
+        Input layer image. It is expected to be in ``RGBA`` mode.
+    corner_offsets : CornerOffsets or None
+        Optional per-corner displacement. ``None`` leaves the image unchanged.
+
+    Returns
+    -------
+    PIL.Image.Image
+        Perspective-warped layer image in ``RGBA`` mode.
+    """
+    if corner_offsets is None:
+        return img
+
+    import cv2
+    import numpy as np
+
+    w, h = img.size
+
+    offsets = corner_offsets.resolved(width=w, height=h)
+    if all(dx == 0 and dy == 0 for dx, dy in offsets):
+        return img
+
+    # Source rectangle in local layer coordinates.
+    src_pts = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(w - 1), 0.0],
+            [float(w - 1), float(h - 1)],
+            [0.0, float(h - 1)],
+        ],
+        dtype=np.float32,
+    )
+
+    base_dst = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(w - 1), 0.0],
+            [float(w - 1), float(h - 1)],
+            [0.0, float(h - 1)],
+        ],
+        dtype=np.float32,
+    )
+
+    delta = np.asarray(offsets, dtype=np.float32)
+    dst_pts = base_dst + delta
+
+    # Expand local output bounds so moved corners are not clipped.
+    min_x = float(np.floor(dst_pts[:, 0].min()))
+    min_y = float(np.floor(dst_pts[:, 1].min()))
+    max_x = float(np.ceil(dst_pts[:, 0].max()))
+    max_y = float(np.ceil(dst_pts[:, 1].max()))
+
+    out_w = max(1, int(max_x - min_x + 1))
+    out_h = max(1, int(max_y - min_y + 1))
+
+    # Shift destination quad into positive local coordinates.
+    dst_pts[:, 0] -= min_x
+    dst_pts[:, 1] -= min_y
+
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+    src_rgba = np.asarray(img, dtype=np.uint8)
+
+    warped = cv2.warpPerspective(
+        src_rgba,
+        matrix,
+        (out_w, out_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+    return Image.fromarray(warped, mode='RGBA')
 
 
 def _apply_rotation(img: Image.Image, rotation: float) -> Image.Image:
@@ -642,9 +882,13 @@ class ImageLayerAttachmentSink(AttachmentSink):
         If a transform input is present for this layer:
 
         - ``position`` is overridden using ``crop.anchor_xy``.
-        The layer center on the canvas is set to these coordinates.
+          The layer center on the canvas is set to these coordinates.
         - ``resize`` is overridden using ``crop.bbox_size``.
-        The layer is resized to match the crop bounding box dimensions.
+          The layer is resized to match the crop bounding box dimensions.
+
+        Other layer-local transformations remain unchanged. In particular,
+        ``corner_offsets`` and ``rotation`` are still taken from the layer declaration
+        and are applied before the transform-derived resize and placement.
 
         If no transform input is connected, the layer uses the geometry
         specified explicitly via :meth:`image`.
@@ -658,14 +902,15 @@ class ImageLayerAttachmentSink(AttachmentSink):
         Notes
         -----
         - This mechanism enables declarative geometric reconstruction workflows,
-        such as:
+          such as:
             1. Crop a region from an image.
             2. Refine it independently (e.g. via ``Img2Img``).
             3. Reinsert it into a stack using the original position and size.
-        - The transform input overrides only spatial parameters (position and
-          resize).
+        - The transform input overrides only spatial reconstruction parameters
+          (``position`` and ``resize``). It does not override local image
+          transformations such as ``corner_offsets`` or ``rotation``.
         - The transform mechanism assumes that the stack canvas shares the same
-        coordinate reference as the image from which the crop was generated.
+          coordinate reference as the image from which the crop was generated.
         """
 
         return AttachmentSink(
@@ -703,17 +948,21 @@ class ImageStack(NodeRef):
     For each layer, the following pipeline is executed:
 
     1. Load the upstream image and convert it to ``RGBA``.
-    2. Apply optional rotation (``rotation``) around the layer center.
-    3. Apply optional resizing (``resize``) to the rotated layer.
-    4. Optionally soften the layer edges (``feather``).
-    5. Resolve layer placement (``position``) on the canvas.
-    6. Alpha-composite the transformed layer onto the canvas.
+    2. Apply optional local perspective corner offsets (``corner_offsets``).
+    3. Apply optional rotation (``rotation``) around the layer center.
+    4. Apply optional resizing (``resize``) to the transformed layer.
+    5. Optionally soften the layer edges (``feather``).
+    6. Resolve layer placement (``position``) on the canvas.
+    7. Alpha-composite the transformed layer onto the canvas.
 
     This execution order is important:
 
-    - rotation is applied *before* resizing,
-    - therefore ``resize`` refers to the final rotated layer bounding box,
-    not to the original unrotated image size.
+    - ``corner_offsets`` is applied first, in the original local layer coordinate
+      space;
+    - ``rotation`` is applied after the local corner warp;
+    - ``resize`` is applied after both local corner warp and rotation;
+    - therefore ``resize`` refers to the final transformed layer bounding box,
+      not to the original unwarped image size.
 
     Canvas
     ------
@@ -729,19 +978,74 @@ class ImageStack(NodeRef):
     - ``'RGBA'`` → preserve the alpha channel,
     - ``'RGB'`` → drop the alpha channel before saving.
 
+    Corner offsets
+    --------------
+    Each layer may optionally define ``corner_offsets`` to apply a local perspective
+    warp before rotation, resizing, feathering, and placement.
+
+    ``corner_offsets`` is a :class:`CornerOffsets` instance. It contains optional
+    per-corner displacements:
+
+    - ``top_left``
+    - ``top_right``
+    - ``bottom_right``
+    - ``bottom_left``
+
+    Each corner value may be either:
+
+    - ``None``:
+        Do not move that corner.
+    - ``(dx, dy)``:
+        Move that corner by ``dx`` and ``dy`` in local layer coordinates.
+
+    The corner order is clockwise:
+
+    1. top-left
+    2. top-right
+    3. bottom-right
+    4. bottom-left
+
+    Delta components support:
+
+    - ``int``:
+        Absolute displacement in pixels.
+    - ``'<number>px'``:
+        Absolute displacement in pixels.
+    - ``'<number>%'``:
+        Percentage displacement relative to the current layer size.
+
+    For percentage deltas, horizontal components are resolved against the current
+    layer width, while vertical components are resolved against the current layer
+    height.
+
+    Examples:
+
+    - ``CornerOffsets(top_left=(-10, 5))``
+        Move only the top-left corner by ``-10`` pixels horizontally and ``5`` pixels
+        vertically.
+    - ``CornerOffsets(top_right=('5%', '-3%'))``
+        Move only the top-right corner by ``5%`` of layer width and ``-3%`` of layer
+        height.
+    - ``CornerOffsets(top_left=('-4%', '2%'), bottom_right=('3%', '5%'))``
+        Apply a light perspective-like deformation to two opposite corners.
+
+    The local warped canvas is expanded so moved corners are preserved instead of
+    being clipped.
+
     Rotation
     --------
-    Each layer may optionally be rotated before resizing and placement using
-    ``rotation``.
+    Each layer may optionally be rotated after local corner-offset warping and before
+    resizing and placement using ``rotation``.
 
     - ``0.0``:
         No rotation.
     - ``float``:
         Counter-clockwise rotation angle in degrees.
 
-    Rotation is applied around the center of the layer. The rotated canvas is
-    expanded so that the full rotated content is preserved, and newly exposed
-    pixels are filled with transparency.
+    Rotation is applied around the center of the current layer, after any
+    ``corner_offsets`` transformation. The rotated canvas is expanded so that the
+    full rotated content is preserved, and newly exposed pixels are filled with
+    transparency.
 
     Since rotation is applied before resizing, any subsequent ``resize`` operation
     acts on the rotated layer as a whole.
@@ -827,8 +1131,16 @@ class ImageStack(NodeRef):
     - ``position``
     - ``resize``
 
-    It does **not** override ``rotation``. Rotation remains an explicit property
-    of the declared layer and affects only the attached image content.
+    It does **not** override:
+
+    - ``corner_offsets``
+    - ``rotation``
+    - ``feather``
+    - ``corner_radius``
+
+    ``corner_offsets`` and ``rotation`` remain explicit properties of the declared
+    layer and affect only the attached image content before it is resized and
+    reinserted.
 
     If no transform input is provided, the layer uses the geometry declared
     explicitly via :meth:`image`.
@@ -907,6 +1219,7 @@ class ImageStack(NodeRef):
         position='center',
         resize=None,
         rotation=0.0,
+        corner_offsets=None,
         feather=0,
         corner_radius=None,
     )
@@ -928,6 +1241,9 @@ class ImageStack(NodeRef):
             Node identifier.
         ``image`` : str
             Path to the composited output image.
+        ``params.layers`` : list[dict]
+            Per-layer configuration, including ``idx``, ``position``, ``resize``,
+            ``rotation``, ``corner_offsets``, ``feather``, and ``corner_radius``.
         ``metadata`` : str
             Path to the JSON sidecar.
 
@@ -955,6 +1271,7 @@ class ImageStack(NodeRef):
         position: Pos = 'center',
         resize: ResizeMode = None,
         rotation: float = 0.0,
+        corner_offsets: Optional[CornerOffsets] = None,
         feather: int | str = 0,
         corner_radius: Optional[int | str] = None,
     ) -> ImageLayerAttachmentSink:
@@ -1046,6 +1363,42 @@ class ImageStack(NodeRef):
 
             Default: ``0.0``.
 
+        corner_offsets : CornerOffsets or None, optional
+            Optional local perspective corner warp applied before rotation, resizing,
+            feathering, and placement.
+
+            The value is a :class:`CornerOffsets` instance with optional per-corner
+            deltas:
+
+            - ``top_left``
+            - ``top_right``
+            - ``bottom_right``
+            - ``bottom_left``
+
+            Each corner delta may be:
+
+            - ``None`` → no displacement for that corner
+            - ``(dx, dy)`` → move that corner in local layer coordinates
+
+            Delta components may be:
+
+            - ``int`` → absolute displacement in pixels
+            - ``"<number>px"`` → absolute displacement in pixels
+            - ``"<number>%"`` → percentage of the current layer size
+
+            Percentage deltas are resolved before resizing:
+
+            - horizontal deltas use the current layer width
+            - vertical deltas use the current layer height
+
+            The local warped canvas is expanded to preserve moved corners.
+
+            Example:
+
+            ``CornerOffsets(top_left=("-4%", "2%"), top_right=("6%", "-3%"))``
+
+            Default: ``None``.
+
         feather : int or str, optional
             Feathering applied to the layer edges before compositing.
 
@@ -1104,10 +1457,10 @@ class ImageStack(NodeRef):
 
         Notes
         -----
-        - The layer transformation is purely geometric and includes rotation,
-          resizing, and placement.
+        - The layer transformation is purely geometric and includes local corner-offset
+          warping, rotation, resizing, and placement.
         - No automatic color matching, lighting harmonization, or shadow
-        synthesis is performed.
+          synthesis is performed.
         - ``idx`` must be unique; attempting to reuse an index raises an error.
         """
 
@@ -1155,6 +1508,27 @@ class ImageStack(NodeRef):
                 f'{self.id}: rotation must be a finite number, got {rotation!r}'
             )
 
+        if corner_offsets is not None:
+            for name, delta in (
+                ('top_left', corner_offsets.top_left),
+                ('top_right', corner_offsets.top_right),
+                ('bottom_right', corner_offsets.bottom_right),
+                ('bottom_left', corner_offsets.bottom_left),
+            ):
+                if delta is None:
+                    continue
+                if not isinstance(delta, tuple) or len(delta) != 2:
+                    raise ValueError(
+                        f'{self.id}: corner_offsets.{name} must be None or a '
+                        f'(dx, dy) tuple, got {delta!r}'
+                    )
+
+                dx, dy = delta
+
+                # Validate syntax using dummy reference sizes.
+                resolve_delta_expr(dx, max_size=100)
+                resolve_delta_expr(dy, max_size=100)
+
         idx = int(idx)
 
         if idx in self._layers:
@@ -1173,6 +1547,7 @@ class ImageStack(NodeRef):
             position=position,
             resize=resize,
             rotation=rotation,
+            corner_offsets=corner_offsets,
             feather=feather,
             corner_radius=corner_radius,
         )
@@ -1253,6 +1628,7 @@ class ImageStack(NodeRef):
                 position = layer_spec.position
                 resize = layer_spec.resize
 
+            layer = _apply_corner_offsets(layer, layer_spec.corner_offsets)
             layer = _apply_rotation(layer, layer_spec.rotation)
             layer = _apply_resize(
                 layer, resize, cfg.width, cfg.height
@@ -1356,6 +1732,12 @@ class ImageStack(NodeRef):
                         'position': ls.position,
                         'resize': ls.resize,
                         'rotation': ls.rotation,
+                        'corner_offsets': None if ls.corner_offsets is None else {
+                            'top_left': ls.corner_offsets.top_left,
+                            'top_right': ls.corner_offsets.top_right,
+                            'bottom_right': ls.corner_offsets.bottom_right,
+                            'bottom_left': ls.corner_offsets.bottom_left,
+                        },
                         'feather': ls.feather,
                         'corner_radius': ls.corner_radius,
                     }

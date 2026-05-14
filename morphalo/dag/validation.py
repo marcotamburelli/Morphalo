@@ -82,6 +82,80 @@ def validate_dag(dag: DAG) -> None:
     _assert_acyclic(dag)
 
 
+def _find_cycle(
+    node_ids: list[str],
+    out: dict[str, list[str]],
+) -> list[str] | None:
+    """
+    Find one directed cycle in a graph.
+
+    Parameters
+    ----------
+    node_ids : list of str
+        Node identifiers to inspect.
+    out : dict of str to list of str
+        Adjacency list mapping each node to its outgoing neighbors.
+
+    Returns
+    -------
+    list of str or None
+        A concrete cycle path if one exists.
+
+        The returned list repeats the first node as the last element, for example::
+
+            ['a', 'b', 'c', 'a']
+
+        If no cycle is found, returns ``None``.
+
+    Notes
+    -----
+    This function uses DFS node coloring:
+
+    - white / unseen: node has not been visited yet.
+    - gray / visiting: node is currently on the DFS recursion stack.
+    - black / done: node and its descendants have been fully explored.
+
+    An edge pointing to a gray node is a back edge and identifies a cycle.
+    """
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+    stack_index: dict[str, int] = {}
+
+    def visit(node_id: str) -> list[str] | None:
+        visiting.add(node_id)
+        stack_index[node_id] = len(stack)
+        stack.append(node_id)
+
+        for next_id in out.get(node_id, []):
+            if next_id in visited:
+                continue
+
+            if next_id in visiting:
+                i = stack_index[next_id]
+                return stack[i:] + [next_id]
+
+            cycle = visit(next_id)
+            if cycle is not None:
+                return cycle
+
+        stack.pop()
+        stack_index.pop(node_id, None)
+        visiting.remove(node_id)
+        visited.add(node_id)
+
+        return None
+
+    for node_id in node_ids:
+        if node_id not in visited:
+            cycle = visit(node_id)
+            if cycle is not None:
+                return cycle
+
+    return None
+
+
 def _assert_acyclic(dag: DAG) -> None:
     node_ids = [n.id for n in dag.nodes]
 
@@ -104,7 +178,15 @@ def _assert_acyclic(dag: DAG) -> None:
                 q.append(m)
 
     if visited != len(node_ids):
-        cyclic = [nid for nid, d in indeg.items() if d > 0]
+        cycle = _find_cycle(node_ids=node_ids, out=out)
+
+        if cycle is None:
+            cyclic = [nid for nid, d in indeg.items() if d > 0]
+            raise DagValidationError(
+                f'DAG contains a cycle. Remaining cyclic candidates: {cyclic}'
+            )
+
         raise DagValidationError(
-            f'DAG contains a cycle. Nodes involved: {cyclic}'
+            'DAG contains a cycle: '
+            + ' -> '.join(cycle)
         )

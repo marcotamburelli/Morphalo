@@ -422,6 +422,89 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     )
 
 
+def _invert_mask_inside_box(
+    mask: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> np.ndarray:
+    """
+    Invert a mask only inside a prompt bounding box.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Full-frame boolean mask.
+    box : tuple[int, int, int, int]
+        Prompt box ``(x1, y1, x2, y2)``.
+
+    Returns
+    -------
+    np.ndarray
+        Full-frame boolean mask containing the local inversion inside ``box`` and
+        false outside the box.
+    """
+    x1, y1, x2, y2 = box
+
+    inv = ~mask
+    out = np.zeros_like(mask, dtype=bool)
+    out[y1:y2, x1:x2] = inv[y1:y2, x1:x2]
+
+    return out
+
+
+def _pose_positive_points_for_sam(
+    *,
+    pose_xy: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Build positive SAM prompt points from reliable pose landmarks.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        Pose landmarks in full-image coordinates, with invalid points encoded as
+        ``(-1, -1)``.
+    bbox : tuple[int, int, int, int]
+        Prompt bounding box ``(x1, y1, x2, y2)``. Only landmarks inside this box
+        are used.
+
+    Returns
+    -------
+    tuple[np.ndarray | None, np.ndarray | None]
+        ``(point_coords, point_labels)`` suitable for ``SamPredictor.predict``.
+        If no usable landmark is available, returns ``(None, None)`` so the caller
+        can fall back to bbox-only prompting.
+    """
+    x1, y1, x2, y2 = bbox
+
+    landmark_ids = [
+        0,       # nose
+        11, 12,  # shoulders
+        13, 14,  # elbows
+        15, 16,  # wrists
+        23, 24,  # hips
+        25, 26,  # knees
+        27, 28,  # ankles
+    ]
+
+    pts = []
+    for i in landmark_ids:
+        px, py = pose_xy[i]
+        if px < 0 or py < 0:
+            continue
+        if not (x1 <= px < x2 and y1 <= py < y2):
+            continue
+        pts.append([int(px), int(py)])
+
+    if not pts:
+        return None, None
+
+    point_coords = np.asarray(pts, dtype=np.float32)
+    point_labels = np.ones((len(pts),), dtype=np.int32)
+
+    return point_coords, point_labels
+
+
 def _score_sam_mask_with_landmarks(
     mask: np.ndarray,
     pose_xy: np.ndarray,
@@ -540,7 +623,10 @@ class SubjectCrop(NodeRef):
         - Pose landmarks are used to select the bbox that best matches the
         detected body.
         - The bbox may be expanded using ``box_margin``.
-        - SAM segments inside the selected bbox.
+        - SAM segments inside the selected bbox, optionally guided by positive
+          pose-landmark points.
+        - When multiple SAM masks are available, both each mask and its local
+          inverse inside the prompt bbox are scored against pose landmarks.
         - The final crop region corresponds to the selected person bbox.
 
     ``target='face'``
@@ -872,6 +958,8 @@ class SubjectCrop(NodeRef):
     - For ``crop_mode='bbox[w:h]'``, the requested aspect ratio is treated as a
       target, not a hard guarantee. Near the image boundaries the final crop may
       deviate from the requested ratio.
+    - For ``target='person'``, SAM mask polarity is resolved during candidate
+      selection by evaluating both the original SAM mask and its local inverse.
     """
 
     # Either pass a path explicitly, or wire an upstream image into default input.
@@ -1168,8 +1256,19 @@ class SubjectCrop(NodeRef):
 
             box = np.array([bx1, by1, bx2, by2], dtype=np.float32)
 
+            point_coords = None
+            point_labels = None
+
+            if cfg.target == 'person':
+                point_coords, point_labels = _pose_positive_points_for_sam(
+                    pose_xy=pose_xy,
+                    bbox=(bx1, by1, bx2, by2),
+                )
+
             with torch.inference_mode():
                 masks, scores, _ = predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
                     box=box[None, :],
                     multimask_output=bool(cfg.multimask),
                 )
@@ -1178,80 +1277,94 @@ class SubjectCrop(NodeRef):
                 raise RuntimeError(
                     f"SubjectCrop node '{node_id}': SAM returned no masks.")
 
-            # Pick the best mask in a robust way:
-            best_i = 0
+            # Pick the best mask in a robust way.
+            #
+            # For target='person', also evaluate the local inverse of each SAM mask.
+            # This handles cases where SAM returns the local background / complement instead
+            # of the subject.
+            best_mask = None
             best_key = None
 
             for i in range(len(masks)):
-
                 mi = masks[i].astype(bool)
 
                 if cfg.target == 'person':
-
-                    key = _score_sam_mask_with_landmarks(
+                    candidates = [
                         mi,
-                        pose_xy,
-                    )
+                        _invert_mask_inside_box(
+                            mi,
+                            (bx1, by1, bx2, by2),
+                        ),
+                    ]
+
+                    for cand in candidates:
+                        key = _score_sam_mask_with_landmarks(
+                            cand,
+                            pose_xy,
+                        )
+
+                        if best_key is None or key > best_key:
+                            best_key = key
+                            best_mask = cand
 
                 else:
                     frac = float(mi[by1:by2, bx1:bx2].mean())
                     score_i = float(scores[i]) if scores is not None else 0.0
                     key = (score_i, -abs(frac - 0.35))
 
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_i = i
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_mask = mi
 
-            mask = masks[int(best_i)].astype(bool)
+            if best_mask is None:
+                raise RuntimeError(
+                    f"SubjectCrop node '{node_id}': failed to select a SAM mask."
+                )
+
+            mask = best_mask.astype(bool)
 
             # ------------------------------------------------------------------
             # SAM may occasionally return the complementary (background) mask
             # when prompted with a bounding box only. In that case the subject
             # appears as a hole in the mask.
             #
-            # We detect this situation using MediaPipe pose landmarks: the correct
-            # subject mask should contain most valid body landmarks. If fewer than
-            # half of them fall inside the predicted mask, we assume SAM returned
-            # the background instead.
-            #
-            # When flipping the mask we must restrict the inversion to the prompt
-            # bounding box. Outside that region SAM predictions are undefined and
-            # inverting the whole mask would incorrectly mark the entire image as
-            # foreground.
+            # For target='person', this polarity choice is already handled during
+            # candidate selection by scoring both each SAM mask and its local
+            # inverse. Therefore this post-hoc correction is applied only to
+            # non-person targets.
             # ------------------------------------------------------------------
-            valid = (
-                (pose_xy[:, 0] >= 0) &
-                (pose_xy[:, 1] >= 0)
-            )
+            if cfg.target != 'person':
+                valid = (
+                    (pose_xy[:, 0] >= 0) &
+                    (pose_xy[:, 1] >= 0)
+                )
 
-            pts = pose_xy[valid]
+                pts = pose_xy[valid]
 
-            inside = 0
-            for px, py in pts:
-                px = int(px)
-                py = int(py)
+                inside = 0
+                for px, py in pts:
+                    px = int(px)
+                    py = int(py)
 
-                if mask[py, px]:
-                    inside += 1
+                    if mask[py, px]:
+                        inside += 1
 
-            if cfg.target == 'person':
-                min_inside = max(1, int(math.ceil(len(pts) * 0.8)))
-            elif cfg.target == 'head':
-                min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
-            elif cfg.target == 'face':
-                min_inside = 1
-            else:
-                # Hand targets still use the pose-guided subject test here because SAM is
-                # prompted with the person bbox, not with a hand-local bbox.
-                min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
+                if cfg.target == 'head':
+                    min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
+                elif cfg.target == 'face':
+                    min_inside = 1
+                else:
+                    # Hand targets still use the pose-guided subject test here because SAM is
+                    # prompted with the person bbox, not with a hand-local bbox.
+                    min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
 
-            if inside < min_inside:
-                # Invert mask only inside the prompt bbox to avoid turning the entire
-                # background of the image into foreground.
-                inv = ~mask
-                new_mask = np.zeros_like(mask, dtype=bool)
-                new_mask[by1:by2, bx1:bx2] = inv[by1:by2, bx1:bx2]
-                mask = new_mask
+                if inside < min_inside:
+                    # Invert mask only inside the prompt bbox to avoid turning the entire
+                    # background of the image into foreground.
+                    inv = ~mask
+                    new_mask = np.zeros_like(mask, dtype=bool)
+                    new_mask[by1:by2, bx1:bx2] = inv[by1:by2, bx1:bx2]
+                    mask = new_mask
 
             if cfg.target in ('hands', 'left-hand', 'right-hand'):
                 if hand_mask is None:
