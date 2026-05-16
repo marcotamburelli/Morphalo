@@ -402,27 +402,69 @@ def get_yolo(*, model_name: str, device: str) -> YOLOModel:
 
 def get_sam(
     *,
-    checkpoint: str,
-    model_type: str,
+    model_id: str,
     device: str,
-) -> torch.nn.Module:
-    from segment_anything import sam_model_registry
+    dtype: torch.dtype,
+) -> tuple[Any, Any]:
+    def _infer_sam_kind(model_id: str) -> str:
+        model_id_l = model_id.lower()
+
+        if 'sam-hq' in model_id_l or 'sam_hq' in model_id_l:
+            return 'sam_hq'
+
+        # NOTE: At the moment SAM2 is not supported
+        # if 'sam2' in model_id_l or 'sam-2' in model_id_l:
+        #     return 'sam2'
+
+        if '/sam-vit-' in model_id_l or 'sam-vit-' in model_id_l:
+            return 'sam'
+
+        raise ValueError(
+            f'Cannot infer SAM backend from model_id={model_id!r}. '
+            "Expected a SAM, or SAM-HQ Hugging Face model id."
+        )
+
+    sam_kind = _infer_sam_kind(model_id)
 
     key = CacheKey(
-        kind='sam',
-        ref=f'{model_type}:{checkpoint}',
+        kind=f'sam:{sam_kind}',
+        ref=model_id,
         device=device,
-        dtype='na'
+        dtype=str(dtype).replace('torch.', ''),
     )
+
     cached = ModelCache.get(key)
     if cached is not None:
         return cached
 
-    sam = sam_model_registry[model_type](checkpoint=checkpoint)
-    sam.to(device=device)
-    sam.eval()
+    if sam_kind == 'sam':
+        from transformers import SamModel, SamProcessor
+        processor_cls = SamProcessor
+        model_cls = SamModel
 
-    return ModelCache.put(key, sam)
+    # NOTE: At the moment SAM2 is not supported
+    # elif sam_kind == 'sam2':
+    #     from transformers import Sam2Model, Sam2Processor
+    #     processor_cls = Sam2Processor
+    #     model_cls = Sam2Model
+
+    elif sam_kind == 'sam_hq':
+        from transformers import SamHQModel, SamHQProcessor
+        processor_cls = SamHQProcessor
+        model_cls = SamHQModel
+
+    else:
+        raise ValueError(f'Unsupported SAM backend: {sam_kind!r}')
+
+    processor = processor_cls.from_pretrained(model_id)
+    model = model_cls.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    )
+    model.to(device)
+    model.eval()
+
+    return ModelCache.put(key, (processor, model))
 
 
 def get_insightface(

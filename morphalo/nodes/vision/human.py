@@ -669,24 +669,63 @@ def resolve_person_bbox_xyxy(
     pose_fallback_expansion: float = 1.35,
 ) -> tuple[int, int, int, int]:
     """
-    Resolve a person bbox using YOLO first, then MediaPipe Pose fallback.
+    Resolve a person bbox using MediaPipe Pose as the primary consistency source.
 
-    YOLO is preferred when available because it usually estimates the visible
-    person silhouette better. If YOLO fails, pose landmarks are used to infer
-    a coarse bbox.
+    YOLO is used as a candidate detector, but a YOLO bbox is accepted only when
+    it contains all valid MediaPipe pose landmarks. If YOLO fails, or if the
+    selected YOLO bbox is inconsistent with the pose, a fallback bbox is derived
+    directly from MediaPipe landmarks.
+
+    Parameters
+    ----------
+    res : Any
+        Single YOLO prediction result.
+
+    node_id : str
+        Node id used for error messages.
+
+    pose_xy : np.ndarray or None
+        MediaPipe pose landmarks in full-image coordinates.
+
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+
+    pose_fallback_expansion : float, default=1.35
+        Expansion factor used when deriving a bbox directly from pose landmarks.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive bbox ``(x1, y1, x2, y2)``.
     """
-    try:
+    if pose_xy is None:
         person_boxes = person_bboxes_xyxy(res, node_id)
         return select_person_bbox_xyxy(
             person_boxes,
+            pose_xy=None,
+        )
+
+    try:
+        person_boxes = person_bboxes_xyxy(res, node_id)
+        yolo_bbox = select_person_bbox_xyxy(
+            person_boxes,
             pose_xy=pose_xy,
         )
-    except RuntimeError as exc:
-        return person_bbox_xyxy_from_pose(
-            pose_xy,
-            image_shape,
-            expansion=pose_fallback_expansion,
-        )
+
+        if bbox_contains_all_valid_pose_points(
+            yolo_bbox,
+            pose_xy=pose_xy,
+        ):
+            return yolo_bbox
+
+    except RuntimeError:
+        pass
+
+    return person_bbox_xyxy_from_pose(
+        pose_xy,
+        image_shape,
+        expansion=pose_fallback_expansion,
+    )
 
 
 def score_bbox_with_pose(
@@ -762,6 +801,52 @@ def score_bbox_with_pose(
         face_ratio,
         area,
     )
+
+
+def bbox_contains_all_valid_pose_points(
+    bbox_xyxy: tuple[int, int, int, int],
+    *,
+    pose_xy: np.ndarray,
+) -> bool:
+    """
+    Return True if a bbox contains all valid MediaPipe pose landmarks.
+
+    Parameters
+    ----------
+    bbox_xyxy : tuple[int, int, int, int]
+        Candidate bbox in full-image coordinates.
+
+    pose_xy : np.ndarray
+        Pose landmarks with shape ``(33, 2)`` in full-image coordinates.
+        Missing landmarks are encoded as ``(-1, -1)``.
+
+    Returns
+    -------
+    bool
+        True if all valid landmarks fall inside the bbox.
+    """
+    if pose_xy is None:
+        return False
+
+    x1, y1, x2, y2 = bbox_xyxy
+
+    valid = (
+        (pose_xy[:, 0] >= 0) &
+        (pose_xy[:, 1] >= 0)
+    )
+    pts = pose_xy[valid]
+
+    if pts.shape[0] == 0:
+        return False
+
+    inside = (
+        (pts[:, 0] >= x1) &
+        (pts[:, 0] < x2) &
+        (pts[:, 1] >= y1) &
+        (pts[:, 1] < y2)
+    )
+
+    return bool(np.all(inside))
 
 
 def select_person_bbox_xyxy(
@@ -866,12 +951,54 @@ def mp_face_landmarks(
 def face_bbox_xyxy_from_landmarks(
     face_xy: np.ndarray,
     image_shape: tuple[int, ...],
+    *,
+    expansion: float = 1.0,
 ) -> tuple[int, int, int, int]:
     """
-    Compute face bounding box from landmarks.
+    Compute an end-exclusive face bounding box from face landmarks.
+
+    The returned box is derived from the min/max landmark coordinates and can be
+    optionally expanded around its center. This is useful because MediaPipe face
+    landmarks usually describe the visible facial feature region more tightly than
+    the full face silhouette.
+
+    Parameters
+    ----------
+    face_xy : np.ndarray
+        Face landmark coordinates with shape ``(N, 2)`` in image-local pixel
+        coordinates.
+
+    image_shape : tuple[int, ...]
+        Source image shape. Only the first two dimensions are used as ``(H, W)``.
+
+    expansion : float, default=1.0
+        Multiplicative bbox expansion factor.
+
+        - ``1.0`` keeps the landmark-tight bbox.
+        - values greater than ``1.0`` expand the bbox around its center.
+        - values between ``0.0`` and ``1.0`` shrink the bbox, although this is
+          usually not recommended for face crops.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive bounding box ``(x1, y1, x2, y2)`` clipped to image bounds.
+
+    Raises
+    ------
+    RuntimeError
+        If landmarks are malformed or the resulting bbox is invalid.
+
+    ValueError
+        If ``expansion`` is negative.
     """
     if face_xy.ndim != 2 or face_xy.shape[1] != 2:
         raise RuntimeError('Invalid face landmarks.')
+
+    if expansion < 0:
+        raise ValueError(
+            f'Invalid expansion={expansion!r}; expected >= 0.'
+        )
 
     h, w = image_shape[:2]
 
@@ -884,6 +1011,28 @@ def face_bbox_xyxy_from_landmarks(
     y1 = max(0, min(h - 1, y1))
     x2 = max(x1 + 1, min(w, x2))
     y2 = max(y1 + 1, min(h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid face bbox.')
+
+    if expansion != 1.0:
+        bw = x2 - x1
+        bh = y2 - y1
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        bw *= float(expansion)
+        bh *= float(expansion)
+
+        x1 = int(np.floor(cx - bw / 2.0))
+        y1 = int(np.floor(cy - bh / 2.0))
+        x2 = int(np.ceil(cx + bw / 2.0))
+        y2 = int(np.ceil(cy + bh / 2.0))
+
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(x1 + 1, min(w, x2))
+        y2 = max(y1 + 1, min(h, y2))
 
     if x2 <= x1 or y2 <= y1:
         raise RuntimeError('Invalid face bbox.')

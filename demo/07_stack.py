@@ -13,7 +13,8 @@ This is a minimal example of how preprocessing nodes can be chained into a small
 compositing pipeline inside the DAG:
 
 - ``FileImage`` provides the input assets
-- ``SubjectCrop`` isolates the person from the source image
+- ``SubjectCrop`` isolates the person from the source image using landmarks and
+  a SAM/SAM-HQ segmentation backend
 - ``ImageStack`` places multiple image layers on a shared canvas
 
 The resulting workflow is useful as a starting point for:
@@ -65,13 +66,15 @@ BK_IMG = '~/images/bk_img.png'
 # Shared model assets used by SubjectCrop.
 #
 # Notes:
-# - SAM is used to obtain a clean person mask/cutout.
-# - MediaPipe face / pose models are kept here for consistency with the crop
-#   stack, even though this demo only targets `person`.
+# - sam_model selects the SAM/SAM-HQ backend used for person segmentation.
+# - YOLO proposes person boxes. If omitted, SubjectCrop uses its default YOLO
+#   model.
+# - MediaPipe Pose landmarks stabilize subject-box selection and provide
+#   positive prompt points for person-mask candidates.
 #
 MODEL_SPEC = {
-    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
-    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+    'sam_model': 'facebook/sam-vit-large',
+    'yolo_model': 'yolov8n.pt',
     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
 }
 
@@ -81,20 +84,15 @@ MODEL_SPEC = {
 #     emit a cropped RGBA image.
 #
 # `crop_mode='trim'`:
-#     trim the output to the extracted subject region instead of keeping a
-#     larger full-frame canvas.
+#     return a tight RGBA cutout trimmed to the non-transparent subject mask.
 #
 # `box_margin`:
 #     small margin applied around the initial detected subject box.
-#
-# `expansion`:
-#     enlarges the effective crop region before final trimming.
 #
 COMMON_PARAMS = {
     'mode': 'default',
     'crop_mode': 'trim',
     'box_margin': 0.12,
-    'expansion': 1.2,
 }
 
 
@@ -163,8 +161,8 @@ with DAG(
     # `position='center-bottom'` anchors the subject near the lower center of
     # the composition, which is a common placement for full-body characters.
     #
-    # `resize='fit'` preserves aspect ratio and scales the subject to fit the
-    # available stacking logic without distortion.
+    # `resize='fit'` preserves aspect ratio while fitting the subject inside the
+    # stack canvas.
     #
     # `feather='5px'` applies a small edge softening to reduce visible cutout
     # boundaries against the new background.

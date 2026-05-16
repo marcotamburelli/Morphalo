@@ -69,7 +69,6 @@ def cutout_stack_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
@@ -184,7 +183,6 @@ def cutout_stack_canny_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
@@ -318,7 +316,6 @@ def cutout_stack_depth_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
@@ -448,7 +445,6 @@ def cutout_stack_pose_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
@@ -619,7 +615,6 @@ def cutout_stack_ip_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {
@@ -779,7 +774,6 @@ def cutout_stack_depth_ip_img2img_group(
             name='cutout',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
                 'params': {

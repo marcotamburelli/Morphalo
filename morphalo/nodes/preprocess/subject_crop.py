@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
 
 import numpy as np
+import torch
 from PIL import Image
 
 from morphalo.cache.models import (get_mediapipe_face_landmarker,
@@ -13,7 +14,8 @@ from morphalo.cache.models import (get_mediapipe_face_landmarker,
                                    get_yolo)
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
-from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
+                                                  resolve_spec)
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import postprocess_mask
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
@@ -55,6 +57,18 @@ class CropModeSpec:
     mode: CropModeName
     ratio: Optional[tuple[int, int]] = None
     raw: str = 'trim'
+
+
+# Internal geometry constants.
+#
+# HEAD_AREA_EXPANSION defines how generously the pose-derived head area is cropped
+# before running the Face Landmarker.
+#
+# FACE_BBOX_EXPANSION compensates for the fact that MediaPipe face landmarks tend
+# to describe the internal facial feature region more tightly than the desired
+# visible face crop.
+FACE_BBOX_EXPANSION = 1.15
+HEAD_AREA_EXPANSION = 1.6
 
 
 def _tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
@@ -287,14 +301,13 @@ def _expand_bbox_toward_ratio(
 @dataclass
 class Config:
     device: str
+    dtype: torch.dtype
     yolo_model: Optional[str]
-    sam_checkpoint: Optional[str]
-    sam_model_type: Optional[str]
+    sam_model: Optional[str]
     mode: str
     crop_mode: Optional[CropModeSpec]
     conf: float
     box_margin: float
-    multimask: bool
     save_debug: bool
     dilate_radius: int
     close_radius: int
@@ -311,9 +324,8 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     params = spec.get('params', {})
     debug = spec.get('debug', {})
 
-    device = model.get('device', 'cuda')
-
-    sam_model_type = model.get('sam_model_type')
+    device = str(model.get('device', 'cuda'))
+    dtype = resolve_dtype(str(model.get('dtype', 'bf16')))
 
     mode = str(params.get('mode', 'default'))
     if mode not in ('default', 'mask', 'negative-mask'):
@@ -330,7 +342,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     conf = float(params.get('conf', 0.35))
     box_margin = float(params.get('box_margin', 0.12))
-    multimask = bool(params.get('multimask', True))
 
     dilate_radius = int(params.get('dilate_radius', 0))
     close_radius = int(params.get('close_radius', 0))
@@ -355,11 +366,9 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     needs_sam = target not in ('eyes', 'left-eye', 'right-eye')
 
-    sam_checkpoint = model.get('sam_checkpoint')
-    if needs_sam and not sam_checkpoint:
-        raise ValueError(
-            f"'{node_id}': target={target!r} requires 'model.sam_checkpoint'."
-        )
+    sam_model = None
+    if needs_sam:
+        sam_model = str(model.get('sam_model', 'facebook/sam-vit-large'))
 
     expansion = float(params.get('expansion', 1.0))
     if expansion < 0:
@@ -384,7 +393,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
 
     if target in ('face', 'head', 'eyes', 'left-eye', 'right-eye'):
-        # MediaPipe is used for face/head
+        # Face landmarks are required for face, head, and eye targets.
         face_landmarker_task = model.get('face_landmarker_task')
         if not face_landmarker_task:
             raise ValueError(
@@ -402,14 +411,13 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     return Config(
         device=device,
+        dtype=dtype,
         yolo_model=yolo_model,
-        sam_checkpoint=None if sam_checkpoint is None else str(sam_checkpoint),
-        sam_model_type=None if sam_model_type is None else str(sam_model_type),
+        sam_model=sam_model,
         mode=mode,
         crop_mode=crop_mode,
         conf=conf,
         box_margin=box_margin,
-        multimask=multimask,
         save_debug=save_debug,
         dilate_radius=dilate_radius,
         close_radius=close_radius,
@@ -451,117 +459,428 @@ def _invert_mask_inside_box(
     return out
 
 
-def _pose_positive_points_for_sam(
+def _positive_points_for_sam(
     *,
-    pose_xy: np.ndarray,
+    xy: np.ndarray,
     bbox: tuple[int, int, int, int],
-) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    max_points: Optional[int] = None,
+) -> tuple[Optional[list[list[float]]], Optional[list[int]]]:
     """
-    Build positive SAM prompt points from reliable pose landmarks.
+    Build positive SAM prompt points from valid landmarks inside a bbox.
 
     Parameters
     ----------
-    pose_xy : np.ndarray
-        Pose landmarks in full-image coordinates, with invalid points encoded as
-        ``(-1, -1)``.
+    xy : np.ndarray
+        Landmark coordinates in full-image coordinates, with invalid points encoded
+        as ``(-1, -1)``.
+
+        The array is expected to have shape ``(N, 2)`` or to expose ``x`` and ``y``
+        coordinates in its first two columns.
+
     bbox : tuple[int, int, int, int]
-        Prompt bounding box ``(x1, y1, x2, y2)``. Only landmarks inside this box
-        are used.
+        Prompt bounding box ``(x1, y1, x2, y2)`` in full-image coordinates.
+        Only landmarks inside this box are used.
+
+    max_points : int | None, optional
+        Maximum number of positive points to return. If provided, points are
+        uniformly sampled from the valid landmark sequence. This is useful for dense
+        landmark sets, such as face landmarks, where passing every point may
+        over-constrain the segmentation.
 
     Returns
     -------
-    tuple[np.ndarray | None, np.ndarray | None]
-        ``(point_coords, point_labels)`` suitable for ``SamPredictor.predict``.
-        If no usable landmark is available, returns ``(None, None)`` so the caller
-        can fall back to bbox-only prompting.
+    tuple[list[list[float]] | None, list[int] | None]
+        ``(input_points, input_labels)`` suitable for Hugging Face SAM-compatible
+        processors.
+
+        All labels are positive labels encoded as ``1``. If no usable landmark is
+        available, returns ``(None, None)`` so the caller can fall back to bbox-only
+        prompting.
     """
     x1, y1, x2, y2 = bbox
 
-    landmark_ids = [
-        0,       # nose
-        11, 12,  # shoulders
-        13, 14,  # elbows
-        15, 16,  # wrists
-        23, 24,  # hips
-        25, 26,  # knees
-        27, 28,  # ankles
-    ]
+    points: list[list[float]] = []
 
-    pts = []
-    for i in landmark_ids:
-        px, py = pose_xy[i]
+    for px, py in xy[:, :2]:
         if px < 0 or py < 0:
             continue
+
         if not (x1 <= px < x2 and y1 <= py < y2):
             continue
-        pts.append([int(px), int(py)])
 
-    if not pts:
+        points.append([float(px), float(py)])
+
+    if not points:
         return None, None
 
-    point_coords = np.asarray(pts, dtype=np.float32)
-    point_labels = np.ones((len(pts),), dtype=np.int32)
+    if max_points is not None and max_points <= 0:
+        raise ValueError(f'max_points must be > 0, got {max_points!r}.')
 
-    return point_coords, point_labels
+    if max_points is not None and len(points) > max_points:
+        idxs = np.linspace(
+            0,
+            len(points) - 1,
+            num=int(max_points),
+            dtype=np.int64,
+        )
+        points = [points[int(i)] for i in idxs]
+
+    labels = [1] * len(points)
+
+    return points, labels
 
 
-def _score_sam_mask_with_landmarks(
-    mask: np.ndarray,
-    pose_xy: np.ndarray,
-) -> tuple[int, int]:
+def _predict_sam_mask(
+    *,
+    img_rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    processor: Any,
+    model: Any,
+    device: str,
+    point_coords: Optional[list[list[float]]] = None,
+    point_labels: Optional[list[int]] = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Score a SAM mask using pose landmarks.
+    Predict SAM mask candidates from one bbox and optional positive points.
+
+    This helper targets the Hugging Face SAM / SAM-HQ processor API, where mask
+    post-processing requires both ``original_sizes`` and
+    ``reshaped_input_sizes``. SAM2-style processors are intentionally not handled
+    here.
+
+    Parameters
+    ----------
+    img_rgb : np.ndarray
+        RGB source image with shape ``(H, W, 3)``.
+
+    bbox : tuple[int, int, int, int]
+        Prompt bbox ``(x1, y1, x2, y2)`` in full-image coordinates.
+
+    processor : Any
+        Hugging Face SAM-compatible processor.
+
+    model : Any
+        Hugging Face SAM-compatible model.
+
+    device : str
+        Runtime device.
+
+    point_coords : list[list[float]] | None, optional
+        Optional positive prompt points in full-image coordinates.
+
+    point_labels : list[int] | None, optional
+        Optional point labels. Positive labels are encoded as ``1``.
 
     Returns
     -------
-    tuple[int, int]
-        (num_landmarks_inside, negative_area)
-
-        Higher is better.
+    tuple[np.ndarray, np.ndarray]
+        ``(masks, scores)`` where ``masks`` has shape ``(N, H, W)`` and dtype
+        ``bool``, and ``scores`` has shape ``(N,)``.
     """
+    image = Image.fromarray(np.ascontiguousarray(img_rgb))
 
-    h, w = mask.shape
+    x1, y1, x2, y2 = bbox
 
-    valid = (
-        (pose_xy[:, 0] >= 0) &
-        (pose_xy[:, 1] >= 0)
+    kwargs: dict[str, Any] = {
+        'images': image,
+        'input_boxes': [[[float(x1), float(y1), float(x2), float(y2)]]],
+        'return_tensors': 'pt',
+    }
+
+    if point_coords is not None and point_labels is not None:
+        kwargs['input_points'] = [[point_coords]]
+        kwargs['input_labels'] = [[point_labels]]
+
+    inputs = processor(**kwargs)
+
+    model_dtype = next(model.parameters()).dtype
+
+    inputs = {
+        key: (
+            value.to(device=device, dtype=model_dtype)
+            if torch.is_tensor(value) and torch.is_floating_point(value)
+            else value.to(device=device)
+            if torch.is_tensor(value)
+            else value
+        )
+        for key, value in inputs.items()
+    }
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+
+    masks_t = processor.image_processor.post_process_masks(
+        outputs.pred_masks.detach().float().cpu(),
+        inputs['original_sizes'].detach().cpu(),
+        inputs['reshaped_input_sizes'].detach().cpu(),
+    )[0]
+
+    masks_np = masks_t.numpy()
+
+    if masks_np.ndim == 4:
+        masks_np = masks_np[0]
+    elif masks_np.ndim != 3:
+        raise RuntimeError(f'Unexpected SAM mask shape: {masks_np.shape!r}')
+
+    scores_np = (
+        outputs.iou_scores
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+        .reshape(-1)
     )
 
-    pts = pose_xy[valid]
-
-    inside = 0
-    for px, py in pts:
-        px = int(px)
-        py = int(py)
-
-        if 0 <= px < w and 0 <= py < h and mask[py, px]:
-            inside += 1
-
-    area = int(mask.sum())
-
-    return (inside, -area)
+    return masks_np.astype(bool), scores_np.astype(np.float32)
 
 
-def _infer_sam_model_type(ckpt: Path, sam_model_type: Optional[str]) -> str:
-    if sam_model_type:
-        return sam_model_type
+@dataclass(frozen=True)
+class SamMaskCandidate:
+    """
+    SAM mask candidate with metadata used by person-mask selection.
 
-    name = ckpt.name.lower()
+    Parameters
+    ----------
+    mask : np.ndarray
+        Full-frame boolean candidate mask.
 
-    if 'vit_h' in name:
-        return 'vit_h'
-    if 'vit_l' in name:
-        return 'vit_l'
-    if 'vit_b' in name:
-        return 'vit_b'
+    sam_score : float
+        SAM predicted-IoU score associated with the raw mask.
 
-    return 'vit_h'
+    source : str
+        Prompt strategy that produced the raw mask. Expected values are
+        ``'strict'`` and ``'complete'``.
+
+    inverted : bool, default=False
+        Whether this candidate is the local inverse of the raw SAM mask.
+    """
+    mask: np.ndarray
+    sam_score: float
+    source: str
+    inverted: bool = False
+
+
+def _build_person_sam_candidates(
+    *,
+    img_rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    pose_xy: np.ndarray,
+    processor: Any,
+    model: Any,
+    device: str,
+) -> list[SamMaskCandidate]:
+    """
+    Build person SAM candidates using strict and complete prompting.
+
+    This helper is used only for ``target='person'`` and intentionally combines
+    two prompt strategies:
+
+    strict
+        Uses the resolved person bbox together with positive pose landmarks.
+        This tends to produce cleaner, more subject-specific masks, but may miss
+        weakly supported silhouette regions.
+
+    complete
+        Uses the resolved person bbox only. This may preserve a fuller
+        silhouette, but is more likely to attach nearby background fragments or
+        ambiguous objects.
+
+    For each raw SAM mask, the local inverse inside the prompt bbox is also
+    added as a candidate. The inverse candidate keeps the same SAM score because
+    it is derived from the same raw prediction, but it is marked with
+    ``inverted=True`` so the selector can prefer non-inverted candidates when
+    all stronger criteria are tied.
+
+    Returns
+    -------
+    list[SamMaskCandidate]
+        Full-frame boolean candidate masks with selection metadata.
+    """
+    candidates: list[SamMaskCandidate] = []
+
+    point_coords, point_labels = _positive_points_for_sam(
+        xy=pose_xy,
+        bbox=bbox,
+    )
+
+    prompt_runs = [
+        ('strict', point_coords, point_labels),
+        ('complete', None, None),
+    ]
+
+    for source, run_point_coords, run_point_labels in prompt_runs:
+        masks, scores = _predict_sam_mask(
+            img_rgb=img_rgb,
+            bbox=bbox,
+            processor=processor,
+            model=model,
+            device=device,
+            point_coords=run_point_coords,
+            point_labels=run_point_labels,
+        )
+
+        for i, mask in enumerate(masks):
+            mi = mask.astype(bool)
+            score_i = float(scores[i]) if i < len(scores) else 0.0
+
+            candidates.append(SamMaskCandidate(
+                mask=mi,
+                sam_score=score_i,
+                source=source,
+                inverted=False,
+            ))
+
+            candidates.append(SamMaskCandidate(
+                mask=_invert_mask_inside_box(mi, bbox),
+                sam_score=score_i,
+                source=source,
+                inverted=True,
+            ))
+
+    return candidates
+
+
+def _quantize_score(value: float, *, bins: int = 10) -> int:
+    """
+    Quantize a normalized score into an integer bucket.
+
+    Quantization prevents tiny score differences from dominating later
+    tie-breakers such as area preference or prompt source.
+
+    Parameters
+    ----------
+    value : float
+        Score expected in ``[0, 1]``. Values outside the range are clipped.
+
+    bins : int, default=10
+        Number of score intervals. The returned bucket is in ``[0, bins]``.
+
+    Returns
+    -------
+    int
+        Quantized score bucket.
+    """
+    clipped = min(1.0, max(0.0, float(value)))
+    return int(round(clipped * float(bins)))
+
+
+def _select_best_person_sam_mask(
+    candidates: list[SamMaskCandidate],
+    *,
+    bbox: tuple[int, int, int, int],
+    target_norm_area: float = 0.25,
+) -> np.ndarray:
+    """
+    Select the best person mask among SAM candidates.
+
+    The selector assumes that candidates may come from different prompt
+    strategies, typically:
+
+    - ``strict``: bbox + pose landmarks;
+    - ``complete``: bbox only.
+
+    Selection criteria, in order
+    ----------------------------
+    1. Quantized SAM predicted-IoU score.
+    2. Distance from the preferred normalized candidate area.
+    3. Non-inverted candidates.
+    4. Strict prompt candidates.
+
+    Candidate area normalization
+    ----------------------------
+    Candidate areas are measured inside the SAM prompt bbox and normalized
+    relative to the available candidate set:
+
+    - smallest candidate area -> 0.0
+    - largest candidate area -> 1.0
+
+    The default ``target_norm_area=0.25`` intentionally favors conservative
+    person masks while still allowing candidates larger than the smallest one.
+    This reduces the risk of attaching external background fragments while
+    keeping a chance to recover more complete silhouettes when SAM provides a
+    good intermediate candidate.
+
+    Parameters
+    ----------
+    candidates : list[SamMaskCandidate]
+        Candidate masks and metadata.
+
+    bbox : tuple[int, int, int, int]
+        SAM prompt bbox ``(x1, y1, x2, y2)``.
+
+    target_norm_area : float, default=0.25
+        Preferred normalized candidate area. ``0.0`` favors the smallest
+        candidate, ``1.0`` favors the largest candidate, and intermediate values
+        favor masks between the two extremes.
+
+    Returns
+    -------
+    np.ndarray
+        Selected full-frame boolean mask.
+
+    Raises
+    ------
+    RuntimeError
+        If no candidates are available or selection fails.
+
+    ValueError
+        If ``target_norm_area`` is outside ``[0, 1]``.
+    """
+    if not candidates:
+        raise RuntimeError(
+            'Cannot select best person SAM mask: no candidates.'
+        )
+
+    if not (0.0 <= float(target_norm_area) <= 1.0):
+        raise ValueError(
+            f'target_norm_area must be in [0, 1], got {target_norm_area!r}.'
+        )
+
+    x1, y1, x2, y2 = bbox
+
+    measured: list[tuple[SamMaskCandidate, int]] = []
+    for candidate in candidates:
+        area = int(candidate.mask[y1:y2, x1:x2].sum())
+        measured.append((candidate, area))
+
+    areas = np.asarray(
+        [area for _, area in measured],
+        dtype=np.float32,
+    )
+
+    min_area = float(np.min(areas))
+    max_area = float(np.max(areas))
+    area_span = max(1.0, max_area - min_area)
+
+    best_candidate = None
+    best_key = None
+
+    for candidate, area in measured:
+        norm_area = (float(area) - min_area) / area_span
+        area_distance = abs(norm_area - float(target_norm_area))
+
+        key = (
+            _quantize_score(candidate.sam_score, bins=10),
+            -float(area_distance),
+            not candidate.inverted,
+            candidate.source == 'strict',
+        )
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best_candidate = candidate
+
+    if best_candidate is None:
+        raise RuntimeError('Failed to select best person SAM mask.')
+
+    return best_candidate.mask
 
 
 @dataclass
 class SubjectCrop(NodeRef):
     """
-    Subject-aware crop and inpaint-mask generator using YOLO, MediaPipe, and SAM.
+    Subject-aware crop and inpaint-mask generator using MediaPipe, YOLO, and
+    SAM/SAM-HQ segmentation.
 
     ``SubjectCrop`` detects a region of interest
     (``person``, ``face``, ``head``, ``eyes``, ``left-eye``, ``right-eye``,
@@ -595,55 +914,86 @@ class SubjectCrop(NodeRef):
       and estimating the head region.
 
     - YOLO (COCO class 0) proposes candidate person bounding boxes when
-    ``target`` is ``'person'``, ``'head'``, ``'hands'``,
-    ``'left-hand'``, or ``'right-hand'``.
+      ``target`` is ``'person'``, ``'head'``, ``'hands'``,
+      ``'left-hand'``, or ``'right-hand'``.
 
-    - Pose landmarks are used to select the most plausible person bounding
-    box among YOLO detections.
+    - Pose landmarks are used as the primary anatomical consistency signal.
+      YOLO proposes candidate person boxes, but the selected YOLO box is accepted
+      only when it is consistent with the valid pose landmarks; otherwise a
+      pose-derived person bbox is used.
 
     - A coarse *head area* is derived from the pose landmarks. This region
-    approximates the subject head location and is used to improve the
-    robustness of face and eye detection when the face is small relative
-    to the full image.
+      approximates the subject head location and is used to improve the
+      robustness of face and eye detection when the face is small relative
+      to the full image.
 
     - MediaPipe Face Landmarker is executed inside the head area to obtain
-    accurate face or eye landmarks.
+      accurate face or eye landmarks.
 
     - MediaPipe Hand Landmarker is executed on the full image for hand targets
-    and is used to derive hand-local bounding boxes and landmark-based masks.
+      and is used to derive hand-local bounding boxes and landmark-based masks.
 
-    - Segment Anything (SAM) is used to produce segmentation masks when
-    needed. For hand targets, SAM is guided by the selected person bbox,
-    then intersected with a landmark-derived hand mask to keep only the
-    hand-local portion of the subject mask.
+    - A SAM-compatible segmentation model, loaded through Hugging Face
+      Transformers, is used to produce segmentation masks when needed. The
+      default model is ``facebook/sam-vit-large``.
+
+      For ``target='person'``, the node evaluates both bbox+pose-landmark
+      prompting and bbox-only prompting, then selects a conservative candidate
+      from the combined set.
+
+      For ``target='face'``, SAM is guided by an expanded face bbox and a sparse
+      subset of positive face landmarks.
+
+      For hand targets, SAM is guided by the selected person bbox and positive
+      pose landmarks, then intersected with a landmark-derived hand mask to keep
+      only the hand-local portion of the subject mask.
+
+      For ``target='head'``, SAM intentionally uses bbox-only prompting to avoid
+      over-constraining the mask to the inner facial landmark region.
 
     ``target='person'``
         - MediaPipe Pose landmarks are computed for the full image.
         - YOLO proposes candidate person bounding boxes.
-        - Pose landmarks are used to select the bbox that best matches the
-        detected body.
+        - The best YOLO bbox is selected using pose-landmark alignment.
+        - The selected YOLO bbox is accepted only if it contains all valid pose
+          landmarks. Otherwise, a fallback bbox is inferred directly from the
+          pose landmarks.
         - The bbox may be expanded using ``box_margin``.
-        - SAM segments inside the selected bbox, optionally guided by positive
-          pose-landmark points.
-        - When multiple SAM masks are available, both each mask and its local
-          inverse inside the prompt bbox are scored against pose landmarks.
-        - The final crop region corresponds to the selected person bbox.
+        - SAM is evaluated with two prompt strategies:
+
+          1. bbox + positive pose landmarks;
+          2. bbox only.
+
+        - The bbox+landmark strategy usually produces cleaner, more
+          subject-specific masks, but may miss weak silhouette regions.
+        - The bbox-only strategy may preserve a fuller silhouette, but can attach
+          nearby background fragments or ambiguous objects.
+        - For every raw SAM mask, the local inverse inside the prompt bbox is also
+          added as a candidate to handle occasional polarity mistakes.
+        - Candidate selection uses quantized SAM predicted-IoU score first, then
+          prefers a conservative normalized bbox-local area.
+        - The final crop region corresponds to the resolved person bbox.
 
     ``target='face'``
         - MediaPipe Pose landmarks are used to estimate a coarse head area.
         - MediaPipe Face Landmarker runs inside this head area.
-        - The largest detected face bbox is remapped to full-image coordinates.
-        - SAM segments using the face bbox.
+        - A landmark-derived face bbox is computed and expanded internally by
+          ``FACE_BBOX_EXPANSION`` to avoid overly tight face crops.
+        - Face landmarks are remapped to full-image coordinates.
+        - SAM segments using the expanded face bbox and a sparse subset of
+          positive face-landmark points.
+        - The final crop region corresponds to the expanded face bbox.
 
     ``target='head'``
         - MediaPipe Pose landmarks are computed.
         - YOLO proposes person bounding boxes.
-        - Pose landmarks select the most plausible person bbox.
+        - The selected YOLO bbox is accepted only if it is consistent with the
+          pose landmarks; otherwise, a pose-derived person bbox is used.
         - A head area is derived from pose landmarks.
         - Face landmarks are detected within the head area.
         - A square head crop box is computed from the face bbox using
-        ``expansion`` and an upward bias to preserve hair.
-        - SAM segmentation is still guided by the person bbox for robustness,
+          ``expansion`` and an upward bias to preserve hair.
+        - SAM segmentation is guided by the resolved person bbox for robustness,
           while the crop region corresponds to the derived head box.
 
     ``target='eyes'``
@@ -673,19 +1023,21 @@ class SubjectCrop(NodeRef):
     ``target='hands'``
         - MediaPipe Pose landmarks are computed.
         - YOLO proposes person bounding boxes.
-        - Pose landmarks select the most plausible person bbox.
+        - The selected YOLO bbox is accepted only if it is consistent with the
+          MediaPipe pose landmarks; otherwise, a pose-derived person bbox is used.
         - MediaPipe Hand Landmarker detects reliable hands in the full image.
         - Expanded hand bounding boxes are merged into a single crop box.
         - A landmark-derived hand mask is constructed for all selected hands.
-        - SAM segmentation is guided by the selected person bbox for robustness.
+        - SAM segmentation is guided by the resolved person bbox for robustness.
         - The final mask is the intersection of the SAM subject mask and the
-        landmark-derived hand mask.
+          landmark-derived hand mask.
         - The final crop region isolates one or more visible hands.
 
     ``target='left-hand'``
         - MediaPipe Pose landmarks are computed.
         - YOLO proposes person bounding boxes.
-        - Pose landmarks select the most plausible person bbox.
+        - The selected YOLO bbox is accepted only if it is consistent with the
+          MediaPipe pose landmarks; otherwise, a pose-derived person bbox is used.
         - MediaPipe Hand Landmarker detects reliable hands in the full image.
         - The hand on the left side of the image is selected.
         - MediaPipe handedness labels are mapped internally because they follow
@@ -693,7 +1045,7 @@ class SubjectCrop(NodeRef):
         - A hand-local bbox is computed from landmarks and optionally expanded via
           ``expansion``.
         - A landmark-derived hand mask is constructed for the selected hand.
-        - SAM segmentation is guided by the selected person bbox for robustness.
+        - SAM segmentation is guided by the resolved person bbox for robustness.
         - The final mask is the intersection of the SAM subject mask and the
           landmark-derived hand mask.
         - The final crop region isolates only the left hand in image/viewer
@@ -702,7 +1054,8 @@ class SubjectCrop(NodeRef):
     ``target='right-hand'``
         - MediaPipe Pose landmarks are computed.
         - YOLO proposes person bounding boxes.
-        - Pose landmarks select the most plausible person bbox.
+        - The selected YOLO bbox is accepted only if it is consistent with the
+          MediaPipe pose landmarks; otherwise, a pose-derived person bbox is used.
         - MediaPipe Hand Landmarker detects reliable hands in the full image.
         - The hand on the right side of the image is selected.
         - MediaPipe handedness labels are mapped internally because they follow
@@ -710,7 +1063,7 @@ class SubjectCrop(NodeRef):
         - A hand-local bbox is computed from landmarks and optionally expanded via
           ``expansion``.
         - A landmark-derived hand mask is constructed for the selected hand.
-        - SAM segmentation is guided by the selected person bbox for robustness.
+        - SAM segmentation is guided by the resolved person bbox for robustness.
         - The final mask is the intersection of the SAM subject mask and the
           landmark-derived hand mask.
         - The final crop region isolates only the right hand in image/viewer
@@ -743,26 +1096,49 @@ class SubjectCrop(NodeRef):
         Expected structure:
 
         ``model`` : dict
-            ``sam_checkpoint`` : str
-                Path to the SAM checkpoint. Required.
-            ``sam_model_type`` : {'vit_h', 'vit_l', 'vit_b'}, optional
-                SAM backbone type. If omitted, inferred from the checkpoint
-                filename.
             ``device`` : str, optional
                 Inference device (e.g. ``'cuda'``, ``'cuda:0'``, ``'cpu'``).
                 Default: ``'cuda'``.
+
+            ``dtype`` : str, optional
+                Torch dtype used to load the SAM-compatible segmentation model.
+                Supported values follow ``resolve_dtype`` conventions,
+                e.g. ``'bf16'``, ``'float16'``, ``'float32'``. Default: ``'bf16'``.
+
+            ``sam_model`` : str, optional
+                Hugging Face SAM-compatible model identifier used for mask
+                generation. Default: ``'facebook/sam-vit-large'``.
+
+                Currently this node is intended for still-image SAM/SAM-HQ style
+                backends loaded by ``get_sam(...)``. Typical values include:
+
+                - ``'facebook/sam-vit-base'``
+                - ``'facebook/sam-vit-large'``
+                - ``'facebook/sam-vit-huge'``
+                - ``'syscv-community/sam-hq-vit-base'``
+                - ``'syscv-community/sam-hq-vit-large'``
+                - ``'syscv-community/sam-hq-vit-huge'``
+
+                Required for all targets except ``'eyes'``, ``'left-eye'`` and
+                ``'right-eye'``, which use landmark-derived masks and skip SAM.
+
             ``yolo_model`` : str, optional
-                YOLO weights. Required for ``target='person'``,
-                ``target='head'``, ``target='hands'``,
-                ``target='left-hand'``, and ``target='right-hand'``.
+                YOLO weights used to propose person boxes for ``target='person'``,
+                ``target='head'``, ``target='hands'``, ``target='left-hand'``,
+                and ``target='right-hand'``. YOLO boxes are accepted only when
+                they are consistent with MediaPipe pose landmarks; otherwise the
+                node falls back to a pose-derived person bbox.
+
             ``face_landmarker_task`` : str, optional
                 MediaPipe FaceLandmarker ``.task`` path. Required for
                 ``target='face'``, ``target='eyes'``, ``target='left-eye'``,
                 ``target='right-eye'`` and ``target='head'``.
+
             ``pose_landmarker_task`` : str
                 MediaPipe PoseLandmarker ``.task`` path.
                 This model is required because pose landmarks are used to derive
                 head regions and to select the correct person bbox.
+
             ``hand_landmarker_task`` : str, optional
                 MediaPipe HandLandmarker ``.task`` path. Required for
                 ``target='hands'``, ``target='left-hand'``, and
@@ -817,14 +1193,16 @@ class SubjectCrop(NodeRef):
                 Typical range: 0.2-0.6. Default: 0.35.
 
             ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the selected bounding box before
-                SAM, expressed as a fraction of bbox size.
-                Typical range: 0.05-0.20. Default: 0.12.
+                Symmetric expansion ratio applied to the resolved SAM prompt bbox,
+                expressed as a fraction of bbox size.
 
-            ``multimask`` : bool, optional
-                If True, SAM returns multiple candidate masks and the node selects
-                one via a heuristic based on bbox-center inclusion, coverage, and
-                SAM score. Default: True.
+                For ``target='person'`` and ``target='face'``, this also affects
+                the default crop region because the SAM prompt bbox is reused as
+                the final crop box. For ``target='head'`` and hand targets, the
+                final crop region is target-local and remains independent from
+                this margin.
+
+                Typical range: 0.05-0.20. Default: 0.12.
 
             ``expansion`` : float, optional
                 Expansion factor applied to target-local crop geometry.
@@ -835,6 +1213,10 @@ class SubjectCrop(NodeRef):
                   expands the landmark-derived eye bbox / mask
                 - for hand targets:
                   expands the landmark-derived hand bbox / mask
+
+                This parameter is not used for ``target='face'``. Face bbox
+                expansion is currently controlled by the internal
+                ``FACE_BBOX_EXPANSION`` constant.
 
                 Default: ``1.0``.
 
@@ -864,10 +1246,16 @@ class SubjectCrop(NodeRef):
                 feathered transition between protected subject and repaintable background.
                 Default: 0.
 
+                Note: ``dilate_radius``, ``close_radius`` and
+                ``smoothing_radius`` currently affect only full-frame mask
+                outputs (``mode='mask'`` and ``mode='negative-mask'``). In
+                ``mode='default'``, the RGBA alpha is derived directly from the
+                selected mask after connected-component cleanup.
+
         ``debug`` : dict
             ``save_debug`` : bool, optional
-                If True, saves a debug image with the selected SAM bbox overlay.
-                Default: False.
+                If True, saves a debug image with the selected prompt/crop bbox
+                overlay. Default: False.
 
     Mask post-processing
     --------------------
@@ -922,6 +1310,10 @@ class SubjectCrop(NodeRef):
             Output file path (RGBA cutout or mask).
         ``params`` : dict
             Configuration parameters.
+        ``model`` : dict
+            Resolved model/runtime metadata, including the selected ``sam_model``
+            when SAM is used, MediaPipe task paths, optional YOLO model, device,
+            and dtype.
         ``crop`` : dict
             Crop metadata useful for reinsertion/compositing:
             ``anchor_xy`` : list[int]
@@ -937,29 +1329,43 @@ class SubjectCrop(NodeRef):
     Notes
     -----
     - Mask outputs are always full-frame and aligned to the original image size.
-    - For ``target='head'``, SAM uses the selected person bbox, while the final crop
-      region is the derived head box.
-    - For eye targets, the mask is derived directly from face landmarks and SAM is
-      skipped.
-    - ``left-eye`` and ``right-eye`` refer to image/viewer perspective:
-      left means left side of the image, right means right side of the image.
-    - Heavy models (YOLO, SAM, MediaPipe Tasks) are retrieved via the global model
-      cache where available.
-    - The SAM predictor is created per run because it stores per-image state.
-    - If you change code or spec and need fresh outputs, delete the existing sidecar
-      JSON to avoid reusing cached results.
+    - In ``mode='default'``, ``crop_mode`` controls whether the output is a
+      target-local RGBA cutout, a bbox crop, or a full-frame RGBA canvas.
+    - In ``mode='mask'`` and ``mode='negative-mask'``, ``crop_mode`` is ignored
+      because mask outputs are always full-frame.
+    - ``dilate_radius``, ``close_radius`` and ``smoothing_radius`` affect only
+      full-frame mask outputs. In ``mode='default'``, the RGBA alpha is derived
+      directly from the selected mask after connected-component cleanup.
+    - For ``target='head'``, SAM uses the selected person bbox as segmentation
+      prompt, while the final crop region is the derived head box.
+    - For ``target='face'``, SAM uses an expanded face bbox and a sparse subset
+      of face landmarks as positive prompt points.
+    - For eye targets, the mask is derived directly from face landmarks and SAM
+      is skipped.
     - For hand targets, the final mask is obtained by intersecting the
       landmark-derived hand mask with the SAM subject mask.
     - For ``target='hands'``, multiple disconnected hand components may be
       preserved inside the same crop.
-    - ``left-hand`` and ``right-hand`` refer to image/viewer perspective:
-      left means left side of the image, right means right side of the image.
-      MediaPipe handedness labels are mapped internally to preserve this convention.
+    - Side-specific targets use image/viewer perspective: ``left-eye`` and
+      ``left-hand`` mean the left side of the image, while ``right-eye`` and
+      ``right-hand`` mean the right side of the image.
+    - MediaPipe handedness labels follow anatomical subject perspective and are
+      mapped internally for hand targets to preserve the image/viewer convention.
+    - Heavy models (YOLO, SAM-compatible segmentation models, MediaPipe Tasks)
+      are retrieved via the global model cache where available.
+    - The segmentation backend is loaded through Hugging Face Transformers via
+      ``get_sam(...)`` and cached as a ``(processor, model)`` pair.
+    - This node does not require a local ``sam_checkpoint`` /
+      ``sam_model_type`` pair. Use ``model.sam_model`` to select the Hugging
+      Face model id.
+    - For ``target='person'``, mask polarity is resolved during candidate
+      selection by evaluating both each raw SAM mask and its local inverse inside
+      the prompt bbox.
     - For ``crop_mode='bbox[w:h]'``, the requested aspect ratio is treated as a
       target, not a hard guarantee. Near the image boundaries the final crop may
       deviate from the requested ratio.
-    - For ``target='person'``, SAM mask polarity is resolved during candidate
-      selection by evaluating both the original SAM mask and its local inverse.
+    - If you change code or spec and need fresh outputs, delete the existing
+      sidecar JSON to avoid reusing cached results.
     """
 
     # Either pass a path explicitly, or wire an upstream image into default input.
@@ -971,8 +1377,6 @@ class SubjectCrop(NodeRef):
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # Local imports to avoid hard deps if node unused
         import cv2
-        import torch
-        from segment_anything import SamPredictor
 
         spec = resolve_spec(self.spec)
 
@@ -1002,9 +1406,7 @@ class SubjectCrop(NodeRef):
         h, w = img_bgr.shape[:2]
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        eye_which: Optional[str] = None
         eye_mask: Optional[np.ndarray] = None
-        hand_which: Optional[str] = None
         hand_mask: Optional[np.ndarray] = None
 
         pose_landmarker = get_mediapipe_pose_landmarker(
@@ -1015,11 +1417,12 @@ class SubjectCrop(NodeRef):
             img_rgb=img_rgb,
             pose_landmarker=pose_landmarker,
         )
+        face_xy_full: Optional[np.ndarray] = None
 
         if cfg.target == 'person':
-            # -----------------------------
-            # YOLO: find largest 'person' bbox (COCO class 0)
-            # -----------------------------
+            # YOLO proposes person bbox candidates; resolve_person_bbox_xyxy()
+            # accepts a YOLO box only when it is consistent with MediaPipe pose,
+            # otherwise it falls back to a pose-derived bbox.
             yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
             res = yolo.predict(
                 img_rgb,
@@ -1059,7 +1462,7 @@ class SubjectCrop(NodeRef):
             head_area_rgb, a_x, a_y = crop_head_area_from_pose(
                 img_rgb=img_rgb,
                 pose_xy=pose_xy,
-                expansion=1.6,
+                expansion=HEAD_AREA_EXPANSION,
             )
 
             face_xy = mp_face_landmarks(
@@ -1090,16 +1493,21 @@ class SubjectCrop(NodeRef):
             head_area_rgb, a_x, a_y = crop_head_area_from_pose(
                 img_rgb=img_rgb,
                 pose_xy=pose_xy,
-                expansion=1.6,
+                expansion=HEAD_AREA_EXPANSION,
             )
 
             face_xy = mp_face_landmarks(
                 img_rgb=head_area_rgb,
                 face_landmarker=landmarker,
             )
+            face_xy_full = face_xy.copy()
+            face_xy_full[:, 0] += a_x
+            face_xy_full[:, 1] += a_y
+
             r_x1, r_y1, r_x2, r_y2 = face_bbox_xyxy_from_landmarks(
                 face_xy,
-                image_shape=head_area_rgb.shape
+                image_shape=head_area_rgb.shape,
+                expansion=FACE_BBOX_EXPANSION,
             )
 
             bx1 = r_x1 + a_x
@@ -1122,7 +1530,7 @@ class SubjectCrop(NodeRef):
             head_area_rgb, a_x, a_y = crop_head_area_from_pose(
                 img_rgb=img_rgb,
                 pose_xy=pose_xy,
-                expansion=1.6,
+                expansion=HEAD_AREA_EXPANSION,
             )
 
             face_xy = mp_face_landmarks(
@@ -1225,138 +1633,168 @@ class SubjectCrop(NodeRef):
         # Mask generation
         # -----------------------------
         if cfg.target in ('eyes', 'left-eye', 'right-eye'):
-            # Eye targets: use landmark-derived mask (skip SAM).
+            # Eye targets: use landmark-derived mask and skip SAM.
             if eye_mask is None:
                 raise RuntimeError(
                     f"SubjectCrop node '{node_id}': eye_mask not computed."
                 )
             mask = eye_mask
-            ckpt = None
-            model_type = None
+            sam_model_id = None
         else:
-            # Default segmentation path:
-            # - SAM is guided by the resolved prompt bbox
-            # - for hand targets, the SAM subject mask is later intersected
-            #   with a landmark-derived hand mask
-            ckpt = Path(str(cfg.sam_checkpoint)).expanduser().resolve()
-            if not ckpt.exists() or not ckpt.is_file():
-                raise FileNotFoundError(
-                    f"SubjectCrop node '{node_id}': SAM checkpoint not found: {ckpt}")
+            # Default SAM segmentation path:
+            #
+            # - person targets build candidates from two prompt strategies:
+            #   bbox + pose landmarks and bbox-only
+            # - hand targets use the person bbox with pose landmarks, then intersect
+            #   the resulting subject mask with a landmark-derived hand mask
+            # - face targets use an expanded face bbox with sparse positive face
+            #   landmarks
+            # - head targets intentionally use bbox-only SAM prompting because face
+            #   landmarks are too internal and may cause SAM to ignore hair or the
+            #   outer head silhouette
 
-            model_type = _infer_sam_model_type(ckpt, cfg.sam_model_type)
+            sam_model_id = cfg.sam_model
 
-            sam = get_sam(
-                checkpoint=str(ckpt),
-                model_type=model_type,
-                device=cfg.device
+            if sam_model_id is None:
+                raise RuntimeError(
+                    f"SubjectCrop node '{node_id}': SAM model is not configured."
+                )
+
+            processor, sam_model = get_sam(
+                model_id=sam_model_id,
+                device=cfg.device,
+                dtype=cfg.dtype,
             )
 
-            predictor = SamPredictor(sam)
-            predictor.set_image(np.ascontiguousarray(img_rgb))
-
-            box = np.array([bx1, by1, bx2, by2], dtype=np.float32)
-
-            point_coords = None
-            point_labels = None
-
             if cfg.target == 'person':
-                point_coords, point_labels = _pose_positive_points_for_sam(
-                    pose_xy=pose_xy,
+                # For full-body crops, neither strict nor complete prompting is universally
+                # better:
+                #
+                # - strict candidates are cleaner but can miss weak silhouette regions
+                # - complete candidates can preserve more silhouette but may attach artifacts
+                #
+                # We evaluate both families and select a conservative candidate using SAM
+                # score, normalized area, and weak tie-breakers.
+                candidates = _build_person_sam_candidates(
+                    img_rgb=img_rgb,
                     bbox=(bx1, by1, bx2, by2),
+                    pose_xy=pose_xy,
+                    processor=processor,
+                    model=sam_model,
+                    device=cfg.device,
                 )
 
-            with torch.inference_mode():
-                masks, scores, _ = predictor.predict(
+                mask = _select_best_person_sam_mask(
+                    candidates,
+                    bbox=(bx1, by1, bx2, by2),
+                ).astype(bool)
+
+            else:
+                point_coords = None
+                point_labels = None
+
+                if cfg.target in ('hands', 'left-hand', 'right-hand'):
+                    point_coords, point_labels = _positive_points_for_sam(
+                        xy=pose_xy,
+                        bbox=(bx1, by1, bx2, by2),
+                    )
+
+                elif cfg.target == 'face' and face_xy_full is not None:
+                    point_coords, point_labels = _positive_points_for_sam(
+                        xy=face_xy_full,
+                        bbox=(bx1, by1, bx2, by2),
+                        max_points=16,
+                    )
+
+                masks, scores = _predict_sam_mask(
+                    img_rgb=img_rgb,
+                    bbox=(bx1, by1, bx2, by2),
+                    processor=processor,
+                    model=sam_model,
+                    device=cfg.device,
                     point_coords=point_coords,
                     point_labels=point_labels,
-                    box=box[None, :],
-                    multimask_output=bool(cfg.multimask),
                 )
 
-            if masks is None or len(masks) == 0:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': SAM returned no masks.")
+                if masks is None or len(masks) == 0:
+                    raise RuntimeError(
+                        f"SubjectCrop node '{node_id}': SAM returned no masks."
+                    )
 
-            # Pick the best mask in a robust way.
-            #
-            # For target='person', also evaluate the local inverse of each SAM mask.
-            # This handles cases where SAM returns the local background / complement instead
-            # of the subject.
-            best_mask = None
-            best_key = None
+                best_mask = None
+                best_key = None
 
-            for i in range(len(masks)):
-                mi = masks[i].astype(bool)
+                for i in range(len(masks)):
+                    mi = masks[i].astype(bool)
 
-                if cfg.target == 'person':
-                    candidates = [
-                        mi,
-                        _invert_mask_inside_box(
-                            mi,
-                            (bx1, by1, bx2, by2),
-                        ),
-                    ]
-
-                    for cand in candidates:
-                        key = _score_sam_mask_with_landmarks(
-                            cand,
-                            pose_xy,
-                        )
-
-                        if best_key is None or key > best_key:
-                            best_key = key
-                            best_mask = cand
-
-                else:
-                    frac = float(mi[by1:by2, bx1:bx2].mean())
-                    score_i = float(scores[i]) if scores is not None else 0.0
-                    key = (score_i, -abs(frac - 0.35))
+                    score_i = (
+                        float(scores[i])
+                        if scores is not None and i < len(scores)
+                        else 0.0
+                    )
+                    key = score_i
 
                     if best_key is None or key > best_key:
                         best_key = key
                         best_mask = mi
 
-            if best_mask is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': failed to select a SAM mask."
-                )
+                if best_mask is None:
+                    raise RuntimeError(
+                        f"SubjectCrop node '{node_id}': failed to select a SAM mask."
+                    )
 
-            mask = best_mask.astype(bool)
+                mask = best_mask.astype(bool)
 
             # ------------------------------------------------------------------
             # SAM may occasionally return the complementary (background) mask
             # when prompted with a bounding box only. In that case the subject
             # appears as a hole in the mask.
             #
-            # For target='person', this polarity choice is already handled during
-            # candidate selection by scoring both each SAM mask and its local
-            # inverse. Therefore this post-hoc correction is applied only to
-            # non-person targets.
+            # For target='person', polarity is already handled during candidate
+            # generation:
+            # each raw candidate and its local inverse are both passed to the
+            # selector.
+            # Therefore this post-hoc correction is applied only to non-person
+            # targets.
             # ------------------------------------------------------------------
             if cfg.target != 'person':
+                # Resolve the landmark set used to detect possible SAM polarity
+                # mistakes.
+                #
+                # By default, pose landmarks are a reasonable coarse anchor because
+                # SAM is usually prompted with a person-level bbox.
+                #
+                # For face targets, however, pose landmarks are too sparse and too
+                # coarse for a tight face crop. Since the face branch already has
+                # full-image face landmarks, use them as polarity anchors instead.
+                polarity_xy = pose_xy
+                polarity_fraction = 0.5
+
+                if cfg.target == 'face' and face_xy_full is not None:
+                    polarity_xy = face_xy_full
+                    polarity_fraction = 0.25
+
                 valid = (
-                    (pose_xy[:, 0] >= 0) &
-                    (pose_xy[:, 1] >= 0)
+                    (polarity_xy[:, 0] >= 0) &
+                    (polarity_xy[:, 1] >= 0)
                 )
 
-                pts = pose_xy[valid]
+                pts = polarity_xy[valid]
 
                 inside = 0
+                mask_h, mask_w = mask.shape
+
                 for px, py in pts:
                     px = int(px)
                     py = int(py)
 
-                    if mask[py, px]:
+                    if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
                         inside += 1
 
-                if cfg.target == 'head':
-                    min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
-                elif cfg.target == 'face':
-                    min_inside = 1
-                else:
-                    # Hand targets still use the pose-guided subject test here because SAM is
-                    # prompted with the person bbox, not with a hand-local bbox.
-                    min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
+                min_inside = max(
+                    1,
+                    int(math.ceil(len(pts) * polarity_fraction)),
+                )
 
                 if inside < min_inside:
                     # Invert mask only inside the prompt bbox to avoid turning the entire
@@ -1414,11 +1852,28 @@ class SubjectCrop(NodeRef):
         )
 
         if num > 1:
-            if cfg.target in ('eyes', 'left-eye', 'right-eye', 'hands'):
-                # Keep all components in the crop.
+            if cfg.target in (
+                'eyes',
+                'left-eye',
+                'right-eye',
+                'hands',
+                'left-hand',
+                'right-hand',
+            ):
+                # Keep all connected components inside already target-local crops.
+                #
                 # - For 'eyes', this preserves both eyes as two disjoint blobs.
-                # - For 'left-eye'/'right-eye', the crop is expected to isolate a single eye.
+                # - For 'left-eye' / 'right-eye', the crop is expected to isolate a single eye.
                 # - For 'hands', this preserves multiple visible hands inside one shared crop.
+                # - For 'left-hand' / 'right-hand', the crop is already constrained by the
+                #   selected hand bbox and by the landmark-derived hand mask, so keeping all
+                #   components is safer than selecting the component under the crop center.
+                #
+                # TODO:
+                # If single-hand crops start carrying too many small artifacts, replace this
+                # broad keep-all rule with a hand-seeded component selector, e.g. selecting the
+                # connected component that contains or is nearest to a reliable hand landmark
+                # such as the wrist or palm center.
                 crop_mask = (labels != 0)
 
             else:
@@ -1553,11 +2008,8 @@ class SubjectCrop(NodeRef):
             'image': str(out_path),
             'model': {
                 **({} if cfg.yolo_model is None else {'yolo': cfg.yolo_model}),
-                **({} if ckpt is None else {
-                    'sam_checkpoint': str(ckpt),
-                }),
-                **({} if model_type is None else {
-                    'sam_model_type': model_type,
+                **({} if sam_model_id is None else {
+                    'sam_model': sam_model_id,
                 }),
                 **({} if cfg.face_landmarker_task is None else {
                     'face_landmarker_task': cfg.face_landmarker_task,
@@ -1569,6 +2021,7 @@ class SubjectCrop(NodeRef):
                     'hand_landmarker_task': cfg.hand_landmarker_task,
                 }),
                 'device': cfg.device,
+                'dtype': str(cfg.dtype).replace('torch.', ''),
             },
             'params': {
                 'target': cfg.target,
@@ -1576,7 +2029,6 @@ class SubjectCrop(NodeRef):
                 'crop_mode': None if cfg.crop_mode is None else cfg.crop_mode.raw,
                 'conf': cfg.conf,
                 'box_margin': cfg.box_margin,
-                'multimask': cfg.multimask,
                 'dilate_radius': cfg.dilate_radius,
                 'close_radius': cfg.close_radius,
                 'expansion': cfg.expansion,

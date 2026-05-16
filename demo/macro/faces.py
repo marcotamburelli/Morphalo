@@ -89,7 +89,6 @@ def refine_face_group(
             name='crop_face',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
@@ -255,7 +254,6 @@ def apply_face_id_head_group(
             name='head_mask',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },
@@ -445,7 +443,6 @@ def fine_face_details_group(
             name='region_mask',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                     # 'yolo_model' is only needed when region == 'head' and your SubjectCrop uses YOLO for it.
@@ -596,7 +593,6 @@ def refine_hand_group(
             name='crop_hand',
             spec={
                 'model': {
-                    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
                     'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
                     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
                 },

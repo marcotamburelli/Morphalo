@@ -303,14 +303,14 @@ pipeline structure.
 
 ### Artifact-based execution
 
-Each node writes its outputs to disk:
+Each node writes its outputs to disk using a node-local artifact directory:
 
 ```
 outputs/
   dag_name/
-  node_id/
-   image.png
-   artifact.json
+    node_id/
+      image.png
+      artifact.json
 ```
 
 The `artifact.json` file records:
@@ -350,7 +350,6 @@ Root-level scripts:
 
 - `init_project.sh` – bootstrap local virtual environment
 - `fetch_media_pipe.sh` – download MediaPipe task models
-- `fetch_sam.sh` – download SAM checkpoints
 - `requirements.txt` – Python dependencies
 - `config.ini` – configuration
 
@@ -402,19 +401,18 @@ Or use the provided helper script:
 
 ## Optional: download extra model assets
 
-Some nodes rely on external checkpoints (e.g. MediaPipe tasks, SAM weights).
+Some nodes rely on external assets such as MediaPipe task files. Most Hugging Face
+models, including SAM/SAM-HQ backends used by `SubjectCrop`, are downloaded
+automatically by Transformers on first use.
+
 Helper scripts are provided:
 
 ```bash
 # MediaPipe task files (pose/hand/face landmarker)
 ./fetch_media_pipe.sh
-
-# Segment Anything checkpoints (vit_h/vit_l/vit_b)
-./fetch_sam.sh
 ```
 
 - MediaPipe models are placed under `~/models/mediapipe`.
-- SAM models are placed under `~/models/sam`.
 
 ## Running DAGs
 
@@ -433,13 +431,13 @@ The runner discovers DAGs **at import time** via `DagRegistry`, then executes th
 There is a helper script that ensures the local venv is activated and calls the CLI:
 
 ```bash
-./run_dag.sh <dag-module>
+./bin/run_dag.sh <dag-module>
 ```
 
 Example:
 
 ```bash
-./run_dag.sh dags.demo_img
+./bin/run_dag.sh dags.demo_img
 ```
 
 This script calls `python -m morphalo.cli run-dags "$DAG_MODULE" "$@"`.

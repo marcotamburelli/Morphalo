@@ -34,20 +34,21 @@ Depending on the selected ``target``, it may use:
 Supported targets
 -----------------
 - ``person``:
-    full subject extraction, typically using YOLO + SAM
+    full subject extraction, typically using YOLO + SAM/SAM-HQ
 - ``head``:
     head-oriented region derived from face landmarks, with hair-friendly framing
 - ``face``:
-    tighter face crop
+    tighter face crop, guided by face landmarks and SAM/SAM-HQ
 - ``eyes``:
     combined region covering both eyes
 - ``left-eye`` / ``right-eye``:
-    single-eye crops derived from MediaPipe face landmarks
+    single-eye crops derived from MediaPipe face landmarks, using image/viewer
+    perspective
 - ``hands``:
     combined crop covering all visible hands of the selected subject
 - ``left-hand`` / ``right-hand``:
-    single-hand crops derived from MediaPipe hand landmarks and
-    subject-guided masking
+    single-hand crops derived from MediaPipe hand landmarks and subject-guided
+    masking, using image/viewer perspective
 
 Defined DAGs
 ------------
@@ -139,7 +140,7 @@ Notes
     White pixels represent everything except the selected region.
 
 - ``crop_mode='trim'``:
-    returns a tight crop with transparency outside the selected mask.
+    returns a tight RGBA cutout trimmed to the non-transparent selected mask.
 
 - ``crop_mode='bbox'``:
     returns a rectangular crop including the original background, with fully
@@ -163,7 +164,9 @@ Notes
 - Hand detection may fail on heavily deformed, occluded, or poorly delineated
   hands; in those cases a future pose-based fallback may be useful.
 
-- Left/right semantics follow subject perspective, not viewer perspective.
+- Left/right semantics follow image/viewer perspective, not anatomical subject
+  perspective. ``left-eye`` and ``left-hand`` mean the region on the left side
+  of the image.
 """
 
 from pathlib import Path
@@ -186,14 +189,14 @@ INIT_IMG = '~/images/init_img_2.png'
 # Shared model assets used by SubjectCrop.
 #
 # Notes:
-# - SAM is required for subject/mask extraction on larger regions such as person.
+# - sam_model selects the SAM/SAM-HQ backend used for segmentation targets.
 # - MediaPipe Face Landmarker is required for face/head/eye targets.
 # - MediaPipe Hand Landmarker is required for hand targets.
 # - The pose landmarker is used to stabilize subject selection and derive
 #   pose-guided regions such as head crops.
 #
 MODEL_SPEC = {
-    'sam_checkpoint': '~/models/sam/sam_vit_l_0b3195.pth',
+    'sam_model': 'facebook/sam-vit-large',
     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
     'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
@@ -205,7 +208,7 @@ MODEL_SPEC = {
 #     emit an RGBA crop rather than a full-frame mask.
 #
 # `crop_mode='trim'`:
-#     return the crop box content with transparency outside the selected mask.
+#     return a tight RGBA cutout trimmed to the non-transparent mask area.
 #
 # `box_margin`:
 #     expands the initial detection box before segmentation/cropping.
@@ -234,7 +237,6 @@ MASK_PARAMS = {
     'target': 'person',
     'mode': 'mask',
     'box_margin': 0.12,
-    'expansion': 1.2,
     'dilate_radius': 10,
     'close_radius': 4,
     'smoothing_radius': 7,
@@ -376,8 +378,7 @@ with DAG(
     # should treat the eyes as a single semantic region, for example local
     # inpainting/refinement of gaze or eyelids.
     #
-    # For eye targets, MediaPipe landmarks are typically sufficient, so SAM can
-    # be omitted.
+    # Eye targets are landmark-derived and skip SAM entirely.
     #
     eyes_crop = SubjectCrop(
         name='eyes_crop',
@@ -397,8 +398,9 @@ with DAG(
     # Left eye crop
     # -------------------------------------------------------------------------
     #
-    # Crop only the subject's left eye.
-    # Note: "left" is in subject perspective, not viewer perspective.
+    # Crop only the eye on the left side of the image.
+    # Note: "left" is in image/viewer perspective, not anatomical subject
+    # perspective.
     #
     left_eye_crop = SubjectCrop(
         name='left_eye_crop',
@@ -418,8 +420,9 @@ with DAG(
     # Right eye crop
     # -------------------------------------------------------------------------
     #
-    # Crop only the subject's right eye.
-    # Note: "right" is in subject perspective, not viewer perspective.
+    # Crop only the eye on the right side of the image.
+    # Note: "right" is in image/viewer perspective, not anatomical subject
+    # perspective.
     #
     right_eye_crop = SubjectCrop(
         name='right_eye_crop',
@@ -464,8 +467,9 @@ with DAG(
     # Left hand crop
     # -------------------------------------------------------------------------
     #
-    # Crop only the subject's left hand.
-    # Note: "left" is in subject perspective, not viewer perspective.
+    # Crop only the hand on the left side of the image.
+    # Note: "left" is in image/viewer perspective, not anatomical subject
+    # perspective.
     #
     left_hand_crop = SubjectCrop(
         name='left_hand_crop',
@@ -482,8 +486,9 @@ with DAG(
     # Right hand crop
     # -------------------------------------------------------------------------
     #
-    # Crop only the subject's right hand.
-    # Note: "right" is in subject perspective, not viewer perspective.
+    # Crop only the hand on the right side of the image.
+    # Note: "right" is in image/viewer perspective, not anatomical subject
+    # perspective.
     #
     right_hand_crop = SubjectCrop(
         name='right_hand_crop',
