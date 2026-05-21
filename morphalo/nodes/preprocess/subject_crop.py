@@ -768,6 +768,7 @@ def _select_best_person_sam_mask(
     candidates: list[SamMaskCandidate],
     *,
     bbox: tuple[int, int, int, int],
+    pose_xy: np.ndarray,
     target_norm_area: float = 0.25,
 ) -> np.ndarray:
     """
@@ -779,17 +780,38 @@ def _select_best_person_sam_mask(
     - ``strict``: bbox + pose landmarks;
     - ``complete``: bbox only.
 
+    Before ranking candidates, the selector tries to discard masks that do not
+    contain enough stable pose landmarks. This helps reject SAM masks that cover
+    nearby objects, props, furniture, or the local inverse/background instead of the
+    actual subject.
+
+    This landmark filtering is intentionally conservative and non-fatal: if no
+    candidate passes the landmark-consistency check, the selector falls back to the
+    full candidate set.
+
     Selection criteria, in order
     ----------------------------
-    1. Quantized SAM predicted-IoU score.
-    2. Distance from the preferred normalized candidate area.
-    3. Non-inverted candidates.
-    4. Strict prompt candidates.
+    1. Landmark-consistency filtering, when possible.
+    2. Quantized SAM predicted-IoU score.
+    3. Distance from the preferred normalized candidate area.
+    4. Non-inverted candidates.
+    5. Strict prompt candidates.
+
+    Landmark-consistency filtering
+    ------------------------------
+    Only a small set of relatively stable body anchors is used, such as nose,
+    shoulders, elbows, and hips. Lower-leg and foot landmarks are intentionally
+    ignored because they are often occluded, truncated, or confused with supports,
+    props, seats, or background objects.
+
+    A candidate is kept if it contains at least a minimum fraction of the valid
+    stable landmarks. If no valid landmarks are available, or if all candidates fail
+    the check, the original candidate set is used.
 
     Candidate area normalization
     ----------------------------
     Candidate areas are measured inside the SAM prompt bbox and normalized
-    relative to the available candidate set:
+    relative to the available candidate set after optional landmark filtering:
 
     - smallest candidate area -> 0.0
     - largest candidate area -> 1.0
@@ -807,6 +829,11 @@ def _select_best_person_sam_mask(
 
     bbox : tuple[int, int, int, int]
         SAM prompt bbox ``(x1, y1, x2, y2)``.
+
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in full-image coordinates, with invalid points
+        encoded as ``(-1, -1)``. A stable subset of these landmarks is used to
+        reject masks that do not plausibly cover the selected subject.
 
     target_norm_area : float, default=0.25
         Preferred normalized candidate area. ``0.0`` favors the smallest
@@ -826,6 +853,58 @@ def _select_best_person_sam_mask(
     ValueError
         If ``target_norm_area`` is outside ``[0, 1]``.
     """
+    def _landmark_inside_count(
+        mask: np.ndarray,
+        xy: np.ndarray,
+        idxs: list[int],
+    ) -> tuple[int, int]:
+        """
+        Count how many selected landmarks fall inside a candidate mask.
+
+        Parameters
+        ----------
+        mask : np.ndarray
+            Full-frame boolean mask.
+
+        xy : np.ndarray
+            Landmark coordinates in full-image coordinates.
+
+        idxs : list[int]
+            Landmark indices to evaluate.
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(inside, valid)`` where ``inside`` is the number of valid landmarks
+            covered by the mask and ``valid`` is the number of usable landmarks.
+        """
+        mask_h, mask_w = mask.shape
+
+        inside = 0
+        valid = 0
+
+        for idx in idxs:
+            if idx < 0 or idx >= xy.shape[0]:
+                continue
+
+            px, py = xy[idx, :2]
+
+            if px < 0 or py < 0:
+                continue
+
+            px = int(px)
+            py = int(py)
+
+            if not (0 <= px < mask_w and 0 <= py < mask_h):
+                continue
+
+            valid += 1
+
+            if mask[py, px]:
+                inside += 1
+
+        return inside, valid
+
     if not candidates:
         raise RuntimeError(
             'Cannot select best person SAM mask: no candidates.'
@@ -838,13 +917,54 @@ def _select_best_person_sam_mask(
 
     x1, y1, x2, y2 = bbox
 
+    # Stable body anchors:
+    # 0  = nose
+    # 11 = left shoulder
+    # 12 = right shoulder
+    # 13 = left elbow
+    # 14 = right elbow
+    # 15 = left wrist
+    # 16 = right wrist
+    # 23 = left hip
+    # 24 = right hip
+    # 25 = left knee
+    # 26 = right knee
+    #
+    # Wrists and knees are included because they help preserve visible arms and legs
+    # without relying on more fragile extremity landmarks.
+    #
+    # Ankles, heels, and foot tips are intentionally excluded because they are often
+    # occluded, outside the actual visible subject, or confused with supports / props.
+    safe_pose_idxs = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26]
+    min_landmark_fraction = 0.5
+
     measured: list[tuple[SamMaskCandidate, int]] = []
+    filtered: list[tuple[SamMaskCandidate, int]] = []
+
     for candidate in candidates:
         area = int(candidate.mask[y1:y2, x1:x2].sum())
         measured.append((candidate, area))
 
+        inside, valid = _landmark_inside_count(
+            candidate.mask,
+            pose_xy,
+            safe_pose_idxs,
+        )
+
+        if valid > 0:
+            min_inside = max(
+                1,
+                int(math.ceil(float(valid) * min_landmark_fraction)),
+            )
+
+            if inside >= min_inside:
+                filtered.append((candidate, area))
+
+    # Prefer landmark-consistent masks, but do not hard-fail on difficult poses.
+    pool = filtered if filtered else measured
+
     areas = np.asarray(
-        [area for _, area in measured],
+        [area for _, area in pool],
         dtype=np.float32,
     )
 
@@ -855,7 +975,7 @@ def _select_best_person_sam_mask(
     best_candidate = None
     best_key = None
 
-    for candidate, area in measured:
+    for candidate, area in pool:
         norm_area = (float(area) - min_area) / area_span
         area_distance = abs(norm_area - float(target_norm_area))
 
@@ -1687,6 +1807,7 @@ class SubjectCrop(NodeRef):
                 mask = _select_best_person_sam_mask(
                     candidates,
                     bbox=(bx1, by1, bx2, by2),
+                    pose_xy=pose_xy,
                 ).astype(bool)
 
             else:

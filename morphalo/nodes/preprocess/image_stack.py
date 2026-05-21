@@ -86,6 +86,7 @@ class LayerSpec:
     corner_offsets: Optional[CornerOffsets] = None
     feather: int | str = 0
     corner_radius: Optional[int | str] = None
+    alpha: float = 1.0
 
 
 @dataclass
@@ -952,8 +953,9 @@ class ImageStack(NodeRef):
     3. Apply optional rotation (``rotation``) around the layer center.
     4. Apply optional resizing (``resize``) to the transformed layer.
     5. Optionally soften the layer edges (``feather``).
-    6. Resolve layer placement (``position``) on the canvas.
-    7. Alpha-composite the transformed layer onto the canvas.
+    6. Apply global layer opacity (``alpha``).
+    7. Resolve layer placement (``position``) on the canvas.
+    8. Alpha-composite the transformed layer onto the canvas.
 
     This execution order is important:
 
@@ -1222,6 +1224,7 @@ class ImageStack(NodeRef):
         corner_offsets=None,
         feather=0,
         corner_radius=None,
+        alpha=1.0,
     )
         Declare a compositing layer and return an :class:`AttachmentSink`
         for wiring.
@@ -1243,7 +1246,8 @@ class ImageStack(NodeRef):
             Path to the composited output image.
         ``params.layers`` : list[dict]
             Per-layer configuration, including ``idx``, ``position``, ``resize``,
-            ``rotation``, ``corner_offsets``, ``feather``, and ``corner_radius``.
+            ``rotation``, ``corner_offsets``, ``feather``, ``corner_radius``,
+            and ``alpha``.
         ``metadata`` : str
             Path to the JSON sidecar.
 
@@ -1274,6 +1278,7 @@ class ImageStack(NodeRef):
         corner_offsets: Optional[CornerOffsets] = None,
         feather: int | str = 0,
         corner_radius: Optional[int | str] = None,
+        alpha: float = 1.0,
     ) -> ImageLayerAttachmentSink:
         """
         Declare an input image layer.
@@ -1448,6 +1453,27 @@ class ImageStack(NodeRef):
             This parameter has no effect when the layer already contains
             transparency (e.g. segmentation masks).
 
+                    alpha : float, optional
+            Global opacity multiplier applied to the layer before compositing.
+
+            The value must be in the ``[0.0, 1.0]`` range:
+
+            - ``1.0``:
+              Keep the layer opacity unchanged.
+            - ``0.0``:
+              Make the layer fully transparent.
+            - intermediate values:
+              Multiply the current alpha channel by the given factor.
+
+            This operation is applied after local transformations, resizing,
+            and feathering, but before final alpha compositing onto the canvas.
+
+            Since ``alpha`` multiplies the existing alpha channel, it works both
+            for fully opaque layers and for layers that already contain
+            transparency, such as segmentation cutouts.
+
+            Default: ``1.0``.
+
         Returns
         -------
         AttachmentSink
@@ -1542,6 +1568,12 @@ class ImageStack(NodeRef):
 
         validate_size_expr(feather)
 
+        alpha = float(alpha)
+        if not math.isfinite(alpha) or not (0.0 <= alpha <= 1.0):
+            raise ValueError(
+                f'{self.id}: alpha must be a finite float in [0, 1], got {alpha!r}'
+            )
+
         self._layers[idx] = LayerSpec(
             idx=idx,
             position=position,
@@ -1550,6 +1582,7 @@ class ImageStack(NodeRef):
             corner_offsets=corner_offsets,
             feather=feather,
             corner_radius=corner_radius,
+            alpha=alpha,
         )
 
         return ImageLayerAttachmentSink(
@@ -1704,6 +1737,11 @@ class ImageStack(NodeRef):
                 layer.height,
             )
 
+            if layer_spec.alpha < 1.0:
+                r, g, b, a = layer.split()
+                a = a.point(lambda v: int(round(v * layer_spec.alpha)))
+                layer = Image.merge('RGBA', (r, g, b, a))
+
             _place_on_canvas(canvas, layer, cx=cx, cy=cy)
 
         out_dir = Path(output_dir)
@@ -1740,6 +1778,7 @@ class ImageStack(NodeRef):
                         },
                         'feather': ls.feather,
                         'corner_radius': ls.corner_radius,
+                        'alpha': ls.alpha,
                     }
                     for ls in (self._layers[i] for i in sorted(self._layers.keys()))
                 ],
