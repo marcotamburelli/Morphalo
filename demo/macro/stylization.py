@@ -1127,3 +1127,220 @@ def refine_region_group(
         )
 
     return g
+
+
+def refine_region_dual_style_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    stack_spec: SpecInput = {},
+    bbox: tuple[int, ...],
+    bbox_format: str = 'xyxy',
+    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    texture_weight: float = 0.75,
+    struct_weight: float = 0.75,
+    texture_compl: float = 0.1,
+    struct_compl: float = 0.1,
+    layer_feather: int | str = 30,
+    layer_corner_radius: int | str = 50,
+) -> NodeGroup:
+    """
+    Create a reusable NodeGroup that refines a manually selected rectangular
+    region using separate texture and structure IP-Adapter references.
+
+    The group crops a fixed rectangular region from the input image, refines that
+    crop with ``Img2Img`` using two IP-Adapter slots, and overlays the refined
+    crop back onto the original image using the crop metadata emitted by
+    ``BoxCrop``.
+
+    The two IP-Adapter references are routed differently:
+
+    - ``in_texture`` is applied mostly to upper UNet blocks, which usually affect
+      fine visual texture, material appearance, and local detail.
+    - ``in_struct`` is applied mostly to lower UNet blocks, which usually affect
+      structure, layout, and broader composition.
+
+    Ports
+    -----
+    in_image
+        Base image used both as stack background and crop source.
+
+    in_texture
+        Texture/style reference image wired into the first IP-Adapter slot.
+
+    in_struct
+        Structure/composition reference image wired into the second IP-Adapter
+        slot.
+
+    in_prompt
+        Optional prompt payload wired into the internal ``Img2Img`` prompt sink.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name.
+
+    refine_spec : SpecInput
+        Spec for the internal ``Img2Img`` refinement node.
+
+    stack_spec : SpecInput, optional
+        Spec for ``ImageStack``.
+
+    bbox : tuple[int, ...]
+        Manual crop box values interpreted according to ``bbox_format``.
+
+    bbox_format : {'xyxy', 'xywh', 'xyl'}, optional
+        Format of ``bbox``. Default is ``'xyxy'``.
+
+    texture_weight_name : str, optional
+        IP-Adapter weight name used for the texture reference.
+
+    struct_weight_name : str, optional
+        IP-Adapter weight name used for the structure reference.
+
+    texture_weight : float, optional
+        Main texture strength routed to upper UNet blocks.
+
+    struct_weight : float, optional
+        Main structure strength routed to lower UNet blocks.
+
+    texture_compl : float, optional
+        Complementary texture strength routed to lower UNet blocks.
+
+    struct_compl : float, optional
+        Complementary structure strength routed to upper UNet blocks.
+
+    layer_feather : int or str, optional
+        Feather applied when compositing the refined crop.
+
+    layer_corner_radius : int or str, optional
+        Corner radius applied to the refined crop mask.
+
+    Input Ports
+    -----------
+    in_image : Tap
+        Base image used both as:
+        1) background layer for ``ImageStack``;
+        2) source image for ``BoxCrop``.
+
+    in_texture : Tap
+        Texture/style reference image, or reference image list, wired into the
+        ``texture`` IP-Adapter slot of ``refine_region``.
+
+    in_struct : Tap
+        Structure/composition reference image, or reference image list, wired
+        into the ``structure`` IP-Adapter slot of ``refine_region``.
+
+    in_prompt : Tap
+        Optional prompt payload wired into the prompt sink of ``refine_region``.
+        The port uses ``strict=False``, so the group can run without an external
+        prompt input when ``refine_spec`` already provides the prompt.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed region-refinement group.
+
+    Notes
+    -----
+    This group is a dual-style counterpart of ``refine_region_group``. It does
+    not run semantic detection and relies entirely on the provided coordinates.
+
+    The default IP-Adapter routing follows the practical Morphalo convention:
+
+    - lower blocks preserve or transfer structure;
+    - upper blocks transfer texture and fine visual detail.
+    """
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style_texture = Tap(name='in_texture')
+        tap_style_struct = Tap(name='in_struct')
+
+        # -------------------
+        # Internal nodes
+        # -------------------
+        crop_region = BoxCrop(
+            name='crop_region',
+            spec={
+                'params': {
+                    'bbox_format': bbox_format,
+                    'bbox': list(bbox),
+                },
+            },
+        )
+
+        refine_region = Img2Img(
+            name='refine_region',
+            spec=refine_spec,
+        )
+
+        texture_sink = refine_region.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name=texture_weight_name,
+            scale={
+                'down': {'block_2': [0, texture_compl]},
+                'up': {'block_0': [0.0, texture_weight, 0.0]},
+            },
+            key='texture',
+        )
+
+        struct_sink = refine_region.ip_adapter.add(
+            'h94/IP-Adapter',
+            subfolder='sdxl_models',
+            weight_name=struct_weight_name,
+            scale={
+                'down': {'block_2': [0, struct_weight]},
+                'up': {'block_0': [0.0, struct_compl, 0.0]},
+            },
+            key='structure',
+        )
+
+        stack = ImageStack(
+            name='out',
+            spec=stack_spec,
+        )
+
+        # -------------------
+        # Wiring
+        # -------------------
+
+        # 1) Base image as background.
+        tap_image >> stack.image(0)
+
+        # 2) Crop manual region from base image.
+        tap_image >> crop_region
+
+        # 3) Refine cropped region.
+        crop_region >> refine_region
+        tap_prompt >> refine_region.prompt()
+        tap_style_texture >> texture_sink
+        tap_style_struct >> struct_sink
+
+        # 4) Overlay refined crop using BoxCrop transform metadata.
+        layer1 = stack.image(
+            1,
+            position='center',
+            feather=layer_feather,
+            corner_radius=layer_corner_radius,
+        )
+
+        refine_region >> layer1
+        crop_region >> layer1.transform()
+
+        # -------------------
+        # Register ports
+        # -------------------
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style_texture,
+            tap_style_struct,
+        )
+
+    return g

@@ -5,7 +5,7 @@ from typing import Literal, Optional
 from morphalo.dag import NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from morphalo.nodes.common.config_resolve import SpecInput
-from morphalo.nodes.preprocess import ImageStack, SubjectCrop
+from morphalo.nodes.preprocess import BoxCrop, ImageStack, ImgAuxMap, SubjectCrop
 
 FineRegion = Literal['face', 'eyes', 'left-eye', 'right-eye', 'head']
 
@@ -651,6 +651,568 @@ def refine_hand_group(
         g.register_ports(
             tap_image,
             tap_prompt,
+        )
+
+    return g
+
+
+def _sliding_window_bboxes_xyxy(
+    *,
+    image_size: tuple[int, int],
+    grid: tuple[int, int],
+    window_fraction: tuple[float, float] = (0.5, 0.5),
+) -> list[tuple[int, int, int, int]]:
+    """
+    Build overlapping sliding-window crop boxes.
+
+    Parameters
+    ----------
+    image_size : tuple[int, int]
+        Source image size as ``(width, height)``.
+
+    grid : tuple[int, int]
+        Number of sliding-window positions as ``(cols, rows)``.
+
+    window_fraction : tuple[float, float], optional
+        Window size expressed as a fraction of the image size, using
+        ``(width_fraction, height_fraction)``.
+
+        For example, with ``grid=(3, 3)`` and
+        ``window_fraction=(0.5, 0.5)``, the generated windows use starts:
+
+        - x: ``0``, ``0.25 * width``, ``0.5 * width``
+        - y: ``0``, ``0.25 * height``, ``0.5 * height``
+
+        This covers the whole image with overlapping half-image windows.
+
+    Returns
+    -------
+    list of tuple[int, int, int, int]
+        Crop boxes in ``xyxy`` format.
+    """
+    width, height = image_size
+    cols, rows = grid
+    win_fx, win_fy = window_fraction
+
+    if cols < 1 or rows < 1:
+        raise ValueError('grid values must be >= 1')
+
+    if not 0 < win_fx <= 1:
+        raise ValueError('window_fraction[0] must be in the range (0, 1]')
+
+    if not 0 < win_fy <= 1:
+        raise ValueError('window_fraction[1] must be in the range (0, 1]')
+
+    win_w = max(1, round(width * win_fx))
+    win_h = max(1, round(height * win_fy))
+
+    max_x = width - win_w
+    max_y = height - win_h
+
+    if max_x < 0 or max_y < 0:
+        raise ValueError('window size cannot exceed image size')
+
+    x_positions = [
+        round(max_x * i / max(cols - 1, 1))
+        for i in range(cols)
+    ]
+
+    y_positions = [
+        round(max_y * i / max(rows - 1, 1))
+        for i in range(rows)
+    ]
+
+    return [
+        (x, y, x + win_w, y + win_h)
+        for y in y_positions
+        for x in x_positions
+    ]
+
+
+def refine_sliding_tiles_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    image_size: tuple[int, int],
+    grid: tuple[int, int] = (3, 3),
+    window_fraction: tuple[float, float] = (0.5, 0.5),
+    stack_spec: SpecInput = {},
+    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    texture_weight: float = 0.75,
+    struct_weight: float = 0.75,
+    texture_compl: float = 0.1,
+    struct_compl: float = 0.1,
+    layer_feather: int | str = 40,
+    layer_corner_radius: int | str = 60,
+) -> NodeGroup:
+    """
+    Create a reusable NodeGroup that refines an image through overlapping tiles.
+
+    This group applies a sliding-window refinement strategy. The input image is
+    divided into overlapping rectangular regions, each region is refined with
+    ``Img2Img`` using two IP-Adapter references, and the refined crop is
+    composited back onto the progressively updated image.
+
+    The macro is intended to improve small or mid-sized details that global
+    generation often approximates poorly, such as malformed hands, feet, small
+    objects, distorted background details, accessories, fabric folds, or local
+    artifacts.
+
+    Unlike semantic refinement macros, this group does not detect a specific
+    target. It scans the image using a fixed overlapping grid.
+
+    Ports
+    -----
+    in_image
+        Base image to refine.
+
+    in_prompt
+        Optional prompt payload wired into every internal ``Img2Img`` node.
+
+    in_texture
+        Style reference used mostly for texture/detail conditioning.
+
+    in_struct
+        Style reference used mostly for structure/composition conditioning.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name.
+
+    refine_spec : SpecInput
+        Spec for every internal ``Img2Img`` refinement node.
+
+    image_size : tuple[int, int]
+        Source image size as ``(width, height)``. This is required because the
+        tile boxes are generated statically when the group is built.
+
+    grid : tuple[int, int], optional
+        Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
+
+    window_fraction : tuple[float, float], optional
+        Tile size as a fraction of the image size, expressed as
+        ``(width_fraction, height_fraction)``.
+
+        With ``grid=(3, 3)`` and ``window_fraction=(0.5, 0.5)``, the image is
+        refined using nine half-image crops whose origins slide over the image
+        with a stride of one quarter of the image size.
+
+    stack_spec : SpecInput, optional
+        Spec for every internal ``ImageStack`` node.
+
+    texture_weight_name : str, optional
+        IP-Adapter weight name used for the texture reference.
+
+    struct_weight_name : str, optional
+        IP-Adapter weight name used for the structure reference.
+
+    texture_weight : float, optional
+        Main texture strength applied mostly to the upper blocks.
+
+    struct_weight : float, optional
+        Main structure strength applied mostly to the lower blocks.
+
+    texture_compl : float, optional
+        Complementary low-block texture strength.
+
+    struct_compl : float, optional
+        Complementary up-block structure strength.
+
+    layer_feather : int or str, optional
+        Feather applied when compositing every refined tile.
+
+    layer_corner_radius : int or str, optional
+        Corner radius applied to every refined tile mask.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed tiled-refinement group.
+
+    Notes
+    -----
+    Tiles are processed sequentially. Each tile is cropped from the progressively
+    updated image produced by the previous tile. This makes overlapping regions
+    accumulate refinements instead of having every tile compete directly against
+    the original image.
+
+    This is usually safer than refining all tiles in parallel and stacking them
+    at the end, because parallel tiles may disagree in overlapping regions.
+
+    This macro is intended for conservative refinement.
+
+    Recommended settings:
+        - strength <= 0.30
+        - cfg/guidance_scale between 2.0 and 3.5
+        - short prompts only
+
+    High denoising strength or high CFG values may cause tiled drift, because each
+    overlapping crop is regenerated independently and then propagated to subsequent
+    tiles.
+    """
+    bboxes = _sliding_window_bboxes_xyxy(
+        image_size=image_size,
+        grid=grid,
+        window_fraction=window_fraction,
+    )
+
+    if not bboxes:
+        raise ValueError(f'{name}: no tile boxes were generated')
+
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style_texture = Tap(name='in_texture')
+        tap_style_struct = Tap(name='in_struct')
+
+        previous_image = tap_image
+
+        for idx, bbox in enumerate(bboxes):
+            is_last = idx == len(bboxes) - 1
+
+            crop_tile = BoxCrop(
+                name=f'crop_{idx:02d}',
+                spec={
+                    'params': {
+                        'bbox_format': 'xyxy',
+                        'bbox': list(bbox),
+                    },
+                },
+            )
+
+            refine_tile = Img2Img(
+                name=f'refine_{idx:02d}',
+                spec=refine_spec,
+            )
+
+            texture_sink = refine_tile.ip_adapter.add(
+                'h94/IP-Adapter',
+                subfolder='sdxl_models',
+                weight_name=texture_weight_name,
+                scale={
+                    'down': {'block_2': [0, texture_compl]},
+                    'up': {'block_0': [0.0, texture_weight, 0.0]},
+                },
+                key='texture',
+            )
+
+            struct_sink = refine_tile.ip_adapter.add(
+                'h94/IP-Adapter',
+                subfolder='sdxl_models',
+                weight_name=struct_weight_name,
+                scale={
+                    'down': {'block_2': [0, struct_weight]},
+                    'up': {'block_0': [0.0, struct_compl, 0.0]},
+                },
+                key='structure',
+            )
+
+            stack_name = 'out' if is_last else f'stack_{idx:02d}'
+
+            stack = ImageStack(
+                name=stack_name,
+                spec=stack_spec,
+            )
+
+            # 1) Use the progressively refined image as the current background.
+            previous_image >> stack.image(0)
+
+            # 2) Crop the current tile from the progressively refined image.
+            previous_image >> crop_tile
+
+            # 3) Refine the tile.
+            crop_tile >> refine_tile
+            tap_prompt >> refine_tile.prompt()
+            tap_style_texture >> texture_sink
+            tap_style_struct >> struct_sink
+
+            # 4) Composite the refined tile back using crop metadata.
+            layer = stack.image(
+                1,
+                position='center',
+                feather=layer_feather,
+                corner_radius=layer_corner_radius,
+            )
+
+            refine_tile >> layer
+            crop_tile >> layer.transform()
+
+            previous_image = stack
+
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style_texture,
+            tap_style_struct,
+        )
+
+    return g
+
+
+def refine_sliding_tiles_with_controlnet_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    image_size: tuple[int, int],
+    grid: tuple[int, int] = (3, 3),
+    window_fraction: tuple[float, float] = (0.5, 0.5),
+    stack_spec: SpecInput = {},
+    controlnet_model: str = 'diffusers/controlnet-depth-sdxl-1.0',
+    controlnet_conditioning_scale: float = 0.7,
+    aux_map_spec: SpecInput = {
+        'processor': 'depth_midas',
+    },
+    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    texture_weight: float = 0.75,
+    struct_weight: float = 0.75,
+    texture_compl: float = 0.1,
+    struct_compl: float = 0.1,
+    layer_feather: int | str = 40,
+    layer_corner_radius: int | str = 60,
+) -> NodeGroup:
+    """
+    Create a reusable NodeGroup that refines an image through overlapping tiles with ControlNet.
+
+    Similar to `refine_sliding_tiles_group`, but each tile refinement is additionally
+    constrained by a geometric conditioning signal (e.g., depth, canny edges) via ControlNet.
+
+    The macro:
+    1. Divides the input image into overlapping rectangular tiles.
+    2. For each tile:
+       - Crops the current (progressively refined) image.
+       - Generates an auxiliary map (depth, canny, etc.) from the tile using ``ImgAuxMap``.
+       - Refines the tile with ``Img2Img`` using:
+         * Two IP-Adapter references (texture and structure)
+         * The auxiliary map as ControlNet conditioning
+       - Composites the refined tile back onto the progressively updated image.
+
+    This approach combines both semantic (style via IP-Adapters) and geometric (structure
+    via ControlNet) constraints to improve detail coherence.
+
+    Ports
+    -----
+    in_image
+        Base image to refine.
+
+    in_prompt
+        Optional prompt payload wired into every internal ``Img2Img`` node.
+
+    in_texture
+        Style reference used mostly for texture/detail conditioning.
+
+    in_struct
+        Style reference used mostly for structure/composition conditioning.
+
+    Parameters
+    ----------
+    name : str
+        NodeGroup name.
+
+    refine_spec : SpecInput
+        Spec for every internal ``Img2Img`` refinement node.
+
+    image_size : tuple[int, int]
+        Source image size as ``(width, height)``. This is required because the
+        tile boxes are generated statically when the group is built.
+
+    grid : tuple[int, int], optional
+        Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
+
+    window_fraction : tuple[float, float], optional
+        Tile size as a fraction of the image size, expressed as
+        ``(width_fraction, height_fraction)``. Default is ``(0.5, 0.5)``.
+
+    stack_spec : SpecInput, optional
+        Spec for every internal ``ImageStack`` node.
+
+    controlnet_model : str, optional
+        ControlNet model identifier (e.g., ``'diffusers/controlnet-depth-sdxl-1.0'``).
+        Default is ``'diffusers/controlnet-depth-sdxl-1.0'``.
+
+    controlnet_conditioning_scale : float, optional
+        Conditioning scale for the ControlNet adapter. Default is ``0.7``.
+
+    aux_map_spec : SpecInput, optional
+        Spec for every internal ``ImgAuxMap`` node used to generate the geometric
+        constraint. By default this uses MiDaS depth, matching ``controlnet_model``:
+        ``{'processor': 'depth_midas'}``.
+        Pass a matching processor/model pair when using a different ControlNet.
+
+    texture_weight_name : str, optional
+        IP-Adapter weight name used for the texture reference.
+
+    struct_weight_name : str, optional
+        IP-Adapter weight name used for the structure reference.
+
+    texture_weight : float, optional
+        Main texture strength applied mostly to the upper blocks.
+
+    struct_weight : float, optional
+        Main structure strength applied mostly to the lower blocks.
+
+    texture_compl : float, optional
+        Complementary low-block texture strength.
+
+    struct_compl : float, optional
+        Complementary up-block structure strength.
+
+    layer_feather : int or str, optional
+        Feather applied when compositing every refined tile.
+
+    layer_corner_radius : int or str, optional
+        Corner radius applied to every refined tile mask.
+
+    Returns
+    -------
+    NodeGroup
+        The constructed tiled-refinement group with ControlNet constraints.
+
+    Notes
+    -----
+    Tiles are processed sequentially. Each tile is cropped from the progressively
+    updated image produced by the previous tile.
+
+    The auxiliary map is generated only for the current tile (not the full image),
+    which keeps ControlNet conditioning spatially aligned with the local refinement.
+
+    Recommended settings:
+        - refine_spec strength <= 0.30
+        - cfg/guidance_scale between 2.0 and 3.5
+        - short prompts only
+    """
+    bboxes = _sliding_window_bboxes_xyxy(
+        image_size=image_size,
+        grid=grid,
+        window_fraction=window_fraction,
+    )
+
+    if not bboxes:
+        raise ValueError(f'{name}: no tile boxes were generated')
+
+    with NodeGroup(name) as g:
+        # -------------------
+        # Ports
+        # -------------------
+        tap_image = Tap(name='in_image')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_style_texture = Tap(name='in_texture')
+        tap_style_struct = Tap(name='in_struct')
+
+        previous_image = tap_image
+
+        for idx, bbox in enumerate(bboxes):
+            is_last = idx == len(bboxes) - 1
+
+            # -------------------
+            # Crop tile from progressively refined image
+            # -------------------
+            crop_tile = BoxCrop(
+                name=f'crop_{idx:02d}',
+                spec={
+                    'params': {
+                        'bbox_format': 'xyxy',
+                        'bbox': list(bbox),
+                    },
+                },
+            )
+
+            # -------------------
+            # Generate auxiliary map (depth/canny/etc) for the cropped tile
+            # -------------------
+            aux_map = ImgAuxMap(
+                name=f'aux_map_{idx:02d}',
+                spec=aux_map_spec,
+            )
+
+            # -------------------
+            # Refine tile with style adapters and geometric constraint
+            # -------------------
+            refine_tile = Img2Img(
+                name=f'refine_{idx:02d}',
+                spec=refine_spec,
+            )
+
+            # Texture IP-Adapter
+            texture_sink = refine_tile.ip_adapter.add(
+                'h94/IP-Adapter',
+                subfolder='sdxl_models',
+                weight_name=texture_weight_name,
+                scale={
+                    'down': {'block_2': [0, texture_compl]},
+                    'up': {'block_0': [0.0, texture_weight, 0.0]},
+                },
+                key='texture',
+            )
+
+            # Structure IP-Adapter
+            struct_sink = refine_tile.ip_adapter.add(
+                'h94/IP-Adapter',
+                subfolder='sdxl_models',
+                weight_name=struct_weight_name,
+                scale={
+                    'down': {'block_2': [0, struct_weight]},
+                    'up': {'block_0': [0.0, struct_compl, 0.0]},
+                },
+                key='structure',
+            )
+
+            # ControlNet from auxiliary map
+            controlnet_sink = refine_tile.controlnet.add(
+                controlnet_model,
+                conditioning_scale=controlnet_conditioning_scale,
+                key='geometry',
+            )
+
+            # -------------------
+            # Composite refined tile back
+            # -------------------
+            stack_name = 'out' if is_last else f'stack_{idx:02d}'
+
+            stack = ImageStack(
+                name=stack_name,
+                spec=stack_spec,
+            )
+
+            # 1) Use the progressively refined image as the current background.
+            previous_image >> stack.image(0)
+
+            # 2) Crop the current tile from the progressively refined image.
+            previous_image >> crop_tile
+
+            # 3) Generate auxiliary map from the cropped tile.
+            crop_tile >> aux_map
+
+            # 4) Refine the tile with all constraints.
+            crop_tile >> refine_tile
+            tap_prompt >> refine_tile.prompt()
+            tap_style_texture >> texture_sink
+            tap_style_struct >> struct_sink
+            aux_map >> controlnet_sink
+
+            # 5) Composite the refined tile back using crop metadata.
+            layer = stack.image(
+                1,
+                position='center',
+                feather=layer_feather,
+                corner_radius=layer_corner_radius,
+            )
+
+            refine_tile >> layer
+            crop_tile >> layer.transform()
+
+            previous_image = stack
+
+        g.register_ports(
+            tap_image,
+            tap_prompt,
+            tap_style_texture,
+            tap_style_struct,
         )
 
     return g

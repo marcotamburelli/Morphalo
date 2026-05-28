@@ -21,45 +21,88 @@ from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 @dataclass
 class ImgAuxMap(NodeRef):
     """
-    Single-image auxiliary preprocessing node producing a packed control image
-    via ControlNet auxiliary annotators.
+    Single-image auxiliary preprocessing node producing a ControlNet-ready map.
 
-    This node reads an input image (via the default DAG connection) and produces a
-    single packed control image suitable for conditioning diffusion pipelines
-    (e.g. ControlNet, T2I-Adapter, pose/edge/depth-guided pipelines).
+    This node reads one input image, runs a ``controlnet-aux`` annotator on it,
+    and writes the resulting auxiliary image as a PNG file. The generated image is
+    intended to be used as spatial conditioning for downstream diffusion pipelines,
+    for example ControlNet, T2I-Adapter, or other image-guided SDXL workflows.
 
-    The control image is generated using one of the auxiliary annotators provided
-    by ``controlnet-aux`` (e.g. OpenPose, Canny, HED, MiDaS, LineArt, Zoe, etc.),
-    selected through the ``processor`` parameter. All annotators share a common execution
-    and resizing pipeline, ensuring consistent spatial semantics across different
-    control modalities.
+    The concrete auxiliary map is selected through ``processor``. Typical examples
+    include pose skeletons, Canny edges, HED edges, line art, depth maps, normal
+    maps, and other structure-oriented conditioning signals.
 
-    The output control image is a standard BGR image (OpenCV convention) written
-    to disk as PNG, together with a JSON sidecar containing resolved parameters,
-    input/output metadata, and timing information.
+    The node uses two separate resizing stages:
 
-    Processing overview
-    -------------------
-    1) Load the input image in BGR format (OpenCV).
-    2) Convert to RGB and resize for inference so that the long side equals
-    ``detect_long_side`` (aspect ratio preserved).
-    3) Run the selected controlnet-aux annotator on the resized image.
-    4) Convert the annotator output back to a NumPy array.
-    5) Resize the output control image to the target size:
-    - If ``out_width``/``out_height`` are provided, fit and optionally pad.
-    - Otherwise, preserve the original input image size.
-    6) Write the output control image to disk (PNG) and emit a JSON sidecar.
+    1. Annotator inference resize
+        The source image is resized before being passed to the annotator. This is
+        controlled by ``detect_long_side`` and always preserves aspect ratio.
+
+    2. Final output resize
+        The annotator result is resized to the final control-map canvas. This is
+        controlled by ``out_width``, ``out_height``, ``pad_to_multiple_of``, and
+        ``output_resize_mode``.
+
+    These two stages are intentionally independent. ``detect_long_side`` controls
+    only the resolution seen by the annotator; it does not define the final output
+    size.
+
+    Processing flow
+    ---------------
+    The node performs the following steps:
+
+    1. Resolve the input image path from the upstream default input.
+
+    2. Load the image with OpenCV.
+
+      The image is initially loaded in BGR format, following OpenCV conventions.
+
+    3. Convert the image from BGR to RGB.
+
+      ``controlnet-aux`` annotators operate on PIL/RGB images, so the image is
+      converted before preprocessing.
+
+    4. Resize the RGB image for annotator inference.
+
+      The longest side is scaled to ``detect_long_side`` while preserving the
+      source aspect ratio. This resized image is used only as annotator input.
+
+    5. Run the selected ``controlnet-aux`` annotator.
+
+      Annotator defaults are read from ``MODEL_PARAMS[processor]`` and can be
+      overridden through ``params``.
+
+    6. Resolve the final output size.
+
+      If ``out_width`` or ``out_height`` are provided, they define the requested
+      final output canvas. Any missing dimension falls back to the corresponding
+      original input-image dimension.
+
+      The resolved size is then optionally rounded up using
+      ``pad_to_multiple_of``.
+
+    7. Resize the annotator output to the final canvas.
+
+      The resize strategy is controlled by ``output_resize_mode``:
+
+      - ``'stretch'`` resizes directly to the final canvas size.
+      - ``'contain'`` preserves aspect ratio and pads the remaining area with
+        black pixels.
+
+    8. Save the final map as PNG.
+
+      The final RGB map is converted back to BGR before being written with OpenCV.
+
+    9. Write a JSON sidecar.
+
+      The sidecar contains resolved parameters, input/output geometry, and timing
+      information.
 
     Parameters
     ----------
     name : str, optional
-        Unique node identifier within the DAG. If not provided, it is auto-generated
-        by the enclosing DAG/NodeRef implementation.
-
-    path : str or Path, optional
-        Input image path. If omitted, the node resolves the upstream default input
-        (``input['default']['images']``, ``input['default']['image']`` or
-        ``input['default']['path']``).
+        Unique node identifier within the DAG. If not provided, an identifier is
+        automatically generated by the enclosing DAG.
 
     spec : dict or str or pathlib.Path or sequence of (dict or str or pathlib.Path)
         Node configuration specification.
@@ -69,90 +112,168 @@ class ImgAuxMap(NodeRef):
         sequence is given, each element is resolved independently and merged from
         left to right, with later elements overriding earlier ones.
 
+        Expected keys include:
+
+        **Annotator selection**
+
+        - ``processor`` : str, optional
+            ``controlnet-aux`` processor identifier. Default is
+            ``'openpose_full'``.
+
+            The value must be one of the processors available in
+            ``third_party.controlnet_aux.processor.MODELS``.
+
+        - ``device`` : str, optional
+            Device used for checkpoint-backed annotators. Default is ``'cuda'``.
+
+            Lightweight or stateless processors may ignore this value.
+
+        **Annotator inference resizing**
+
+        - ``detect_long_side`` : int, optional
+            Long-side resolution used when running the annotator. Default is
+            ``512``.
+
+            The input image is resized proportionally so that its longest side
+            equals this value. The aspect ratio is preserved.
+
+            This parameter affects preprocessing cost and annotator detail level,
+            but it does not determine the final output size.
+
+        **Final output sizing**
+
+        - ``out_width`` : int or None, optional
+            Requested final output width.
+
+            If omitted, the original input image width is used. The resolved value
+            may still be rounded up by ``pad_to_multiple_of``.
+
+        - ``out_height`` : int or None, optional
+            Requested final output height.
+
+            If omitted, the original input image height is used. The resolved value
+            may still be rounded up by ``pad_to_multiple_of``.
+
+        - ``pad_to_multiple_of`` : int, optional
+            Output-size alignment multiple. Default is ``64``.
+
+            If greater than 1, the final output width and height are rounded up to
+            the nearest multiple of this value. This is useful for diffusion
+            pipelines that expect or prefer dimensions aligned to a fixed multiple.
+
+            Use ``1`` or ``0`` to disable output-size alignment.
+
+        - ``output_resize_mode`` : {'stretch', 'contain'}, optional
+            Strategy used to adapt the annotator output to the final canvas.
+            Default is ``'stretch'``.
+
+            ``'stretch'``
+                Resize the annotator output directly to the final width and height.
+
+                This may slightly distort the auxiliary map if the target aspect
+                ratio differs from the annotator output aspect ratio. However, it
+                guarantees that the control image fills the whole target canvas and
+                matches the downstream generation size exactly.
+
+                This is usually the preferred mode when the control map is meant to
+                align pixel-for-pixel with a diffusion canvas.
+
+            ``'contain'``
+                Preserve the annotator output aspect ratio and fit it inside the
+                final canvas.
+
+                Empty areas are padded with black pixels. This avoids geometric
+                distortion, but the padding becomes part of the conditioning signal.
+
+            ``'cover'`` is intentionally not supported because cropping a control map
+            would discard spatial conditioning information.
+
+        **Annotator parameters**
+
+        - ``params`` : dict, optional
+            Annotator-specific parameter overrides.
+
+            The node starts from ``MODEL_PARAMS[processor]`` and applies this
+            dictionary on top. Supported keys depend on the selected processor.
+
+    path : str or pathlib.Path, optional
+        Input image path.
+
+        If provided, this path is used directly and the node does not require an
+        upstream default input. If omitted, the input image is resolved from the
+        upstream ``default`` input.
+
     Inputs
     ------
-    default : dict
-        Required upstream output mapping that must contain the input image path.
-        The node expects either:
-
-        - ``image`` : str
-            Filesystem path to the input image.
-        - ``path`` : str
-            Alternative key for the filesystem path.
+    default : dict, optional
+        Required only when ``path`` is not provided. Upstream output dictionary
+        containing the source image path. The node expects either ``"image"`` or
+        ``"path"`` to point to the image file.
 
     Outputs
     -------
     dict
-        JSON-serializable dictionary containing at least:
+        Primary output dictionary.
+
+        The output contains at least:
 
         - ``ok`` : bool
+          Success flag.
+
         - ``node`` : str
-            Operator name (derived from the class name by ``NodeRef``).
+          Operator name derived from the concrete node class.
+
         - ``id`` : str
-            Node id.
+          Node identifier.
+
         - ``input_image`` : str
-            Input image path.
+          Resolved input image path.
+
         - ``image`` : str
-            Filesystem path to the generated control image (PNG).
+          Path to the generated auxiliary map PNG.
+
         - ``input`` : dict
-            Input image resolution metadata.
+          Input image metadata, including original width and height.
+
         - ``output`` : dict
-            Output image resolution metadata.
+          Output image metadata, including final width and height.
+
         - ``params`` : dict
-            Resolved preprocessing and annotator parameters.
-        - ``metadata`` : str
-            Filesystem path to the JSON sidecar.
+          Resolved preprocessing and annotator parameters.
+
         - ``timing`` : dict
-            Elapsed time for the run.
+          Runtime timing information.
 
-    Configuration keys (spec)
-    -------------------------
-    Annotator selection
-    ~~~~~~~~~~~~~~~~~~~
-    processor : str, default "openpose_full"
-        Control modality / annotator identifier. Must be one of the keys supported
-        by ``controlnet-aux`` (e.g. ``openpose_full``, ``canny``, ``depth_midas``,
-        ``lineart_realistic``, ``normal_bae``, etc.).
-
-    Inference resizing
-    ~~~~~~~~~~~~~~~~~~
-    detect_long_side : int, default 512
-        Long-side resolution used for annotator inference. The input image is resized
-        before running the annotator to reduce computation cost while preserving
-        aspect ratio. Typical values are 512 (quality) or 384 (fast mode).
-
-    Output resizing
-    ~~~~~~~~~~~~~~~
-    out_width : int | None, default None
-        Target output width. If not provided, the original input image width is used.
-    out_height : int | None, default None
-        Target output height. If not provided, the original input image height is used.
-    keep_aspect : bool, default True
-        If True, the output control image is resized using letterbox fit (aspect ratio
-        preserved) and padded as needed. If False, the image is stretched to exactly
-        match the target size.
-    pad_to_multiple_of : int, default 64
-        If > 1, output dimensions are rounded up to the nearest multiple of this value
-        (commonly required by diffusion backbones such as SDXL).
-
-    Annotator parameters
-    ~~~~~~~~~~~~~~~~~~~~
-    params : dict, optional
-        Dictionary of annotator-specific parameters that override the defaults defined
-        by ``MODEL_PARAMS[processor]``. The exact keys depend on the selected annotator.
+        - ``metadata`` : str
+          Path to the JSON sidecar.
 
     Notes
     -----
-    - All outputs are written as PNG to avoid lossy compression artifacts that could
-    degrade thin edges, pose skeletons, or depth gradients.
-    - This node is purely spatial and stateless; no temporal smoothing or tracking
-    is applied. For temporally consistent preprocessing, use the corresponding
-    video node (``VideoAuxMap``).
-    - Some annotators (e.g. DWPose) may require additional backends and are not
-    available out-of-the-box in all environments.
+    - The final output image is written as PNG to avoid lossy compression artifacts.
+      This is important for thin edges, pose skeletons, line art, and depth
+      gradients.
+
+    - The final control map should usually have the same size as the image that will
+      be generated or transformed downstream.
+
+    - ``output_resize_mode='stretch'`` is generally the safest default for
+      ControlNet-style workflows where the conditioning image must match the target
+      generation canvas exactly.
+
+    - ``output_resize_mode='contain'`` is useful when preserving the annotator map
+      aspect ratio is more important than filling the whole output canvas.
+
+    - Black padding introduced by ``'contain'`` is still part of the conditioning
+      image and may influence generation.
+
+    - This node is spatial and stateless. It does not perform temporal smoothing,
+      tracking, or cross-frame consistency.
+
+    - Some ``controlnet-aux`` processors may require additional checkpoints or
+      third-party backends and may not be available in every environment.
     """
 
-    path: Union[str, Path, List[Union[str, Path]]] = None
+    path: Optional[Union[str, Path]] = None
     spec: SpecInput = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -192,10 +313,29 @@ class ImgAuxMap(NodeRef):
         device = spec.get('device', 'cuda')
 
         detect_long_side = int(spec.get('detect_long_side', 512))
+        if detect_long_side <= 0:
+            raise ValueError(
+                f"'{self.id}': invalid detect_long_side={detect_long_side!r}; "
+                'expected >= 0.'
+            )
+
         out_w = spec.get('out_width', None)
         out_h = spec.get('out_height', None)
+
         pad_to_multiple_of = int(spec.get('pad_to_multiple_of', 64))
-        keep_aspect = bool(spec.get('keep_aspect', True))
+        if pad_to_multiple_of < 0:
+            raise ValueError(
+                f"'{self.id}': invalid pad_to_multiple_of={pad_to_multiple_of!r}; "
+                'expected a positive integer.'
+            )
+
+        output_resize_mode = str(spec.get('output_resize_mode', 'stretch'))
+        if output_resize_mode not in ('stretch', 'contain'):
+            raise ValueError(
+                f"'{self.id}': invalid output_resize_mode={output_resize_mode!r} "
+                "expected 'stretch' or 'contain'."
+            )
+        keep_aspect = output_resize_mode == 'contain'
 
         # params: defaults + overrides
         params = dict(MODEL_PARAMS.get(processor, {}))
@@ -208,8 +348,15 @@ class ImgAuxMap(NodeRef):
         in_h, in_w = frame_bgr.shape[:2]
 
         # decide output size
-        target_w = int(out_w) if out_w else in_w
-        target_h = int(out_h) if out_h else in_h
+        target_w = int(out_w) if out_w is not None else in_w
+        target_h = int(out_h) if out_h is not None else in_h
+
+        if target_w <= 0 or target_h <= 0:
+            raise ValueError(
+                f"'{self.id}': invalid output size {target_w}x{target_h}; "
+                'expected positive dimensions.'
+            )
+
         if pad_to_multiple_of and pad_to_multiple_of > 1:
             target_w = round_up(target_w, pad_to_multiple_of)
             target_h = round_up(target_h, pad_to_multiple_of)
@@ -222,7 +369,7 @@ class ImgAuxMap(NodeRef):
 
         pil_in = Image.fromarray(rgb_small)
         # controlnet-aux detectors take PIL
-        pil_out = annotator(pil_in, **params)
+        pil_out = annotator(pil_in, **params).convert('RGB')
         out_rgb = np.array(pil_out, dtype=np.uint8)
 
         # --- output fit/pad ---
@@ -231,7 +378,7 @@ class ImgAuxMap(NodeRef):
             out_w=target_w,
             out_h=target_h,
             keep_aspect=keep_aspect,
-            pad_to_multiple_of=1,  # already padded target dims above
+            pad_to_multiple_of=1,  # target dimensions are already aligned above
         )
 
         out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
@@ -264,7 +411,7 @@ class ImgAuxMap(NodeRef):
                 'out_width': out_w,
                 'out_height': out_h,
                 'pad_to_multiple_of': pad_to_multiple_of,
-                'keep_aspect': keep_aspect,
+                'output_resize_mode': output_resize_mode,
                 'annotator_params': params,
             },
             'output': {

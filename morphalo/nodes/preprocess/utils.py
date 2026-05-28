@@ -1,5 +1,188 @@
 import cv2
+import math
+import re
 import numpy as np
+from dataclasses import dataclass
+from typing import Any, Literal, Optional
+
+CropModeName = Literal['bbox', 'trim', 'full_frame']
+
+@dataclass(frozen=True)
+class CropModeSpec:
+    """
+    Normalized crop-mode configuration.
+
+    Parameters
+    ----------
+    mode : {'bbox', 'trim', 'full_frame'}
+        Base crop mode.
+    ratio : tuple[int, int] | None, optional
+        Desired aspect ratio for bbox-guided crops, expressed as ``(w, h)``.
+
+        This is only meaningful when ``mode == 'bbox'``.
+        The ratio is a target, not a hard constraint: the final crop is expanded
+        toward the requested ratio as much as possible while keeping the target
+        fully inside the crop and staying within image bounds.
+    raw : str
+        Original user-provided crop-mode string, preserved for reporting.
+    """
+    mode: CropModeName
+    ratio: Optional[tuple[int, int]] = None
+    raw: str = 'trim'
+
+
+def tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
+    ys, xs = np.where(alpha > 0)
+    if xs.size == 0 or ys.size == 0:
+        raise RuntimeError('Trimmed crop has no non-transparent pixels.')
+
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+
+    return x1, y1, x2, y2
+
+
+def parse_crop_mode(value: Any, *, node_id: str) -> CropModeSpec:
+    s = str(value).strip().lower()
+
+    if s in ('bbox', 'trim', 'full_frame'):
+        return CropModeSpec(mode=s, ratio=None, raw=s)
+
+    m = re.fullmatch(r'bbox\[(\d+):(\d+)\]', s)
+    if m is None:
+        raise ValueError(
+            f"'{node_id}': invalid crop_mode={value!r} "
+            "(expected 'bbox', 'bbox[w:h]', 'trim', or 'full_frame')"
+        )
+
+    rw = int(m.group(1))
+    rh = int(m.group(2))
+
+    if rw <= 0 or rh <= 0:
+        raise ValueError(
+            f"'{node_id}': invalid crop_mode={value!r} "
+            '(ratio terms must be > 0)'
+        )
+
+    return CropModeSpec(mode='bbox', ratio=(rw, rh), raw=s)
+
+
+def expand_bbox_toward_ratio(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    *,
+    full_w: int,
+    full_h: int,
+    ratio: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    x1 = int(x1)
+    y1 = int(y1)
+    x2 = int(x2)
+    y2 = int(y2)
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError(f'Invalid bbox: {(x1, y1, x2, y2)!r}')
+
+    rw, rh = ratio
+    target_ratio = float(rw) / float(rh)
+
+    bw = int(x2 - x1)
+    bh = int(y2 - y1)
+
+    if bw <= 0 or bh <= 0:
+        raise RuntimeError(f'Invalid bbox size: {(bw, bh)!r}')
+
+    current_ratio = float(bw) / float(bh)
+
+    if current_ratio >= target_ratio:
+        crop_w = bw
+        crop_h = int(math.ceil(float(crop_w) / target_ratio))
+    else:
+        crop_h = bh
+        crop_w = int(math.ceil(float(crop_h) * target_ratio))
+
+    crop_w = max(crop_w, bw)
+    crop_h = max(crop_h, bh)
+
+    crop_w = min(crop_w, full_w)
+    crop_h = min(crop_h, full_h)
+
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    out_x1 = int(math.floor(cx - crop_w / 2.0))
+    out_y1 = int(math.floor(cy - crop_h / 2.0))
+    out_x2 = out_x1 + crop_w
+    out_y2 = out_y1 + crop_h
+
+    if out_x1 < 0:
+        out_x2 -= out_x1
+        out_x1 = 0
+    if out_x2 > full_w:
+        shift = out_x2 - full_w
+        out_x1 -= shift
+        out_x2 = full_w
+
+    if out_y1 < 0:
+        out_y2 -= out_y1
+        out_y1 = 0
+    if out_y2 > full_h:
+        shift = out_y2 - full_h
+        out_y1 -= shift
+        out_y2 = full_h
+
+    out_x1 = max(0, out_x1)
+    out_y1 = max(0, out_y1)
+    out_x2 = min(full_w, out_x2)
+    out_y2 = min(full_h, out_y2)
+
+    if out_x1 > x1:
+        needed = out_x1 - x1
+        grow = min(needed, full_w - out_x2)
+        out_x1 -= needed
+        out_x2 += grow
+        out_x1 = max(0, out_x1)
+        out_x2 = min(full_w, out_x2)
+
+    if out_x2 < x2:
+        needed = x2 - out_x2
+        grow = min(needed, out_x1)
+        out_x2 += needed
+        out_x1 -= grow
+        out_x1 = max(0, out_x1)
+        out_x2 = min(full_w, out_x2)
+
+    if out_y1 > y1:
+        needed = out_y1 - y1
+        grow = min(needed, full_h - out_y2)
+        out_y1 -= needed
+        out_y2 += grow
+        out_y1 = max(0, out_y1)
+        out_y2 = min(full_h, out_y2)
+
+    if out_y2 < y2:
+        needed = y2 - out_y2
+        grow = min(needed, out_y1)
+        out_y2 += needed
+        out_y1 -= grow
+        out_y1 = max(0, out_y1)
+        out_y2 = min(full_h, out_y2)
+
+    if out_x2 <= out_x1 or out_y2 <= out_y1:
+        raise RuntimeError(
+            f'Failed to derive a valid expanded crop bbox from {(x1, y1, x2, y2)!r}.'
+        )
+
+    if not (out_x1 <= x1 and x2 <= out_x2 and out_y1 <= y1 and y2 <= out_y2):
+        raise RuntimeError(
+            'Expanded crop bbox does not fully contain the original bbox.'
+        )
+
+    return int(out_x1), int(out_y1), int(out_x2), int(out_y2)
 
 
 def round_up(x: int, m: int) -> int:

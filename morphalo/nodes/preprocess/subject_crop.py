@@ -2,7 +2,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -17,7 +17,11 @@ from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import postprocess_mask
+from morphalo.nodes.preprocess.segmentation import predict_sam_mask
+from morphalo.nodes.preprocess.utils import (CropModeSpec,
+                                             expand_bbox_toward_ratio,
+                                             parse_crop_mode, postprocess_mask,
+                                             tight_alpha_bbox)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.face_region import (crop_head_area_from_pose,
                                                expand_clip_bbox,
@@ -32,33 +36,6 @@ from morphalo.nodes.vision.human import (eye_bbox_xyxy_from_landmarks,
                                          mp_pose_landmarks_xy,
                                          resolve_person_bbox_xyxy)
 
-CropModeName = Literal['bbox', 'trim', 'full_frame']
-
-
-@dataclass(frozen=True)
-class CropModeSpec:
-    """
-    Normalized crop-mode configuration.
-
-    Parameters
-    ----------
-    mode : {'bbox', 'trim', 'full_frame'}
-        Base crop mode.
-    ratio : tuple[int, int] | None, optional
-        Desired aspect ratio for bbox-guided crops, expressed as ``(w, h)``.
-
-        This is only meaningful when ``mode == 'bbox'``.
-        The ratio is a target, not a hard constraint: the final crop is expanded
-        toward the requested ratio as much as possible while keeping the target
-        fully inside the crop and staying within image bounds.
-    raw : str
-        Original user-provided crop-mode string, preserved for reporting.
-    """
-    mode: CropModeName
-    ratio: Optional[tuple[int, int]] = None
-    raw: str = 'trim'
-
-
 # Internal geometry constants.
 #
 # HEAD_AREA_EXPANSION defines how generously the pose-derived head area is cropped
@@ -69,233 +46,6 @@ class CropModeSpec:
 # visible face crop.
 FACE_BBOX_EXPANSION = 1.15
 HEAD_AREA_EXPANSION = 1.6
-
-
-def _tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
-    """
-    Return the minimal end-exclusive box containing non-zero alpha pixels.
-
-    Parameters
-    ----------
-    alpha : np.ndarray
-        Alpha channel with shape ``(H, W)``.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        Tight bounding box ``(x1, y1, x2, y2)`` in local coordinates.
-
-    Raises
-    ------
-    RuntimeError
-        If the alpha channel contains no non-zero pixels.
-    """
-    ys, xs = np.where(alpha > 0)
-    if xs.size == 0 or ys.size == 0:
-        raise RuntimeError('Trimmed crop has no non-transparent pixels.')
-
-    x1 = int(xs.min())
-    y1 = int(ys.min())
-    x2 = int(xs.max()) + 1
-    y2 = int(ys.max()) + 1
-
-    return x1, y1, x2, y2
-
-
-def _parse_crop_mode(value: Any, *, node_id: str) -> CropModeSpec:
-    """
-    Parse and validate the crop-mode configuration.
-
-    Supported forms
-    ---------------
-    - 'bbox'
-    - 'bbox[w:h]'
-    - 'trim'
-    - 'full_frame'
-
-    Notes
-    -----
-    ``bbox[w:h]`` requests a bbox crop expanded toward the given aspect ratio.
-    The requested ratio is not guaranteed exactly if the source image bounds do
-    not provide enough room.
-    """
-    s = str(value).strip().lower()
-
-    if s in ('bbox', 'trim', 'full_frame'):
-        return CropModeSpec(
-            mode=s,
-            ratio=None,
-            raw=s,
-        )
-
-    m = re.fullmatch(r'bbox\[(\d+):(\d+)\]', s)
-    if m is None:
-        raise ValueError(
-            f"'{node_id}': invalid crop_mode={value!r} "
-            "(expected 'bbox', 'bbox[w:h]', 'trim', or 'full_frame')"
-        )
-
-    rw = int(m.group(1))
-    rh = int(m.group(2))
-
-    if rw <= 0 or rh <= 0:
-        raise ValueError(
-            f"'{node_id}': invalid crop_mode={value!r} "
-            '(ratio terms must be > 0)'
-        )
-
-    return CropModeSpec(
-        mode='bbox',
-        ratio=(rw, rh),
-        raw=s,
-    )
-
-
-def _expand_bbox_toward_ratio(
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    *,
-    full_w: int,
-    full_h: int,
-    ratio: tuple[int, int],
-) -> tuple[int, int, int, int]:
-    """
-    Expand a bounding box toward a desired aspect ratio within image bounds.
-
-    The input bbox is preserved entirely inside the returned crop. Expansion is
-    attempted symmetrically around the bbox center first; when the crop hits an
-    image border, the remaining expansion is compensated asymmetrically on the
-    opposite side. If the source image is too constrained, the returned crop may
-    deviate from the requested ratio.
-
-    Parameters
-    ----------
-    x1, y1, x2, y2 : int
-        End-exclusive source bbox coordinates.
-    full_w, full_h : int
-        Full source image size.
-    ratio : tuple[int, int]
-        Desired aspect ratio as ``(w, h)``.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        Expanded end-exclusive crop box within source-image bounds.
-    """
-    x1 = int(x1)
-    y1 = int(y1)
-    x2 = int(x2)
-    y2 = int(y2)
-
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError(f'Invalid bbox: {(x1, y1, x2, y2)!r}')
-
-    rw, rh = ratio
-    target_ratio = float(rw) / float(rh)
-
-    bw = int(x2 - x1)
-    bh = int(y2 - y1)
-
-    if bw <= 0 or bh <= 0:
-        raise RuntimeError(f'Invalid bbox size: {(bw, bh)!r}')
-
-    current_ratio = float(bw) / float(bh)
-
-    # Compute the ideal size that would contain the original bbox exactly.
-    if current_ratio >= target_ratio:
-        crop_w = bw
-        crop_h = int(math.ceil(float(crop_w) / target_ratio))
-    else:
-        crop_h = bh
-        crop_w = int(math.ceil(float(crop_h) * target_ratio))
-
-    crop_w = max(crop_w, bw)
-    crop_h = max(crop_h, bh)
-
-    # If the ideal size does not fit inside the source image, clamp it.
-    crop_w = min(crop_w, full_w)
-    crop_h = min(crop_h, full_h)
-
-    # Center the crop on the original bbox center first.
-    cx = 0.5 * (x1 + x2)
-    cy = 0.5 * (y1 + y2)
-
-    out_x1 = int(math.floor(cx - crop_w / 2.0))
-    out_y1 = int(math.floor(cy - crop_h / 2.0))
-    out_x2 = out_x1 + crop_w
-    out_y2 = out_y1 + crop_h
-
-    # Shift horizontally into bounds without changing width.
-    if out_x1 < 0:
-        out_x2 -= out_x1
-        out_x1 = 0
-    if out_x2 > full_w:
-        shift = out_x2 - full_w
-        out_x1 -= shift
-        out_x2 = full_w
-
-    # Shift vertically into bounds without changing height.
-    if out_y1 < 0:
-        out_y2 -= out_y1
-        out_y1 = 0
-    if out_y2 > full_h:
-        shift = out_y2 - full_h
-        out_y1 -= shift
-        out_y2 = full_h
-
-    # Final clamp for numerical safety.
-    out_x1 = max(0, out_x1)
-    out_y1 = max(0, out_y1)
-    out_x2 = min(full_w, out_x2)
-    out_y2 = min(full_h, out_y2)
-
-    # Ensure containment. If the clamped box still does not fully contain the
-    # original bbox, expand toward the available side as much as possible.
-    if out_x1 > x1:
-        needed = out_x1 - x1
-        grow = min(needed, full_w - out_x2)
-        out_x1 -= needed
-        out_x2 += grow
-        out_x1 = max(0, out_x1)
-        out_x2 = min(full_w, out_x2)
-
-    if out_x2 < x2:
-        needed = x2 - out_x2
-        grow = min(needed, out_x1)
-        out_x2 += needed
-        out_x1 -= grow
-        out_x1 = max(0, out_x1)
-        out_x2 = min(full_w, out_x2)
-
-    if out_y1 > y1:
-        needed = out_y1 - y1
-        grow = min(needed, full_h - out_y2)
-        out_y1 -= needed
-        out_y2 += grow
-        out_y1 = max(0, out_y1)
-        out_y2 = min(full_h, out_y2)
-
-    if out_y2 < y2:
-        needed = y2 - out_y2
-        grow = min(needed, out_y1)
-        out_y2 += needed
-        out_y1 -= grow
-        out_y1 = max(0, out_y1)
-        out_y2 = min(full_h, out_y2)
-
-    if out_x2 <= out_x1 or out_y2 <= out_y1:
-        raise RuntimeError(
-            f'Failed to derive a valid expanded crop bbox from {(x1, y1, x2, y2)!r}.'
-        )
-
-    if not (out_x1 <= x1 and x2 <= out_x2 and out_y1 <= y1 and y2 <= out_y2):
-        raise RuntimeError(
-            'Expanded crop bbox does not fully contain the original bbox.'
-        )
-
-    return int(out_x1), int(out_y1), int(out_x2), int(out_y2)
 
 
 @dataclass
@@ -317,6 +67,7 @@ class Config:
     hand_landmarker_task: Optional[str]
     pose_landmarker_task: str
     smoothing_radius: int
+    min_landmark_fraction: Optional[float]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -333,7 +84,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     # It should apply only when mode='default'
     if mode == 'default':
-        crop_mode = _parse_crop_mode(
+        crop_mode = parse_crop_mode(
             params.get('crop_mode', 'trim'),
             node_id=node_id,
         )
@@ -346,6 +97,14 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     dilate_radius = int(params.get('dilate_radius', 0))
     close_radius = int(params.get('close_radius', 0))
     smoothing_radius = int(params.get('smoothing_radius', 0))
+    min_landmark_fraction = params.get('min_landmark_fraction', 0.8)
+    if min_landmark_fraction is not None:
+        min_landmark_fraction = float(min_landmark_fraction)
+        if not (0.0 <= min_landmark_fraction <= 1.0):
+            raise ValueError(
+                f"'{node_id}': invalid min_landmark_fraction={min_landmark_fraction!r} "
+                '(expected a float in [0, 1] or None)'
+            )
 
     target = str(params.get('target', 'person'))
     if target not in (
@@ -427,6 +186,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         hand_landmarker_task=hand_landmarker_task,
         pose_landmarker_task=pose_landmarker_task,
         smoothing_radius=smoothing_radius,
+        min_landmark_fraction=min_landmark_fraction,
     )
 
 
@@ -530,110 +290,6 @@ def _positive_points_for_sam(
     return points, labels
 
 
-def _predict_sam_mask(
-    *,
-    img_rgb: np.ndarray,
-    bbox: tuple[int, int, int, int],
-    processor: Any,
-    model: Any,
-    device: str,
-    point_coords: Optional[list[list[float]]] = None,
-    point_labels: Optional[list[int]] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Predict SAM mask candidates from one bbox and optional positive points.
-
-    This helper targets the Hugging Face SAM / SAM-HQ processor API, where mask
-    post-processing requires both ``original_sizes`` and
-    ``reshaped_input_sizes``. SAM2-style processors are intentionally not handled
-    here.
-
-    Parameters
-    ----------
-    img_rgb : np.ndarray
-        RGB source image with shape ``(H, W, 3)``.
-
-    bbox : tuple[int, int, int, int]
-        Prompt bbox ``(x1, y1, x2, y2)`` in full-image coordinates.
-
-    processor : Any
-        Hugging Face SAM-compatible processor.
-
-    model : Any
-        Hugging Face SAM-compatible model.
-
-    device : str
-        Runtime device.
-
-    point_coords : list[list[float]] | None, optional
-        Optional positive prompt points in full-image coordinates.
-
-    point_labels : list[int] | None, optional
-        Optional point labels. Positive labels are encoded as ``1``.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        ``(masks, scores)`` where ``masks`` has shape ``(N, H, W)`` and dtype
-        ``bool``, and ``scores`` has shape ``(N,)``.
-    """
-    image = Image.fromarray(np.ascontiguousarray(img_rgb))
-
-    x1, y1, x2, y2 = bbox
-
-    kwargs: dict[str, Any] = {
-        'images': image,
-        'input_boxes': [[[float(x1), float(y1), float(x2), float(y2)]]],
-        'return_tensors': 'pt',
-    }
-
-    if point_coords is not None and point_labels is not None:
-        kwargs['input_points'] = [[point_coords]]
-        kwargs['input_labels'] = [[point_labels]]
-
-    inputs = processor(**kwargs)
-
-    model_dtype = next(model.parameters()).dtype
-
-    inputs = {
-        key: (
-            value.to(device=device, dtype=model_dtype)
-            if torch.is_tensor(value) and torch.is_floating_point(value)
-            else value.to(device=device)
-            if torch.is_tensor(value)
-            else value
-        )
-        for key, value in inputs.items()
-    }
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-
-    masks_t = processor.image_processor.post_process_masks(
-        outputs.pred_masks.detach().float().cpu(),
-        inputs['original_sizes'].detach().cpu(),
-        inputs['reshaped_input_sizes'].detach().cpu(),
-    )[0]
-
-    masks_np = masks_t.numpy()
-
-    if masks_np.ndim == 4:
-        masks_np = masks_np[0]
-    elif masks_np.ndim != 3:
-        raise RuntimeError(f'Unexpected SAM mask shape: {masks_np.shape!r}')
-
-    scores_np = (
-        outputs.iou_scores
-        .detach()
-        .float()
-        .cpu()
-        .numpy()
-        .reshape(-1)
-    )
-
-    return masks_np.astype(bool), scores_np.astype(np.float32)
-
-
 @dataclass(frozen=True)
 class SamMaskCandidate:
     """
@@ -668,6 +324,7 @@ def _build_person_sam_candidates(
     processor: Any,
     model: Any,
     device: str,
+    use_landmarks: bool = True,
 ) -> list[SamMaskCandidate]:
     """
     Build person SAM candidates using strict and complete prompting.
@@ -698,18 +355,22 @@ def _build_person_sam_candidates(
     """
     candidates: list[SamMaskCandidate] = []
 
-    point_coords, point_labels = _positive_points_for_sam(
-        xy=pose_xy,
-        bbox=bbox,
-    )
+    prompt_runs: list[tuple[str, Optional[list[list[float]]],
+                            Optional[list[int]]]] = []
 
-    prompt_runs = [
-        ('strict', point_coords, point_labels),
-        ('complete', None, None),
-    ]
+    if use_landmarks:
+        point_coords, point_labels = _positive_points_for_sam(
+            xy=pose_xy,
+            bbox=bbox,
+        )
+
+        if point_coords is not None and point_labels is not None:
+            prompt_runs.append(('strict', point_coords, point_labels))
+
+    prompt_runs.append(('complete', None, None))
 
     for source, run_point_coords, run_point_labels in prompt_runs:
-        masks, scores = _predict_sam_mask(
+        masks, scores = predict_sam_mask(
             img_rgb=img_rgb,
             bbox=bbox,
             processor=processor,
@@ -770,6 +431,7 @@ def _select_best_person_sam_mask(
     bbox: tuple[int, int, int, int],
     pose_xy: np.ndarray,
     target_norm_area: float = 0.25,
+    min_landmark_fraction: Optional[float] = 0.8,
 ) -> np.ndarray:
     """
     Select the best person mask among SAM candidates.
@@ -800,9 +462,9 @@ def _select_best_person_sam_mask(
     Landmark-consistency filtering
     ------------------------------
     Only a small set of relatively stable body anchors is used, such as nose,
-    shoulders, elbows, and hips. Lower-leg and foot landmarks are intentionally
-    ignored because they are often occluded, truncated, or confused with supports,
-    props, seats, or background objects.
+    shoulders, elbows, wrists, hips, and knees. Foot-related landmarks are
+    intentionally ignored because they are often occluded, truncated, or confused
+    with supports, props, seats, or background objects.
 
     A candidate is kept if it contains at least a minimum fraction of the valid
     stable landmarks. If no valid landmarks are available, or if all candidates fail
@@ -839,6 +501,20 @@ def _select_best_person_sam_mask(
         Preferred normalized candidate area. ``0.0`` favors the smallest
         candidate, ``1.0`` favors the largest candidate, and intermediate values
         favor masks between the two extremes.
+
+    min_landmark_fraction : float | None, default=0.8
+        Minimum fraction of usable stable pose landmarks that must be contained
+        within a candidate SAM mask for it to be considered landmark-consistent.
+        A higher value makes candidate selection stricter and favors masks that
+        better align with pose predictions. A lower value makes selection more
+        permissive and can improve results for noisy or partially occluded poses.
+        If set to 0.0, landmark guidance remains enabled, but a candidate only
+        needs to contain at least one usable stable landmark when such landmarks
+        are available.
+
+        If ``None``, landmark-consistency filtering is skipped. In the standard
+        ``SubjectCrop`` person path, this value is also used upstream to generate
+        only bbox-only SAM candidates.
 
     Returns
     -------
@@ -936,7 +612,14 @@ def _select_best_person_sam_mask(
     # Ankles, heels, and foot tips are intentionally excluded because they are often
     # occluded, outside the actual visible subject, or confused with supports / props.
     safe_pose_idxs = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26]
-    min_landmark_fraction = 0.5
+    # Require a strong majority of usable stable pose landmarks to fall inside the
+    # candidate mask.
+    #
+    # "Usable" means: present in pose_xy, valid, inside image bounds, and included in
+    # safe_pose_idxs. If only one stable landmark is usable, that landmark is allowed
+    # to be decisive: it is still better than ignoring landmark consistency entirely.
+    # The configurable ``min_landmark_fraction`` controls how strict the landmark
+    # consistency check is.
 
     measured: list[tuple[SamMaskCandidate, int]] = []
     filtered: list[tuple[SamMaskCandidate, int]] = []
@@ -945,23 +628,25 @@ def _select_best_person_sam_mask(
         area = int(candidate.mask[y1:y2, x1:x2].sum())
         measured.append((candidate, area))
 
-        inside, valid = _landmark_inside_count(
-            candidate.mask,
-            pose_xy,
-            safe_pose_idxs,
-        )
-
-        if valid > 0:
-            min_inside = max(
-                1,
-                int(math.ceil(float(valid) * min_landmark_fraction)),
+        if min_landmark_fraction is not None:
+            inside, valid = _landmark_inside_count(
+                candidate.mask,
+                pose_xy,
+                safe_pose_idxs,
             )
 
-            if inside >= min_inside:
-                filtered.append((candidate, area))
+            if valid > 0:
+                min_inside = max(
+                    1,
+                    int(math.ceil(float(valid) * min_landmark_fraction)),
+                )
 
-    # Prefer landmark-consistent masks, but do not hard-fail on difficult poses.
-    pool = filtered if filtered else measured
+                if inside >= min_inside:
+                    filtered.append((candidate, area))
+
+    # Prefer landmark-consistent masks when enabled, but do not hard-fail on
+    # difficult poses.
+    pool = filtered if min_landmark_fraction is not None and filtered else measured
 
     areas = np.asarray(
         [area for _, area in pool],
@@ -1366,11 +1051,20 @@ class SubjectCrop(NodeRef):
                 feathered transition between protected subject and repaintable background.
                 Default: 0.
 
-                Note: ``dilate_radius``, ``close_radius`` and
-                ``smoothing_radius`` currently affect only full-frame mask
-                outputs (``mode='mask'`` and ``mode='negative-mask'``). In
-                ``mode='default'``, the RGBA alpha is derived directly from the
-                selected mask after connected-component cleanup.
+            ``min_landmark_fraction`` : float | None, optional
+                Minimum fraction of usable stable pose landmarks that must be
+                contained within a candidate SAM mask to consider it
+                landmark-consistent.
+                Default: 0.8.
+                Typical values around 0.7 are often effective;
+                increasing the value makes pose consistency stricter, while
+                lowering it makes candidate selection more permissive.
+
+                If set to ``None``, strict landmark prompting is disabled and
+                only bbox-only SAM mask candidates are generated and evaluated.
+
+                This parameter can help tune performance for difficult poses,
+                occluded limbs, or noisy landmark detections.
 
         ``debug`` : dict
             ``save_debug`` : bool, optional
@@ -1802,12 +1496,14 @@ class SubjectCrop(NodeRef):
                     processor=processor,
                     model=sam_model,
                     device=cfg.device,
+                    use_landmarks=(cfg.min_landmark_fraction is not None),
                 )
 
                 mask = _select_best_person_sam_mask(
                     candidates,
                     bbox=(bx1, by1, bx2, by2),
                     pose_xy=pose_xy,
+                    min_landmark_fraction=cfg.min_landmark_fraction,
                 ).astype(bool)
 
             else:
@@ -1827,7 +1523,7 @@ class SubjectCrop(NodeRef):
                         max_points=16,
                     )
 
-                masks, scores = _predict_sam_mask(
+                masks, scores = predict_sam_mask(
                     img_rgb=img_rgb,
                     bbox=(bx1, by1, bx2, by2),
                     processor=processor,
@@ -1902,28 +1598,27 @@ class SubjectCrop(NodeRef):
 
                 pts = polarity_xy[valid]
 
-                inside = 0
-                mask_h, mask_w = mask.shape
+                if len(pts) > 0:
+                    inside = 0
+                    mask_h, mask_w = mask.shape
 
-                for px, py in pts:
-                    px = int(px)
-                    py = int(py)
+                    for px, py in pts:
+                        px = int(px)
+                        py = int(py)
 
-                    if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
-                        inside += 1
+                        if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
+                            inside += 1
 
-                min_inside = max(
-                    1,
-                    int(math.ceil(len(pts) * polarity_fraction)),
-                )
+                    min_inside = max(
+                        1,
+                        int(math.ceil(len(pts) * polarity_fraction)),
+                    )
 
-                if inside < min_inside:
-                    # Invert mask only inside the prompt bbox to avoid turning the entire
-                    # background of the image into foreground.
-                    inv = ~mask
-                    new_mask = np.zeros_like(mask, dtype=bool)
-                    new_mask[by1:by2, bx1:bx2] = inv[by1:by2, bx1:bx2]
-                    mask = new_mask
+                    if inside < min_inside:
+                        mask = _invert_mask_inside_box(
+                            mask=mask,
+                            box=(bx1, by1, bx2, by2)
+                        )
 
             if cfg.target in ('hands', 'left-hand', 'right-hand'):
                 if hand_mask is None:
@@ -1951,7 +1646,7 @@ class SubjectCrop(NodeRef):
 
         if cfg.mode == 'default' and cfg.crop_mode is not None:
             if cfg.crop_mode.mode == 'bbox' and cfg.crop_mode.ratio is not None:
-                crop_x1, crop_y1, crop_x2, crop_y2 = _expand_bbox_toward_ratio(
+                crop_x1, crop_y1, crop_x2, crop_y2 = expand_bbox_toward_ratio(
                     crop_x1,
                     crop_y1,
                     crop_x2,
@@ -2042,7 +1737,7 @@ class SubjectCrop(NodeRef):
                 crop_rgba = np.dstack([crop_rgb, alpha])
 
                 if cfg.crop_mode.mode == 'trim':
-                    tx1, ty1, tx2, ty2 = _tight_alpha_bbox(alpha)
+                    tx1, ty1, tx2, ty2 = tight_alpha_bbox(alpha)
                     crop_rgba = crop_rgba[ty1:ty2, tx1:tx2, :]
 
                     out_x1 = int(crop_x1 + tx1)
@@ -2154,6 +1849,7 @@ class SubjectCrop(NodeRef):
                 'close_radius': cfg.close_radius,
                 'expansion': cfg.expansion,
                 'smoothing_radius': cfg.smoothing_radius,
+                'min_landmark_fraction': cfg.min_landmark_fraction,
             },
             'crop': {
                 'anchor_xy': [anchor_x, anchor_y],

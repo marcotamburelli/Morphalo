@@ -15,7 +15,8 @@ This demo showcases ``SubjectCrop`` across three complementary use cases:
     such as ``1:1`` or ``16:9``.
 
 The goal is to demonstrate how a single preprocessing node can provide reusable,
-task-oriented outputs for downstream DAGs.
+task-oriented outputs for downstream DAGs, and how prompt-based AnyCrop can
+extract arbitrary regions such as pants and a blouse.
 
 Why SubjectCrop?
 ----------------
@@ -53,7 +54,7 @@ Supported targets
 Defined DAGs
 ------------
 
-This file defines three demo DAGs:
+This file defines four demo DAGs:
 
 1) ``subject_crop_masks``
     Produces full-frame positive and negative masks for the whole subject.
@@ -63,6 +64,10 @@ This file defines three demo DAGs:
 
 3) ``subject_crop_bbox_ratio``
     Demonstrates bbox-based crops with aspect-ratio expansion.
+
+4) ``any_crop_trim``
+    Demonstrates open-vocabulary prompt crops using AnyCrop, with trimmed RGBA
+    outputs for detected regions such as pants and a blouse.
 
 Conceptual graph (subject masks)
 -------------------------------
@@ -115,6 +120,22 @@ Input image -+-> SubjectCrop(target='person',
                                  crop_mode='bbox[1:1]')
                                     -> square left-hand bbox crop
 
+Conceptual graph (prompt crop)
+------------------------------
+Input image ---+-> AnyCrop(
+                   prompt='pants. trousers. jeans. blue jeans.',
+                   mode='default',
+                   crop_mode='trim'
+                 )
+                 -> lower-garment crop
+                \
+                 +-> AnyCrop(
+                   prompt='top. tank top. sleeveless top. sleeveless shirt. black top.',
+                   mode='default',
+                   crop_mode='trim'
+                 )
+                 -> upper-garment crop
+
 How to run
 ----------
 Run subject masks:
@@ -125,6 +146,9 @@ Run semantic crops:
 
 Run bbox + ratio:
     ./bin/run_dag.sh demo.06_crop --dag subject_crop_bbox_ratio
+
+Run prompt crop with AnyCrop:
+    ./bin/run_dag.sh demo.06_crop --dag any_crop_trim
 
 Notes
 -----
@@ -173,7 +197,7 @@ from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage
-from morphalo.nodes.preprocess import SubjectCrop
+from morphalo.nodes.preprocess import AnyCrop, SubjectCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -673,4 +697,80 @@ with DAG(
         head_bbox,
         head_bbox_square,
         left_hand_bbox_square,
+    ]
+
+
+with DAG(
+    name='any_crop_trim',
+    out_dir=ROOT / 'outputs' / 'any_crop_trim',
+):
+    # -------------------------------------------------------------------------
+    # Input source
+    # -------------------------------------------------------------------------
+    #
+    # Use the same demo image and show how AnyCrop can localize arbitrary
+    # regions from flexible text prompts composed of multiple synonymous or
+    # related concepts.
+    #
+    init_img_any = FileImage(
+        name='init_img_any',
+        path=INIT_IMG,
+    )
+
+    # -------------------------------------------------------------------------
+    # Prompt-based pants crop
+    # -------------------------------------------------------------------------
+    #
+    # Use a flexible prompt with multiple related concepts so Grounding DINO
+    # can match the strongest visual label among several alternatives.
+    #
+    any_crop_pants = AnyCrop(
+        name='any_crop_pants',
+        spec={
+            'model': {
+                'grounding_model': 'IDEA-Research/grounding-dino-tiny',
+                'sam_model': 'facebook/sam-vit-large',
+            },
+            'prompt': 'pants. trousers. jeans. blue jeans.',
+            'params': {
+                'mode': 'default',
+                'crop_mode': 'trim',
+                'box_margin': 0.08,
+                'box_threshold': 0.20,
+                'text_threshold': 0.15,
+                'select': 'best',
+            },
+        },
+    )
+
+    # -------------------------------------------------------------------------
+    # Prompt-based upper-body garment crop
+    # -------------------------------------------------------------------------
+    #
+    # Use a flexible prompt for the upper garment as well. This helps when the
+    # exact clothing label is uncertain, for example top vs tank top vs
+    # sleeveless top.
+    #
+    any_crop_top = AnyCrop(
+        name='any_crop_top',
+        spec={
+            'model': {
+                'grounding_model': 'IDEA-Research/grounding-dino-tiny',
+                'sam_model': 'facebook/sam-vit-large',
+            },
+            'prompt': 'top. black top. tank top. sleeveless top. sleeveless shirt.',
+            'params': {
+                'mode': 'default',
+                'crop_mode': 'trim',
+                'box_margin': 0.08,
+                'box_threshold': 0.20,
+                'text_threshold': 0.15,
+                'select': 'best',
+            },
+        },
+    )
+
+    init_img_any >> [
+        any_crop_pants,
+        any_crop_top,
     ]

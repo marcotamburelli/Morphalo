@@ -247,7 +247,7 @@ def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPip
         kind='omnigen',
         ref=model_id,
         device=device,
-        dtype=dtype_key(dtype)
+        dtype=dtype_key(dtype),
     )
 
     cached = ModelCache.get(key)
@@ -256,8 +256,21 @@ def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPip
 
     omg = OmniGenPipeline.from_pretrained(
         model_id,
-        torch_dtype=dtype
-    ).to(device)
+        torch_dtype=dtype,
+    )
+
+    if device.startswith('cuda'):
+        # Stable default optimization for GPU execution.
+        #
+        # This keeps only the active pipeline component on GPU and leaves the
+        # others on CPU until needed. It is usually much faster than sequential
+        # offload while still reducing VRAM pressure.
+        #
+        # Important: do not call `.to(device)` before/after this. Accelerate
+        # installs hooks that move components between CPU and GPU as needed.
+        omg.enable_model_cpu_offload()
+    else:
+        omg = omg.to(device)
 
     return ModelCache.put(key, omg)
 
@@ -695,3 +708,21 @@ def get_mediapipe_hand_landmarker(
 
     landmarker = mp_vision.HandLandmarker.create_from_options(options)
     return ModelCache.put(key, landmarker)
+
+
+def get_grounding_dino(
+    model_id: str = "IDEA-Research/grounding-dino-tiny",
+    *,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+):
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    ).to(device)
+    model.eval()
+
+    return processor, model
