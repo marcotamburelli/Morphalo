@@ -261,7 +261,6 @@ class BoxCrop(NodeRef):
         cropped = img.crop((out_x1, out_y1, out_x2, out_y2))
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = make_node_output_path(
             out_dir=out_dir,

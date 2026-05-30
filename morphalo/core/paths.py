@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from morphalo.core.ids import validate_dotted_identifier
+
 
 def ensure_out_dir(output_dir: str | Path) -> Path:
     out_dir = Path(output_dir)
@@ -12,9 +14,47 @@ def ensure_out_dir(output_dir: str | Path) -> Path:
     return out_dir
 
 
+def make_node_output_dir(
+    *,
+    out_dir: str | Path,
+    node_id: str,
+    create: bool = True,
+) -> Path:
+    """
+    Resolve the artifact directory for a node execution.
+
+    Dotted node identifiers are treated as filesystem hierarchy. This mirrors
+    NodeGroup naming, where a node inside nested groups may have an identifier
+    such as ``group.subgroup.node``. Its artifacts are stored under
+    ``out_dir/group/subgroup/node``.
+
+    Parameters
+    ----------
+    out_dir : str or Path
+        Base output directory of the DAG execution.
+    node_id : str
+        Identifier of the node producing the output. Dot-separated components
+        are interpreted as nested directories.
+    create : bool, optional
+        If True, create the resolved directory. Default is True.
+
+    Returns
+    -------
+    Path
+        Directory where the node artifacts are stored.
+    """
+    validate_dotted_identifier(node_id, kind='Node id')
+
+    node_dir = Path(out_dir).joinpath(*node_id.split('.'))
+    if create:
+        return ensure_out_dir(node_dir)
+
+    return node_dir
+
+
 def make_node_output_path(
     *,
-    out_dir: Path,
+    out_dir: str | Path,
     node_id: str,
     ext: str = 'png',
     seed: Optional[int] = None,
@@ -23,17 +63,20 @@ def make_node_output_path(
     """
     Generate an output file path for a node execution.
 
-    The path is created under ``out_dir / node_id`` and uses a timestamp-based
-    filename. Optional components such as the random seed can be included
-    to make the filename more informative while keeping semantics out of
-    directory names.
+    The path is created under the node artifact directory resolved by
+    :func:`make_node_output_dir` and uses a timestamp-based filename.
+    For dotted node identifiers, this means ``group.node`` is written under
+    ``out_dir/group/node``. Optional components such as the random seed can be
+    included to make the filename more informative while keeping semantics out
+    of directory names.
 
     Parameters
     ----------
-    out_dir : Path
+    out_dir : str or Path
         Base output directory of the DAG execution.
     node_id : str
-        Identifier of the node producing the output.
+        Identifier of the node producing the output. Dot-separated components
+        are interpreted as nested directories.
     ext : str, optional
         File extension (without leading dot). Default is ``'png'``.
     seed : int, optional
@@ -48,11 +91,10 @@ def make_node_output_path(
 
     Notes
     -----
-    - The directory ``out_dir / node_id`` is created if it does not exist.
+    - The resolved node artifact directory is created if it does not exist.
     - The default filename format is ``YYYY-MM-DD_HHMMSS[_seedN].<ext>``.
     """
-    node_dir = Path(out_dir) / node_id
-    node_dir.mkdir(parents=True, exist_ok=True)
+    node_dir = make_node_output_dir(out_dir=out_dir, node_id=node_id)
 
     if tag is None:
         tag = time.strftime('%Y-%m-%d_%H%M%S')
@@ -69,9 +111,13 @@ def make_node_output_path(
 _TS_RE = re.compile(r'^(?P<ts>\d{4}-\d{2}-\d{2}_\d{6})')
 
 
-def load_latest_output(out_dir: Path, node_id: str) -> Optional[Dict[str, Any]]:
+def load_latest_output(out_dir: str | Path, node_id: str) -> Optional[Dict[str, Any]]:
     """
-    Load the most recent node output JSON from `out_dir/node_id`.
+    Load the most recent node output JSON from the node artifact directory.
+
+    Dotted node identifiers are resolved as nested directories using
+    :func:`make_node_output_dir`, so ``group.node`` is loaded from
+    ``out_dir/group/node``.
 
     Rule:
     - If one or more JSON filenames start with '%Y-%m-%d_%H%M%S', pick the one
@@ -80,7 +126,11 @@ def load_latest_output(out_dir: Path, node_id: str) -> Optional[Dict[str, Any]]:
 
     Returns None if no JSON is found.
     """
-    node_dir = Path(out_dir) / node_id
+    node_dir = make_node_output_dir(
+        out_dir=out_dir,
+        node_id=node_id,
+        create=False,
+    )
     if not node_dir.exists():
         return None
 

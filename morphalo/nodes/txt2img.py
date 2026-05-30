@@ -9,7 +9,6 @@ from diffusers import (StableDiffusionXLAdapterPipeline,
 from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
-from morphalo.core.paths import ensure_out_dir
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
@@ -480,9 +479,8 @@ class Txt2Img(T2IAdapterMixin, ControlNetMixin, PromptMixin, NodeRef):
                 f'Expected {len(ctx.rng.seeds)} output images, got {len(images)}'
             )
 
-        out_dir = ensure_out_dir(output_dir)
         img_paths = [save_image(
-            out_dir,
+            output_dir,
             node_id=self.id,
             seed=seed,
             img=img,

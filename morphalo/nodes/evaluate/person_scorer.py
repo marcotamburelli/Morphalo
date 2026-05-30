@@ -1139,7 +1139,6 @@ class PersonScorer(ImgWiringMixin, NodeRef):
         cfg = _read_cfg(spec, node_id=node_id)
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         pose_landmarker = get_mediapipe_pose_landmarker(
             model_asset_path=cfg.pose_landmarker_task,

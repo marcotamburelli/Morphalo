@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional
 
 from morphalo.cache.ltx_models import (get_ltx_condition,
                                        get_ltx_latent_upsample)
-from morphalo.core.paths import ensure_out_dir
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
@@ -251,9 +250,8 @@ class Img2Video(PromptMixin, NodeRef):
         # Part 4: resize down to target output size
         video_out = [f.resize((ctx.width, ctx.height)) for f in video_out]
 
-        out_dir = ensure_out_dir(output_dir)
         video_path = save_video(
-            out_dir=out_dir,
+            out_dir=output_dir,
             node_id=self.id,
             seed=ctx.rng.seed,
             video_out=video_out,

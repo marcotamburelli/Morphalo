@@ -7,7 +7,6 @@ import torch
 from diffusers.utils import load_image
 
 from morphalo.cache.models import evict_omnigen, get_omnigen
-from morphalo.core.paths import ensure_out_dir
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
@@ -265,9 +264,8 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
 
         img = result.images[0]
 
-        out_dir = ensure_out_dir(output_dir)
         img_path = save_image(
-            out_dir,
+            output_dir,
             node_id=self.id,
             seed=seed,
             img=img,

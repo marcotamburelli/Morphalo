@@ -212,7 +212,6 @@ class VideoAuxMap(NodeRef):
         params.update(spec.get("params", {}) or {})
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         out_video_path = make_node_output_path(
             out_dir=out_dir, node_id=self.id, ext="mp4")

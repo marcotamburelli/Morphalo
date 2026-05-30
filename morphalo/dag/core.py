@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Self, Tuple, Union
 
+from morphalo.core.ids import validate_dotted_identifier
+
 Dest = Union['NodeRef', 'AttachmentSink']
 DestList = List[Dest]
 DestTuple = Tuple[Dest, ...]
@@ -118,6 +120,15 @@ class GraphScope:
     identifiers created within nested scopes. This ensures that node ids remain
     unique when groups are composed or reused.
 
+    Naming
+    ------
+    Scope names must be valid dotted identifiers. Dots are allowed and express
+    logical hierarchy; whitespace and path separators are not allowed.
+
+    Valid examples include ``"refine"``, ``"img_0"``, and
+    ``"macro.refine"``. Invalid examples include ``"my..group"``,
+    ``".group"``, ``"group."``, ``"my/group"``, and ``"my group"``.
+
     Notes
     -----
     - ``GraphScope`` is purely declarative. It does not execute any computation.
@@ -129,6 +140,7 @@ class GraphScope:
     """
 
     def __init__(self, name: str):
+        validate_dotted_identifier(name, kind='Graph scope name')
         self.name = name
         self.nodes: List['NodeRef'] = []
         self.edges: List['Edge'] = []
@@ -211,6 +223,24 @@ class DAG(GraphScope):
     Only root ``DAG`` instances are registered in ``DagRegistry`` upon
     successful exit of their context manager.
 
+    Naming
+    ------
+    DAG names must be valid dotted identifiers. The root DAG name is used as a
+    registry key and for workflow selection; it is not included in node artifact
+    paths.
+
+    Node names declared inside the DAG, when explicitly provided via
+    ``NodeRef(name=...)`` or a concrete node constructor, must follow the same
+    dotted identifier convention. Dots in node names are meaningful:
+    ``name="stage.depth"`` produces a node id ``"stage.depth"`` and artifacts
+    under ``out_dir/stage/depth``.
+
+    A valid name has one or more non-empty components separated by dots and no
+    whitespace or path separators. For example, ``"standing_refine"``,
+    ``"stage.depth"``, and ``"img_0.out"`` are valid; ``"stage..depth"``,
+    ``".depth"``, ``"depth."``, ``"stage/depth"``, and ``"stage depth"`` are
+    invalid.
+
     Notes
     -----
     - Node identifiers created inside nested scopes are automatically
@@ -240,7 +270,8 @@ class DAG(GraphScope):
         Parameters
         ----------
         name : str
-            Human-readable identifier for the DAG.
+            Human-readable identifier for the DAG. Must be a valid dotted
+            identifier. The DAG name is not included in node artifact paths.
         out_dir : str
             Base output directory associated with this DAG. The directory
             is not created automatically; it is passed to nodes during
@@ -306,6 +337,27 @@ class NodeGroup(GraphScope):
 
     Unlike a root ``DAG``, a ``NodeGroup`` is not executable on its own:
     it has no ``out_dir`` and it is not registered in ``DagRegistry``.
+
+    Naming
+    ------
+    Group names must be valid dotted identifiers and become part of the
+    scope-qualified node ids for nodes declared inside the group. For example:
+
+        with NodeGroup("img_0"):
+            ImgAuxMap(name="depth_midas")
+
+    creates the node id ``"img_0.depth_midas"`` and stores artifacts under
+    ``out_dir/img_0/depth_midas``.
+
+    Node names inside groups, when explicitly provided via ``NodeRef(name=...)``
+    or a concrete node constructor, use the same dotted identifier rules as
+    top-level node names. Dots are allowed to create additional artifact
+    hierarchy, so ``NodeGroup("img_0")`` with ``name="maps.depth"`` produces
+    ``"img_0.maps.depth"`` and artifacts under ``out_dir/img_0/maps/depth``.
+
+    Valid examples include ``"img_0"``, ``"macro.refine"``, and
+    ``"maps.depth"``. Invalid examples include ``"img..0"``, ``".img"``,
+    ``"img."``, ``"img/0"``, and ``"img 0"``.
 
     Entry and output nodes
     ----------------------
@@ -605,6 +657,21 @@ class NodeRef:
     inside nested groups receive a hierarchical prefix (e.g.
     ``groupA.groupB.node_1``), ensuring uniqueness within the effective root DAG.
 
+    Naming
+    ------
+    Node names must be valid dotted identifiers. Dots are allowed and represent
+    logical artifact hierarchy, even outside a ``NodeGroup``. For example,
+    ``name="stage.depth"`` creates node id ``"stage.depth"`` at the DAG root and
+    stores artifacts under ``out_dir/stage/depth``. Inside
+    ``NodeGroup("img_0")``, the same name creates
+    ``"img_0.stage.depth"`` and stores artifacts under
+    ``out_dir/img_0/stage/depth``.
+
+    Valid examples include ``"out"``, ``"depth_midas"``, ``"stage.depth"``,
+    and ``"my.sub.node"``. Invalid examples include ``"my..node"``,
+    ``".node"``, ``"node."``, ``"../node"``, ``"my/node"``, ``"my node"``,
+    and names with leading or trailing whitespace.
+
     Dependency wiring DSL
     ----------------------
     ``NodeRef`` implements a small DSL using the right-shift operator:
@@ -630,8 +697,8 @@ class NodeRef:
     ----------
     name : str, optional
         Optional local identifier for the node within the current scope.
-        If not provided, an identifier is generated using the scope's
-        internal counter.
+        If provided, it must be a valid dotted identifier. If not provided, an
+        identifier is generated using the scope's internal counter.
 
     Attributes
     ----------
@@ -675,6 +742,8 @@ class NodeRef:
         This ensures that nodes created inside nested ``NodeGroup`` scopes
         receive a globally unique identifier within the effective root DAG.
 
+        The scope-qualified node id is validated after it is assembled.
+
         Raises
         ------
         RuntimeError
@@ -688,6 +757,7 @@ class NodeRef:
 
         # build scope-qualified identifier
         self.id = _DagContext.prefix() + (self.name or scope.next_id(self.op))
+        validate_dotted_identifier(self.id, kind='Node id')
 
         # register node in current graph scope
         scope.add_node(self)

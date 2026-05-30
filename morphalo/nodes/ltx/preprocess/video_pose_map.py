@@ -169,7 +169,6 @@ class VideoPoseMap(NodeRef):
         models = ModelPaths(**spec.get('models', {}))
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         out_video_path = make_node_output_path(
             out_dir=out_dir,

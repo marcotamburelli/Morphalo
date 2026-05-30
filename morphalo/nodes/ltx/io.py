@@ -10,7 +10,7 @@ from morphalo.nodes.ltx.wiring.ic_lora import ICLoRaSpec
 
 
 def save_video(
-    out_dir: Path,
+    out_dir: str | Path,
     *,
     node_id: str,
     seed: int,

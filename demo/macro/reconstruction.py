@@ -160,6 +160,7 @@ def reconstruct_from_geometry_img2img_group(
     canny_conditioning_scale: float,
     depth_conditioning_scale: float,
     adapter_scale: float,
+    ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
     canny_detect_long_side: int = 1024,
     depth_detect_long_side: int = 1024,
 ) -> NodeGroup:
@@ -207,6 +208,9 @@ def reconstruct_from_geometry_img2img_group(
         IP-Adapter scale controlling how strongly the output borrows style cues
         from the provided style image. Higher values yield stronger style transfer
         but may harm identity/details.
+
+    ip_adapter_weight_name : str, optional
+        IP-Adapter weight file name. Defaults to 'ip-adapter_sdxl_vit-h.bin'.
 
     canny_detect_long_side : int, optional
         Target long-side resolution used by the Canny preprocessor.
@@ -276,7 +280,7 @@ def reconstruct_from_geometry_img2img_group(
         style_sink = out.ip_adapter.add(
             'h94/IP-Adapter',
             subfolder='sdxl_models',
-            weight_name='ip-adapter_sdxl_vit-h.bin',
+            weight_name=ip_adapter_weight_name,
             scale=adapter_scale,
             key='style',
         )

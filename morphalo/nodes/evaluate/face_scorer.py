@@ -1030,7 +1030,6 @@ class FaceScorer(ImgWiringMixin, NodeRef):
         cfg = _read_cfg(spec, node_id=node_id)
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         bundle = ImgBundle(
             node_id=node_id,

@@ -1207,7 +1207,6 @@ class SubjectCrop(NodeRef):
         )
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         # -----------------------------
         # Load image

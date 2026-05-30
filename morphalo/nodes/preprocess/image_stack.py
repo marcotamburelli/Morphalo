@@ -1745,7 +1745,6 @@ class ImageStack(NodeRef):
             _place_on_canvas(canvas, layer, cx=cx, cy=cy)
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = make_node_output_path(out_dir=out_dir, node_id=self.id)
 

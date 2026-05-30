@@ -3,7 +3,48 @@ from __future__ import annotations
 import pytest
 
 from morphalo.dag import DAG, NodeGroup
+from morphalo.core.paths import make_node_output_dir
 from tests.dag.nodes import PassNode, SourceNode
+
+
+@pytest.mark.parametrize(
+    'bad_name',
+    ['my..node', '.node', 'node.', '../node', 'my/node', 'my node', ' ', ' myNode'],
+)
+def test_graph_scope_rejects_invalid_dotted_names(tmp_path, bad_name):
+    with pytest.raises(ValueError):
+        DAG(bad_name, out_dir=tmp_path)
+
+    with DAG('valid_dag', out_dir=tmp_path):
+        with pytest.raises(ValueError):
+            NodeGroup(bad_name)
+
+
+@pytest.mark.parametrize(
+    'bad_name',
+    ['my..node', '.node', 'node.', '../node', 'my/node', 'my node', ' ', ' myNode'],
+)
+def test_node_rejects_invalid_dotted_names(tmp_path, bad_name):
+    with DAG('valid_dag', out_dir=tmp_path):
+        with pytest.raises(ValueError):
+            SourceNode(name=bad_name, value=1)
+
+
+def test_node_allows_valid_dotted_names(tmp_path):
+    with DAG('valid_dag', out_dir=tmp_path) as dag:
+        top = SourceNode(name='my.node', value=1)
+        with NodeGroup('group.sub') as group:
+            nested = SourceNode(name='my.sub.node', value=2)
+
+    assert top.id == 'my.node'
+    assert nested.id == 'group.sub.my.sub.node'
+    assert {n.id for n in dag.nodes} == {'my.node'}
+    assert {n.id for n in group.nodes} == {'group.sub.my.sub.node'}
+
+
+def test_make_node_output_dir_rejects_invalid_node_id(tmp_path):
+    with pytest.raises(ValueError):
+        make_node_output_dir(out_dir=tmp_path, node_id='my..node')
 
 
 def test_empty_group_has_no_entries_and_src_shift_raises(tmp_path):

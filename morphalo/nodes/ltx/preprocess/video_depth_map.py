@@ -85,7 +85,6 @@ class VideoDepthMap(NodeRef):
         })
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         cap = cv2.VideoCapture(str(in_path))
         if not cap.isOpened():

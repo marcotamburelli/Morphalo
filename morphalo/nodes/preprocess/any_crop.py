@@ -846,7 +846,6 @@ class AnyCrop(PromptMixin, NodeRef):
         clean_mask[crop_y1:crop_y2, crop_x1:crop_x2] = crop_mask
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = make_node_output_path(
             out_dir=out_dir,

@@ -8,7 +8,6 @@ from PIL import Image
 
 from morphalo.cache.models import (evict_qwen_image_edit_pipe,
                                    get_qwen_image_edit_pipe)
-from morphalo.core.paths import ensure_out_dir
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
@@ -226,8 +225,7 @@ class QwenImageEdit(PromptMixin, NodeRef):
 
         img = result.images[0]
 
-        out_dir = ensure_out_dir(output_dir)
-        img_path = save_image(out_dir, node_id=self.id, seed=seed, img=img)
+        img_path = save_image(output_dir, node_id=self.id, seed=seed, img=img)
 
         mem = cuda_mem_stats(stats_device)
 

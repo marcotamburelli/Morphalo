@@ -47,7 +47,13 @@ def load_faceid_embeds(path_or_paths: Union[str, List[str]], device: str, dtype:
     return t.to(device=device, dtype=dtype)
 
 
-def save_image(out_dir: Path, *, node_id: str, seed: int, img: Image.Image) -> Path:
+def save_image(
+    out_dir: str | Path,
+    *,
+    node_id: str,
+    seed: int,
+    img: Image.Image,
+) -> Path:
     img_path = make_node_output_path(
         out_dir=out_dir,
         node_id=node_id,
@@ -65,8 +71,9 @@ def write_json_sidecar(out_path: Path, payload: dict) -> Path:
     return meta_path
 
 
-def write_json(path: Path, payload: dict):
+def write_json(path: Path, payload: dict) -> Path:
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False),
         encoding='utf-8'
     )
+    return path
