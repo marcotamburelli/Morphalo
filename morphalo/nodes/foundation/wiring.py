@@ -1,6 +1,9 @@
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from PIL import Image
 
 from morphalo.dag import AttachmentSink, NodeRef
 
@@ -275,3 +278,183 @@ class OmniGenImageBundle:
             )
 
         return rendered
+
+
+def _payload_image_paths(payload: Dict[str, Any], *, input_id: str) -> List[str]:
+    """
+    Resolve one or more image paths from a Morphalo upstream payload.
+    """
+    value = payload.get('images') or payload.get(
+        'image') or payload.get('path')
+    if not value:
+        raise ValueError(
+            f"Upstream output for {input_id!r} must contain "
+            "'image', 'images', or 'path'."
+        )
+
+    if isinstance(value, (str, Path)):
+        return [str(value)]
+
+    if isinstance(value, list):
+        if not value:
+            raise ValueError(f'Upstream image list for {input_id!r} is empty.')
+        return [str(x) for x in value]
+
+    raise TypeError(
+        f'Unsupported image path payload for {input_id!r}: {type(value).__name__}'
+    )
+
+
+class ImageSequenceRegistry:
+    """
+    Registry for declaring indexed image inputs on a DAG node.
+
+    If present, the node's ``default`` input is always the first part of the
+    runtime image sequence. Additional images are declared here using integer
+    indexes and are appended after the default image(s), ordered from the
+    smallest index to the largest. If no default input is wired, the ordered
+    registry images form the whole image sequence.
+    """
+
+    INPUT_PREFIX = 'image'
+
+    def __init__(self, owner: NodeRef):
+        self._owner = owner
+        self._idxs: List[int] = []
+
+    def __call__(self, idx: int) -> AttachmentSink:
+        """
+        Shorthand for ``add(idx=idx)``.
+        """
+        return self.add(idx)
+
+    def add(self, idx: int) -> AttachmentSink:
+        """
+        Declare an indexed image input and return its attachment sink.
+
+        ``idx`` is an integer ordering index, not a semantic label. At runtime,
+        the owning node receives a single ordered image sequence:
+
+        1. all image(s) from the optional ``default`` input, in their payload
+           order;
+        2. all images wired through this registry, sorted by ascending ``idx``.
+
+        This ordering is important because the model is prompted by referring to
+        positions in the image list, for example "the first image", "the second
+        image", and so on. Use smaller indexes for images that should appear
+        earlier after the optional default image.
+
+        Parameters
+        ----------
+        idx : int
+            Ordering index for this image slot. Indexes must be unique within
+            the registry. The numeric value determines the slot order among
+            registry-declared images.
+
+        Returns
+        -------
+        AttachmentSink
+            Sink that can be wired from an upstream image-producing node.
+        """
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise ValueError(
+                'Image sequence idx must be an integer.'
+            )
+        if idx in self._idxs:
+            raise ValueError(f'Duplicate image sequence idx: {idx!r}')
+
+        self._idxs.append(idx)
+        return AttachmentSink(
+            name=f'image_sequence:image:{idx}',
+            target=self._owner,
+            input_id=f'{self.INPUT_PREFIX}:{idx}',
+        )
+
+    @property
+    def specs(self) -> List[int]:
+        return self._idxs
+
+
+class ImageSequenceBundle:
+    """
+    Runtime resolver for indexed image sequence inputs.
+    """
+
+    def __init__(
+        self,
+        specs: List[int],
+        *,
+        input: Optional[Dict[str, Dict]] = None,
+    ):
+        self._images: List[Image.Image] = []
+        self._metadata: List[Dict[str, Any]] = []
+        self._build(specs, input=input or {})
+
+    def _build(
+        self,
+        specs: List[int],
+        *,
+        input: Dict[str, Dict],
+    ) -> None:
+        default_up = input.get('default')
+
+        entries: List[Tuple[str, str]] = []
+        if default_up is not None:
+            for path in _payload_image_paths(default_up, input_id='default'):
+                entries.append(('default', path))
+
+        for idx in sorted(specs):
+            input_id = f'{ImageSequenceRegistry.INPUT_PREFIX}:{idx}'
+            upstream = input.get(input_id)
+            if upstream is None:
+                raise ValueError(
+                    f'Missing image sequence input for {input_id!r}. '
+                    f'Did you wire an image into node.image.add(idx={idx!r})?'
+                )
+            for path in _payload_image_paths(upstream, input_id=input_id):
+                entries.append((input_id, path))
+
+        if not entries:
+            raise ValueError(
+                'Image sequence requires at least one input image.'
+            )
+
+        self._images = [Image.open(path).convert('RGB') for _, path in entries]
+        self._metadata = [
+            {
+                'input_id': input_id,
+                'path': str(Path(path).expanduser()),
+                'width': image.size[0],
+                'height': image.size[1],
+            }
+            for (input_id, path), image in zip(entries, self._images)
+        ]
+
+    @property
+    def images(self) -> List[Image.Image]:
+        return self._images
+
+    @property
+    def metadata(self) -> List[Dict[str, Any]]:
+        return self._metadata
+
+
+class ImageSequenceMixin:
+    """
+    Adds ordered image-sequence wiring helpers to a node.
+    """
+
+    image: ImageSequenceRegistry
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.image = ImageSequenceRegistry(owner=self)
+
+    def build_image_sequence_bundle(
+        self,
+        input: Optional[Dict[str, Dict]],
+    ) -> ImageSequenceBundle:
+        return ImageSequenceBundle(
+            self.image.specs,
+            input=input or {},
+        )

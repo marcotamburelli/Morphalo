@@ -1,10 +1,13 @@
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
-                       OmniGenPipeline, QwenImageEditPipeline,
+                       OmniGenPipeline, QwenImageControlNetInpaintPipeline,
+                       QwenImageControlNetModel, QwenImageEditPipeline,
                        StableDiffusionXLPipeline, T2IAdapter)
 from insightface.app import FaceAnalysis
 from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
@@ -12,7 +15,9 @@ from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
 from ultralytics import YOLO as YOLOModel
 
 from morphalo.cache import CacheKey, ModelCache
-from morphalo.nodes.sdxl_resolve import ResolvedModelRef
+
+if TYPE_CHECKING:
+    from morphalo.nodes.sdxl_resolve import ResolvedModelRef
 
 
 def dtype_key(dtype: torch.dtype) -> str:
@@ -383,6 +388,214 @@ def evict_qwen_image_edit_pipe(
 ) -> QwenImageEditPipeline:
     key = CacheKey(
         kind='qwen_image_edit',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    return ModelCache.pop(key)
+
+
+def get_qwen_image_inpaint_controlnet(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: Optional[str] = None,
+) -> QwenImageControlNetModel:
+    """
+    Load and cache a Qwen image inpainting ControlNet model.
+
+    Parameters
+    ----------
+    model_id : str
+        Hugging Face identifier or local path for the Qwen ControlNet weights.
+    dtype : torch.dtype
+        Torch dtype used for loading weights.
+    device : str, optional
+        Device used for the ControlNet module. ``QwenImageControlNetModel`` does
+        not support Accelerate ``device_map``, so it is loaded normally and moved
+        to this concrete device.
+
+    Returns
+    -------
+    object
+        Cached ``QwenImageControlNetModel`` instance.
+    """
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    key = CacheKey(
+        kind='qwen_image_inpaint_controlnet',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    model = QwenImageControlNetModel.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    ).to(device)
+
+    return ModelCache.put(key, model)
+
+
+def evict_qwen_image_inpaint_controlnet(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: Optional[str] = None,
+) -> Any:
+    """
+    Evict a cached Qwen image inpainting ControlNet model.
+    """
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    key = CacheKey(
+        kind='qwen_image_inpaint_controlnet',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+    )
+    return ModelCache.pop(key)
+
+
+def get_qwen_image_inpaint_pipe(
+    *,
+    model_id: str,
+    controlnet_model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> QwenImageControlNetInpaintPipeline:
+    """
+    Load and cache a Qwen image inpainting pipeline.
+
+    Parameters
+    ----------
+    model_id : str
+        Base Qwen-Image model identifier.
+    controlnet_model_id : str
+        Qwen inpainting ControlNet model identifier.
+    dtype : torch.dtype
+        Torch dtype used for loading weights.
+    device_map : str, default='balanced'
+        Accelerate device map passed to ``from_pretrained``.
+
+    Returns
+    -------
+    object
+        Cached ``QwenImageControlNetInpaintPipeline`` instance.
+    """
+    controlnet_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    key = CacheKey(
+        kind='qwen_image_inpaint_pipe',
+        ref=(
+            f'{model_id}|controlnet={controlnet_model_id}'
+            f'|controlnet_device={controlnet_device}'
+        ),
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    controlnet = get_qwen_image_inpaint_controlnet(
+        model_id=controlnet_model_id,
+        dtype=dtype,
+        device=controlnet_device,
+    )
+
+    pipe = QwenImageControlNetInpaintPipeline.from_pretrained(
+        model_id,
+        controlnet=controlnet,
+        torch_dtype=dtype,
+        device_map=device_map,
+    )
+
+    return ModelCache.put(key, pipe)
+
+
+def evict_qwen_image_inpaint_pipe(
+    *,
+    model_id: str,
+    controlnet_model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> Any:
+    """
+    Evict a cached Qwen image inpainting pipeline.
+    """
+    key = CacheKey(
+        kind='qwen_image_inpaint_pipe',
+        ref=(
+            f'{model_id}|controlnet={controlnet_model_id}'
+            f"|controlnet_device={'cuda' if torch.cuda.is_available() else 'cpu'}"
+        ),
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+    )
+    return ModelCache.pop(key)
+
+
+def get_qwen_image_edit_plus_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> Any:
+    """
+    Load and cache a Qwen Image Edit Plus Diffusers pipeline.
+
+    Parameters
+    ----------
+    model_id : str
+        Hugging Face model identifier or local model directory.
+    dtype : torch.dtype
+        Torch dtype used for loading weights.
+    device_map : str, default='balanced'
+        Accelerate device map passed to ``from_pretrained``.
+
+    Returns
+    -------
+    object
+        Cached ``QwenImageEditPlusPipeline`` instance.
+    """
+    key = CacheKey(
+        kind='qwen_image_edit_plus',
+        ref=model_id,
+        device=str(device_map),
+        dtype=dtype_key(dtype),
+        extra=f'device_map={device_map if device_map is not None else "<none>"}',
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    from diffusers import QwenImageEditPlusPipeline
+
+    pipe = QwenImageEditPlusPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        device_map=device_map,
+    )
+
+    return ModelCache.put(key, pipe)
+
+
+def evict_qwen_image_edit_plus_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_map: str = 'balanced',
+) -> Any:
+    key = CacheKey(
+        kind='qwen_image_edit_plus',
         ref=model_id,
         device=str(device_map),
         dtype=dtype_key(dtype),

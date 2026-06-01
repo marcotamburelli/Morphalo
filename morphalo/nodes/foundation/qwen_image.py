@@ -3,17 +3,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import torch
-
 from morphalo.cache.models import evict_qwen_image, get_qwen_image
 from morphalo.dag import NodeRef
-from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
-                                                  resolve_seed, resolve_spec)
+from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.cuda_mem import cleanup_torch_cuda
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
+from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
+                                                 qwen_stats_device,
+                                                 resolve_qwen_image_params,
+                                                 resolve_qwen_model_config,
+                                                 resolve_qwen_seed)
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
@@ -56,9 +58,14 @@ class QwenImage(PromptMixin, NodeRef):
         - ``model.dtype`` : str, optional
             DType name resolved by :func:`resolve_dtype`
             (default: ``"bf16"``).
-        - ``model.device_map`` : str, optional
-            Accelerate device map used to dispatch the model across available
-            devices (default: ``"balanced"``).
+        - ``model.device_map`` : {'balanced'}, optional
+            Accelerate device map used to dispatch the model. Defaults to
+            ``"balanced"``. ``QwenImage`` currently supports only
+            ``"balanced"``. This mode lets Accelerate distribute pipeline
+            components across available devices while balancing memory pressure,
+            which helps run large Qwen models on domestic hardware with limited
+            VRAM. The node always loads the model through ``device_map`` and
+            does not call ``pipe.to(device)``.
 
         **Generation parameters** (under ``params``)
         - ``params.steps`` : int, optional
@@ -152,8 +159,9 @@ class QwenImage(PromptMixin, NodeRef):
     - The Qwen-Image pipeline is obtained via ``get_qwen_image(...)``, enabling
       process-wide caching and reuse when running under a single-process
       DAG runner.
-    - The pipeline is typically dispatched using an Accelerate ``device_map``
-      (e.g. ``"balanced"``), rather than an explicit ``.to(device)`` call.
+    - The pipeline is dispatched using Accelerate ``device_map="balanced"``,
+      rather than an explicit ``.to(device)`` call. This balances memory across
+      available devices and is the supported path for limited-VRAM setups.
     - Only parameters explicitly present in ``spec`` are forwarded to the
       pipeline, to avoid passing unsupported arguments to different Qwen-Image
       variants.
@@ -186,69 +194,50 @@ class QwenImage(PromptMixin, NodeRef):
         negative = pb.negative_prompt  # optional; some pipelines accept it
 
         # --- model settings ---
-        model = spec.get('model', {}) if isinstance(spec, dict) else {}
-        model_id = model.get('id', 'Qwen/Qwen-Image')
-        dtype = resolve_dtype(model.get('dtype', 'bf16'))
-        device_map = model.get('device_map', 'balanced')
+        model_cfg = resolve_qwen_model_config(
+            spec,
+            default_model_id='Qwen/Qwen-Image',
+            node_name='QwenImage',
+            supported_by='QwenImage',
+        )
 
         # --- params ---
-        params = spec.get('params', {}) if isinstance(spec, dict) else {}
-        steps = int(params.get('steps', 25))
-
-        guidance_scale = params.get('guidance_scale', None)
-        if guidance_scale is not None:
-            guidance_scale = float(guidance_scale)
-
-        true_cfg_scale = params.get('true_cfg_scale', None)
-        if true_cfg_scale is not None:
-            true_cfg_scale = float(true_cfg_scale)
-
-        # optional size (only pass if explicitly set; avoids breaking pipelines)
-        height = params.get('height', None)
-        width = params.get('width', None)
-        if height is not None:
-            height = int(height)
-        if width is not None:
-            width = int(width)
+        params = resolve_qwen_image_params(spec)
 
         # --- seed / generator ---
-        seed = resolve_seed(spec.get('seed', 'random'))
-        gen = torch.Generator(device='cpu').manual_seed(seed)
+        seed = resolve_qwen_seed(spec)
+        gen = qwen_cpu_generator(seed)
 
         # --- load cached pipeline ---
         pipe = get_qwen_image(
-            model_id=model_id,
-            dtype=dtype,
-            device_map=device_map,
+            model_id=model_cfg.model_id,
+            dtype=model_cfg.dtype,
+            device_map=model_cfg.device_map,
         )
 
         # --- run + stats ---
-        # cuda_prerun expects a string device; with device_map it’s still useful if CUDA is involved.
-        # We'll treat 'balanced'/'auto' as 'cuda' for stats, since modules may be on GPU.
-        stats_device = 'cuda' if str(device_map) in (
-            'balanced', 'auto', 'cuda'
-        ) else 'cpu'
+        stats_device = qwen_stats_device()
         cuda_prerun(stats_device)
 
         t0 = time.perf_counter()
 
         call_kwargs: Dict[str, Any] = dict(
             prompt=prompt,
-            num_inference_steps=steps,
+            num_inference_steps=params.steps,
             generator=gen,
         )
 
         # Optional args (only pass when set / non-empty)
         if negative:
             call_kwargs['negative_prompt'] = negative
-        if guidance_scale is not None:
-            call_kwargs['guidance_scale'] = guidance_scale
-        if true_cfg_scale is not None:
-            call_kwargs['true_cfg_scale'] = true_cfg_scale
-        if height is not None:
-            call_kwargs['height'] = height
-        if width is not None:
-            call_kwargs['width'] = width
+        if params.guidance_scale is not None:
+            call_kwargs['guidance_scale'] = params.guidance_scale
+        if params.true_cfg_scale is not None:
+            call_kwargs['true_cfg_scale'] = params.true_cfg_scale
+        if params.height is not None:
+            call_kwargs['height'] = params.height
+        if params.width is not None:
+            call_kwargs['width'] = params.width
 
         result = pipe(**call_kwargs)
 
@@ -272,18 +261,18 @@ class QwenImage(PromptMixin, NodeRef):
             img_path=img_path,
             seed=seed,
             params={
-                'steps': steps,
-                **({} if guidance_scale is None else {'guidance_scale': guidance_scale}),
-                **({} if true_cfg_scale is None else {'true_cfg_scale': true_cfg_scale}),
-                **({} if height is None else {'height': height}),
-                **({} if width is None else {'width': width}),
+                'steps': params.steps,
+                **({} if params.guidance_scale is None else {'guidance_scale': params.guidance_scale}),
+                **({} if params.true_cfg_scale is None else {'true_cfg_scale': params.true_cfg_scale}),
+                **({} if params.height is None else {'height': params.height}),
+                **({} if params.width is None else {'width': params.width}),
             },
             dt_s=dt_s,
             cuda_mem=mem,
             model_info={
-                'id': model_id,
-                'device_map': device_map,
-                'dtype': str(dtype).replace('torch.', ''),
+                'id': model_cfg.model_id,
+                'device_map': model_cfg.device_map,
+                'dtype': str(model_cfg.dtype).replace('torch.', ''),
             },
         )
 
@@ -304,21 +293,24 @@ class QwenImage(PromptMixin, NodeRef):
 
         spec = resolve_spec(self.spec)
 
-        model = spec.get('model', {}) if isinstance(spec, dict) else {}
-        model_id = model.get('id', 'Qwen/Qwen-Image')
-        dtype = resolve_dtype(model.get('dtype', 'bf16'))
-        device_map = model.get('device_map', 'balanced')
+        model_cfg = resolve_qwen_model_config(
+            spec,
+            default_model_id='Qwen/Qwen-Image',
+            node_name='QwenImage',
+            supported_by='QwenImage',
+        )
 
         obj = evict_qwen_image(
-            model_id=model_id,
-            device_map=device_map,
-            dtype=dtype,
+            model_id=model_cfg.model_id,
+            device_map=model_cfg.device_map,
+            dtype=model_cfg.dtype,
         )
 
         if obj is None:
             raise RuntimeError(
                 f'QwenImage cache model not found for eviction: '
-                f'model_id={model_id!r}, device_map={device_map!r}, dtype={dtype!r}'
+                f'model_id={model_cfg.model_id!r}, '
+                f'device_map={model_cfg.device_map!r}, dtype={model_cfg.dtype!r}'
             )
 
         del obj

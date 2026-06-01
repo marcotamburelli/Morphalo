@@ -1,16 +1,20 @@
 '''
 Foundation nodes demo (minimal).
 
-This module contains three small DAGs, one for each "foundation" node:
+This module contains five small DAGs covering the minimal foundation workflows:
 
 1) QwenImage      - text-to-image generation (no input image)
 2) QwenImageEdit  - instruction-based image editing (requires one input image)
-3) OmniGen        - multimodal generation/editing with wired images referenced in the prompt
+3) QwenImageEditPlus - multi-image instruction editing with ordered image refs
+4) QwenImageInpaint - masked inpainting with an AnyCrop-generated mask
+5) OmniGen        - multimodal generation/editing with wired images referenced in the prompt
 
 How to run
 ----------
     ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_min
     ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_edit_min
+    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_edit_plus_min
+    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_inpaint_tshirt_min
     ./bin/run_dag.sh demo.09_foundation_minimal --dag omnigen_style_transfer_min
 '''
 
@@ -18,11 +22,21 @@ from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage, Prompt
-from morphalo.nodes.foundation import OmniGen, QwenImage, QwenImageEdit
+from morphalo.nodes.foundation import (
+    OmniGen,
+    QwenImage,
+    QwenImageEdit,
+    QwenImageEditPlus,
+    QwenImageInpaint,
+)
+from morphalo.nodes.preprocess import AnyCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SOURCE_IMG = '~/images/input_img.png'
+SOURCE_IMG_1 = '~/images/init_img_3.png'
+SOURCE_IMG_2 = '~/images/img_2.jpg'
+SOURCE_IMG_3 = '~/images/picture_2.jpg'
+
 STYLE_REF = '~/images/style_ref_03.jpg'
 
 
@@ -101,7 +115,7 @@ with DAG(
 
     init_img = FileImage(
         name='init_img',
-        path=SOURCE_IMG,
+        path=SOURCE_IMG_1,
     )
 
     prompt = Prompt(
@@ -156,7 +170,167 @@ with DAG(
 
 
 # -----------------------------------------------------------------------------
-# 3) OmniGen (main image + style reference)
+# 3) QwenImageEditPlus (structure image + face reference)
+# -----------------------------------------------------------------------------
+#
+# QwenImageEditPlus accepts an ordered sequence of one or more input images.
+# The model is trained for multi-image editing through image concatenation, so
+# prompts should refer to visible subjects/objects rather than "the first image"
+# or "the second image". Here the wide composition provides the schema and the
+# portrait person provides facial traits.
+#
+with DAG(
+    name='qwen_image_edit_plus_min',
+    out_dir=ROOT / 'outputs' / 'qwen_image_edit_plus_min',
+):
+
+    structure_img = FileImage(
+        name='structure_img',
+        path=SOURCE_IMG_2,
+    )
+
+    face_ref_img = FileImage(
+        name='face_ref_img',
+        path=SOURCE_IMG_3,
+    )
+
+    prompt = Prompt(
+        name='prompt',
+        spec={
+            'lang': 'eng_Latn',
+            'prompt': [
+                "Take the person in the portrait, wearing a gray sweatshirt.",
+                "Then create a full body image of this person, using a pose and clothing as the image of to the seated long-haired girl.",
+            ],
+            'negative_prompt': [
+                'CGI',
+                '3D render',
+                'cartoon',
+                'anime',
+                'overly smooth skin',
+                'plastic skin',
+            ],
+        },
+    )
+
+    out = QwenImageEditPlus(
+        name='out',
+        spec={
+            'model': {
+                # Defaults to 'Qwen/Qwen-Image-Edit-2509' if omitted.
+                # 'id': 'Qwen/Qwen-Image-Edit-2509',
+                'dtype': 'bf16',
+                'device_map': 'balanced',
+            },
+            'params': {
+                'steps': 40,
+                'true_cfg_scale': 4.0,
+                # # SOURCE_IMG_2 is 626x417 (~3:2). Keep a matching output canvas
+                # # so the edit has less incentive to collapse into SOURCE_IMG_3's
+                # # square portrait framing.
+                # 'width': 1024,
+                # 'height': 672,
+                'max_images': 2,
+            },
+        },
+    )
+
+    # First image: schema / composition source.
+    structure_img >> out.image.add(idx=0)
+
+    # Second image: facial-traits reference.
+    face_ref_img >> out.image.add(idx=1)
+
+    # Lateral: prompt instruction -> editor.
+    prompt >> out.prompt()
+
+
+# -----------------------------------------------------------------------------
+# 4) QwenImageInpaint (AnyCrop t-shirt mask + text inpaint)
+# -----------------------------------------------------------------------------
+#
+# AnyCrop localizes the upper garment with an open-vocabulary prompt and emits a
+# full-frame inpaint mask. QwenImageInpaint then repaints only that masked
+# garment area and asks for a t-shirt with the text "MORPHALO".
+#
+with DAG(
+    name='qwen_image_inpaint_tshirt_min',
+    out_dir=ROOT / 'outputs' / 'qwen_image_inpaint_tshirt_min',
+):
+
+    init_img = FileImage(
+        name='init_img',
+        path=SOURCE_IMG_2,
+    )
+
+    tshirt_mask = AnyCrop(
+        name='tshirt_mask',
+        spec={
+            'model': {
+                'grounding_model': 'IDEA-Research/grounding-dino-tiny',
+                'sam_model': 'facebook/sam-vit-large',
+            },
+            'prompt': 't-shirt. tshirt. tee shirt. shirt. sweatshirt. top.',
+            'params': {
+                'mode': 'mask',
+                'box_margin': 0.10,
+                'box_threshold': 0.20,
+                'text_threshold': 0.15,
+                'select': 'best',
+                'dilate_radius': 0,
+                'close_radius': 4,
+                'smoothing_radius': 0,
+            },
+        },
+    )
+
+    prompt = Prompt(
+        name='prompt',
+        spec={
+            'lang': 'eng_Latn',
+            'prompt': [
+                't-shirt with text "MORPHALO" printed across the chest.',
+            ],
+            'negative_prompt': [
+                'misspelled text',
+                'wrong text',
+                'extra letters',
+                'garbled typography',
+            ],
+        },
+    )
+
+    out = QwenImageInpaint(
+        name='out',
+        spec={
+            'model': {
+                # Defaults to 'Qwen/Qwen-Image' with
+                # 'InstantX/Qwen-Image-ControlNet-Inpainting'.
+                'dtype': 'bf16',
+                'device_map': 'balanced',
+            },
+            'params': {
+                'steps': 30,
+                'true_cfg_scale': 4.0,
+                'controlnet_conditioning_scale': 1.0,
+            },
+            'seed': 1234,
+        },
+    )
+
+    # Base image for the inpaint.
+    init_img >> out
+
+    # Full-frame white-on-black t-shirt mask generated by AnyCrop.
+    init_img >> tshirt_mask
+    tshirt_mask >> out.mask()
+
+    # Lateral: inpaint instruction -> editor.
+    prompt >> out.prompt()
+
+
+# -----------------------------------------------------------------------------
+# 5) OmniGen (main image + style reference)
 # -----------------------------------------------------------------------------
 #
 # This demo uses:
@@ -176,7 +350,7 @@ with DAG(
 
     main_img = FileImage(
         name='main_img',
-        path=SOURCE_IMG,
+        path=SOURCE_IMG_1,
     )
 
     style_img = FileImage(
