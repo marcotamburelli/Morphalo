@@ -23,9 +23,9 @@ DAGs included
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.13_video_wip --dag txt2video_min
-    ./bin/run_dag.sh demo.13_video_wip --dag img2video_min
-    ./bin/run_dag.sh demo.13_video_wip --dag txt2video_ic_lora_canny_min
+    ./bin/run_dag.sh demo.14_video_wip --dag txt2video_min
+    ./bin/run_dag.sh demo.14_video_wip --dag img2video_min
+    ./bin/run_dag.sh demo.14_video_wip --dag txt2video_ic_lora_canny_min
 '''
 
 from pathlib import Path

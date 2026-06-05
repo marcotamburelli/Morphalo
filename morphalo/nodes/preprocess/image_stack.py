@@ -1,5 +1,4 @@
 import math
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Tuple, Union
@@ -10,6 +9,7 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.preprocess.utils import resolve_size_expr, validate_size_expr
 
 SizeExpr = int | str
 Pos = Union[Tuple[int, int], str]
@@ -95,83 +95,6 @@ class Config:
     height: int
     background: Optional[Union[str, Tuple[int, int, int, int]]]
     out_mode: Literal['RGBA', 'RGB']
-
-
-def validate_size_expr(size_expr: int | str) -> None:
-    # Absolute pixel value
-    if isinstance(size_expr, int):
-        if size_expr < 0:
-            raise ValueError('size expression must be >= 0')
-        return
-
-    # Must be a string from here
-    if not isinstance(size_expr, str):
-        raise ValueError(
-            f'invalid size expression type {type(size_expr).__name__}; '
-            'expected int or str'
-        )
-
-    s = size_expr.strip().lower()
-
-    pattern = r'^\d+(\.\d+)?(px|%)$'
-
-    if not re.match(pattern, s):
-        raise ValueError(
-            f'invalid size expression value "{size_expr}". '
-            'Expected formats: int, "<number>px", "<number>%".'
-        )
-
-
-def resolve_size_expr(
-    size_expr: int | str,
-    *,
-    max_size: int,
-    min_size: int = 1,
-) -> int:
-    """
-    Resolve a size expression to pixels.
-
-    Parameters
-    ----------
-    size_expr : int or str
-        Size specification.
-
-        Supported formats are:
-
-        - ``int``:
-          Explicit size in pixels.
-        - ``'<number>px'``:
-          Explicit size in pixels.
-        - ``'<number>%'``:
-          Percentage of ``max_size``.
-
-    max_size : int
-        Reference size used to resolve percentage expressions.
-    min_size : int, default=1
-        Minimum resolved value returned by the function.
-
-        This is useful because some geometric quantities, such as output
-        image size, should never collapse to zero, while others, such as
-        corner radius, may validly resolve to zero.
-
-    Returns
-    -------
-    int
-        Resolved size in pixels, clamped to be at least ``min_size``.
-    """
-    validate_size_expr(size_expr)
-
-    if isinstance(size_expr, int):
-        return max(min_size, size_expr)
-
-    s = size_expr.strip().lower()
-
-    if s.endswith('px'):
-        return max(min_size, int(round(float(s[:-2]))))
-
-    pct = max(0.0, float(s[:-1])) / 100.0
-
-    return max(min_size, int(round(max_size * pct)))
 
 
 def resolve_feather_xy(

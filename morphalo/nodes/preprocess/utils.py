@@ -5,6 +5,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
+SizeExpr = int | str
+
 CropModeName = Literal['bbox', 'trim', 'full_frame']
 
 @dataclass(frozen=True)
@@ -67,6 +69,105 @@ def parse_crop_mode(value: Any, *, node_id: str) -> CropModeSpec:
         )
 
     return CropModeSpec(mode='bbox', ratio=(rw, rh), raw=s)
+
+
+def validate_size_expr(
+    size_expr: SizeExpr,
+    *,
+    allow_unitless: bool = False,
+    allow_negative: bool = False,
+) -> None:
+    if isinstance(size_expr, int):
+        if not allow_negative and size_expr < 0:
+            raise ValueError('size expression must be >= 0')
+        return
+
+    if not isinstance(size_expr, str):
+        raise ValueError(
+            f'invalid size expression type {type(size_expr).__name__}; '
+            'expected int or str'
+        )
+
+    s = size_expr.strip().lower()
+    sign = r'-?' if allow_negative else ''
+    suffix = r'(px|%)?' if allow_unitless else r'(px|%)'
+    pattern = rf'^{sign}\d+(\.\d+)?{suffix}$'
+
+    if not re.match(pattern, s):
+        raise ValueError(
+            f'invalid size expression value "{size_expr}". '
+            'Expected formats: int, "<number>px", "<number>%".'
+        )
+
+
+def resolve_size_expr(
+    size_expr: SizeExpr,
+    *,
+    max_size: Optional[int] = None,
+    reference: Optional[int] = None,
+    min_size: int = 1,
+    allow_unitless: bool = False,
+) -> int:
+    """
+    Resolve a pixel or percentage size expression to pixels.
+    """
+    ref = reference if reference is not None else max_size
+    if ref is None:
+        raise TypeError('resolve_size_expr requires max_size or reference')
+    if ref < 0:
+        raise ValueError(f'reference must be >= 0, got {ref}')
+
+    validate_size_expr(size_expr, allow_unitless=allow_unitless)
+
+    if isinstance(size_expr, int):
+        return max(min_size, size_expr)
+
+    s = size_expr.strip().lower()
+    if s.endswith('px'):
+        return max(min_size, int(round(float(s[:-2]))))
+    if s.endswith('%'):
+        pct = max(0.0, float(s[:-1])) / 100.0
+        return max(min_size, int(round(ref * pct)))
+
+    return max(min_size, int(round(float(s))))
+
+
+def validate_percentage_size_expr(
+    value: Optional[SizeExpr],
+    *,
+    node_id: str,
+    name: str,
+) -> Optional[str]:
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise ValueError(
+            f"'{node_id}': invalid {name}={value!r}; "
+            "expected None or a percentage string such as '5%'."
+        )
+
+    s = value.strip().lower()
+    if not s.endswith('%'):
+        raise ValueError(
+            f"'{node_id}': invalid {name}={value!r}; "
+            "expected None or a percentage string such as '5%'."
+        )
+
+    try:
+        raw = float(s[:-1])
+    except ValueError as exc:
+        raise ValueError(
+            f"'{node_id}': invalid {name}={value!r}; "
+            "expected None or a percentage string such as '5%'."
+        ) from exc
+
+    if raw < 0:
+        raise ValueError(
+            f"'{node_id}': invalid {name}={value!r}; expected >= 0%."
+        )
+
+    return s
 
 
 def expand_bbox_toward_ratio(

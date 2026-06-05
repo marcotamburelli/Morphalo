@@ -11,11 +11,11 @@ This module contains five small DAGs covering the minimal foundation workflows:
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_min
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_edit_min
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_edit_plus_min
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag qwen_image_inpaint_tshirt_min
-    ./bin/run_dag.sh demo.09_foundation_minimal --dag omnigen_style_transfer_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_edit_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_edit_plus_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_inpaint_tshirt_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag omnigen_style_transfer_min
 '''
 
 from pathlib import Path

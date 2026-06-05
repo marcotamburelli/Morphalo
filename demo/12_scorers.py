@@ -71,10 +71,10 @@ How to run
 ----------
 Run one DAG at a time, for example:
 
-    ./bin/run_dag.sh demo.11_scorers --dag person_score
-    ./bin/run_dag.sh demo.11_scorers --dag face_score
-    ./bin/run_dag.sh demo.11_scorers --dag prompt_score
-    ./bin/run_dag.sh demo.11_scorers --dag score_chain
+    ./bin/run_dag.sh demo.12_scorers --dag person_score
+    ./bin/run_dag.sh demo.12_scorers --dag face_score
+    ./bin/run_dag.sh demo.12_scorers --dag prompt_score
+    ./bin/run_dag.sh demo.12_scorers --dag score_chain
 
 Notes
 -----
