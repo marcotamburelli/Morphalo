@@ -1,5 +1,6 @@
 import time
 from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -66,10 +67,14 @@ class LayerSpec:
 
     resize : {'fit', 'cover', 'stretch'}
         Resize mode used to adapt the overlay image to the local rectangle.
+    rotation_deg : float
+        Manual clockwise rotation applied to the overlay before resizing and
+        placement, in local rectangle coordinates.
     """
 
     position: Anchor = 'center'
     resize: ResizeMode = 'fit'
+    rotation_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -888,6 +893,8 @@ def _warp_local_to_rect(
     *,
     rect: RotatedRect,
     canvas_size: Tuple[int, int],
+    local_origin: Tuple[float, float] = (0.0, 0.0),
+    local_rect_size: Optional[Tuple[int, int]] = None,
 ) -> Image.Image:
     """
     Warp a local RGBA layer onto a rotated rectangle in full image space.
@@ -895,11 +902,18 @@ def _warp_local_to_rect(
     Parameters
     ----------
     local_rgba : PIL.Image.Image
-        Local RGBA layer with size matching the fitted rectangle.
+        Local RGBA layer expressed in the rectangle local coordinate system. The
+        canvas may be larger than the fitted rectangle when overflow is enabled.
     rect : RotatedRect
         Destination rotated rectangle.
     canvas_size : tuple[int, int]
         Output canvas size ``(width, height)``.
+    local_origin : tuple[float, float], default=(0.0, 0.0)
+        Local coordinates of the input canvas top-left corner in the fitted
+        rectangle coordinate system.
+    local_rect_size : tuple[int, int], optional
+        Size of the fitted rectangle in local coordinates. If omitted, the input
+        canvas size is used, preserving the previous non-overflow behavior.
 
     Returns
     -------
@@ -910,9 +924,14 @@ def _warp_local_to_rect(
     local_rgba = local_rgba.convert('RGBA')
     src_w, src_h = local_rgba.size
     canvas_w, canvas_h = canvas_size
+    local_rect_w, local_rect_h = local_rect_size or (src_w, src_h)
 
     if src_w <= 0 or src_h <= 0:
         raise ValueError(f'invalid local layer size {src_w}x{src_h}')
+
+    if local_rect_w <= 0 or local_rect_h <= 0:
+        raise ValueError(
+            f'invalid local rect size {local_rect_w}x{local_rect_h}')
 
     src = np.asarray(
         [
@@ -924,10 +943,37 @@ def _warp_local_to_rect(
         dtype=np.float32,
     )
 
-    dst = np.asarray(rect.corners, dtype=np.float32)
+    rect_corners = np.asarray(rect.corners, dtype=np.float32)
 
-    if dst.shape != (4, 2):
+    if rect_corners.shape != (4, 2):
         raise ValueError('rect.corners must have shape (4, 2).')
+
+    p0 = rect_corners[0]
+    u = rect_corners[1] - rect_corners[0]
+    v = rect_corners[3] - rect_corners[0]
+
+    def _local_to_world(px: float, py: float) -> np.ndarray:
+        return (
+            p0
+            + u * (float(px) / float(local_rect_w))
+            + v * (float(py) / float(local_rect_h))
+        )
+
+    ox, oy = local_origin
+    local_corners = np.asarray(
+        [
+            [float(ox), float(oy)],
+            [float(ox) + float(src_w), float(oy)],
+            [float(ox) + float(src_w), float(oy) + float(src_h)],
+            [float(ox), float(oy) + float(src_h)],
+        ],
+        dtype=np.float32,
+    )
+
+    dst = np.asarray(
+        [_local_to_world(float(x), float(y)) for x, y in local_corners],
+        dtype=np.float32,
+    )
 
     matrix = cv2.getPerspectiveTransform(src, dst)
 
@@ -1217,19 +1263,31 @@ def _resize_overlay_to_box(
         resample=Image.LANCZOS,
     )
 
-    if resize == 'cover':
-        left = max(0, (out_w - avail_w) // 2)
-        top = max(0, (out_h - avail_h) // 2)
-        resized = resized.crop(
-            (
-                left,
-                top,
-                left + avail_w,
-                top + avail_h,
-            )
-        )
-
     return resized, (pad_x, pad_y, avail_w, avail_h)
+
+
+def _rotate_overlay(
+    overlay: Image.Image,
+    *,
+    rotation_deg: float,
+) -> Image.Image:
+    """
+    Rotate an overlay before local resize and placement.
+
+    Positive angles are clockwise in image coordinates.
+    """
+
+    overlay = overlay.convert('RGBA')
+    angle = float(rotation_deg)
+
+    if angle % 360.0 == 0.0:
+        return overlay
+
+    return overlay.rotate(
+        -angle,
+        resample=Image.BICUBIC,
+        expand=True,
+    )
 
 
 def _resolve_local_center_xy(
@@ -1307,7 +1365,8 @@ def _place_overlay_on_local_canvas(
     box_height: int,
     content_box: Tuple[int, int, int, int],
     position: Anchor,
-) -> Image.Image:
+    allow_overflow: bool = False,
+) -> Tuple[Image.Image, Tuple[float, float]]:
     """
     Place a resized overlay on a local transparent rectangle canvas.
 
@@ -1323,11 +1382,15 @@ def _place_overlay_on_local_canvas(
         Available box ``(x, y, width, height)`` inside the local canvas.
     position : Anchor
         Anchor inside ``content_box``.
+    allow_overflow : bool, default=False
+        If true, expand the local canvas so overlay pixels outside the fitted
+        rectangle are preserved until the final mask clipping step.
 
     Returns
     -------
-    PIL.Image.Image
-        Local RGBA canvas with the overlay placed on it.
+    tuple[PIL.Image.Image, tuple[float, float]]
+        Local RGBA canvas with the overlay placed on it, and the local
+        coordinates of the canvas top-left corner in the rectangle frame.
     """
 
     overlay = overlay.convert('RGBA')
@@ -1342,11 +1405,27 @@ def _place_overlay_on_local_canvas(
 
     x0 = int(round(cx - ow / 2.0))
     y0 = int(round(cy - oh / 2.0))
+    x1 = x0 + ow
+    y1 = y0 + oh
 
-    canvas = Image.new('RGBA', (box_width, box_height), (0, 0, 0, 0))
-    canvas.alpha_composite(overlay, (x0, y0))
+    if allow_overflow:
+        min_x = min(0, x0)
+        min_y = min(0, y0)
+        max_x = max(box_width, x1)
+        max_y = max(box_height, y1)
+    else:
+        min_x = 0
+        min_y = 0
+        max_x = box_width
+        max_y = box_height
 
-    return canvas
+    canvas_w = max(1, int(max_x - min_x))
+    canvas_h = max(1, int(max_y - min_y))
+
+    canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+    canvas.alpha_composite(overlay, (x0 - min_x, y0 - min_y))
+
+    return canvas, (float(min_x), float(min_y))
 
 
 @dataclass
@@ -1387,13 +1466,14 @@ class MaskInsertLayer(NodeRef):
     6. Find the largest axis-aligned rectangle inside the rotated foreground.
     7. Map that rectangle back into the original image coordinates.
     8. Load the attached overlay image from the ``overlay`` input sink.
-    9. Resize the overlay into the rectangle content area using the selected
+    9. Apply the optional manual overlay rotation.
+    10. Resize the overlay against the rectangle content area using the selected
         resize mode.
-    10. Place the resized overlay according to the selected local anchor.
-    11. Warp the local overlay canvas into the rotated rectangle in full-image
+    11. Place the resized overlay according to the selected local anchor.
+    12. Warp the local overlay canvas into the rotated rectangle in full-image
         coordinates.
-    12. Clip the final alpha channel to the original mask.
-    13. Save the generated full-frame RGBA layer and JSON sidecar.
+    13. Clip the final alpha channel to the original mask.
+    14. Save the generated full-frame RGBA layer and JSON sidecar.
 
     Rectangle fitting
     -----------------
@@ -1423,7 +1503,9 @@ class MaskInsertLayer(NodeRef):
 
     ``resize='cover'``
         Preserve aspect ratio and scale the overlay so that it covers the whole
-        available content area. Excess pixels are cropped around the center.
+        available content area. The resized overlay may exceed both the content box
+        and the fitted rectangle. Overflow is preserved during local placement and
+        final clipping is performed only against the source mask.
 
     ``resize='stretch'``
         Resize the overlay exactly to the available content area, without
@@ -1436,6 +1518,9 @@ class MaskInsertLayer(NodeRef):
     - ``'top'``, ``'bottom'``, ``'left'``, ``'right'``
     - ``'top-left'``, ``'top-right'``
     - ``'bottom-left'``, ``'bottom-right'``
+
+    ``rotation_deg`` can be set on :meth:`overlay` to manually rotate the overlay
+    clockwise in local rectangle coordinates before resize and placement.
 
     Parameters
     ----------
@@ -1530,8 +1615,9 @@ class MaskInsertLayer(NodeRef):
             Fitted rotated rectangle metadata, including center, width, height,
             angle, and corners.
         - ``placement`` : dict
-            Overlay placement metadata, including anchor, resize mode, content
-            box, original overlay size, and fitted overlay size.
+            Overlay placement metadata, including anchor, resize mode, manual
+            rotation, content box, original overlay size, rotated overlay size,
+            fitted overlay size, local canvas size, and local origin.
         - ``params`` : dict
             Resolved node parameters.
         - ``debug_image`` : str or None
@@ -1568,6 +1654,7 @@ class MaskInsertLayer(NodeRef):
         *,
         position: Anchor = 'center',
         resize: ResizeMode = 'fit',
+        rotation_deg: float = 0.0,
     ) -> AttachmentSink:
         """
         Declare the overlay image input sink.
@@ -1577,9 +1664,10 @@ class MaskInsertLayer(NodeRef):
         mask-fitted rectangle.
 
         The method also stores the placement configuration associated with the
-        overlay input. At runtime, the attached overlay image is resized according
-        to ``resize``, placed inside the fitted rectangle according to ``position``,
-        warped into full-image coordinates, and clipped to the source mask.
+        overlay input. At runtime, the attached overlay image is rotated according
+        to ``rotation_deg``, resized according to ``resize``, placed inside the
+        fitted rectangle according to ``position``, warped into full-image
+        coordinates, and clipped to the source mask.
 
         Parameters
         ----------
@@ -1623,10 +1711,15 @@ class MaskInsertLayer(NodeRef):
               contained inside the content box.
             - ``'cover'``:
               Preserve aspect ratio and scale the overlay so that it covers the
-              whole content box. Excess pixels are cropped around the center.
+              whole content box. Excess pixels may overflow the fitted rectangle
+              and are clipped only by the final mask.
             - ``'stretch'``:
               Resize the overlay exactly to the content box, without preserving
               aspect ratio.
+
+        rotation_deg : float, default=0.0
+            Manual clockwise rotation applied to the overlay before resizing and
+            placement, in the fitted rectangle local coordinate system.
 
         Returns
         -------
@@ -1649,6 +1742,8 @@ class MaskInsertLayer(NodeRef):
             If ``position`` is not one of the supported anchors.
         ValueError
             If ``resize`` is not one of ``'fit'``, ``'cover'``, or ``'stretch'``.
+        ValueError
+            If ``rotation_deg`` is not a finite number.
 
         Examples
         --------
@@ -1686,9 +1781,17 @@ class MaskInsertLayer(NodeRef):
                 "expected 'fit', 'cover', or 'stretch'."
             )
 
+        rotation_deg = float(rotation_deg)
+        if not isfinite(rotation_deg):
+            raise ValueError(
+                f'{self.id}: invalid rotation_deg {rotation_deg!r}; '
+                'expected a finite number.'
+            )
+
         self._layer = LayerSpec(
             position=position,
             resize=resize,
+            rotation_deg=rotation_deg,
         )
 
         return AttachmentSink(
@@ -1725,6 +1828,10 @@ class MaskInsertLayer(NodeRef):
 
         overlay_path = _resolve_overlay_path(input, input_id='overlay')
         overlay = Image.open(overlay_path).convert('RGBA')
+        placed_overlay = _rotate_overlay(
+            overlay,
+            rotation_deg=self._layer.rotation_deg,
+        )
 
         rect, alignment_angle = _fit_rect_on_mask_axis(fit_mask)
 
@@ -1732,7 +1839,7 @@ class MaskInsertLayer(NodeRef):
         box_height = max(1, int(round(rect.height)))
 
         fitted_overlay, content_box = _resize_overlay_to_box(
-            overlay,
+            placed_overlay,
             box_width=box_width,
             box_height=box_height,
             padding_x=cfg.padding_x,
@@ -1740,12 +1847,15 @@ class MaskInsertLayer(NodeRef):
             resize=self._layer.resize,
         )
 
-        local_layer = _place_overlay_on_local_canvas(
+        allow_overflow = self._layer.resize == 'cover'
+
+        local_layer, local_origin = _place_overlay_on_local_canvas(
             fitted_overlay,
             box_width=box_width,
             box_height=box_height,
             content_box=content_box,
             position=self._layer.position,
+            allow_overflow=allow_overflow,
         )
 
         h, w = mask.shape[:2]
@@ -1753,6 +1863,8 @@ class MaskInsertLayer(NodeRef):
             local_layer,
             rect=rect,
             canvas_size=(w, h),
+            local_origin=local_origin,
+            local_rect_size=(box_width, box_height),
         )
 
         layer = _clip_layer_to_mask(layer, mask)
@@ -1800,9 +1912,13 @@ class MaskInsertLayer(NodeRef):
             'placement': {
                 'position': self._layer.position,
                 'resize': self._layer.resize,
+                'rotation_deg': self._layer.rotation_deg,
                 'content_box': list(content_box),
                 'overlay_size': list(overlay.size),
+                'rotated_overlay_size': list(placed_overlay.size),
                 'fitted_overlay_size': list(fitted_overlay.size),
+                'local_canvas_size': list(local_layer.size),
+                'local_origin': list(local_origin),
             },
             'params': {
                 'threshold': cfg.threshold,
