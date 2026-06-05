@@ -5,9 +5,19 @@ from typing import Literal, Optional
 from morphalo.dag import NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from morphalo.nodes.common.config_resolve import SpecInput
-from morphalo.nodes.preprocess import BoxCrop, ImageStack, ImgAuxMap, SubjectCrop
+from morphalo.nodes.preprocess import (BoxCrop, FaceCrop, ImageStack,
+                                       ImgAuxMap, SubjectCrop)
 
-FineRegion = Literal['face', 'eyes', 'left-eye', 'right-eye', 'head']
+FineRegion = Literal[
+    'face',
+    'eyes',
+    'left-eye',
+    'right-eye',
+    'eyebrows',
+    'left-eyebrow',
+    'right-eyebrow',
+    'head',
+]
 
 
 def refine_face_group(
@@ -439,16 +449,17 @@ def fine_face_details_group(
         if mask_expansion is not None:
             mask_params['expansion'] = mask_expansion
 
-        region_mask = SubjectCrop(
+        crop_node_cls = SubjectCrop if region == 'head' else FaceCrop
+        model_spec = {
+            'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+        }
+        if region == 'head':
+            model_spec['pose_landmarker_task'] = '~/models/mediapipe/pose_landmarker_heavy.task'
+
+        region_mask = crop_node_cls(
             name='region_mask',
             spec={
-                'model': {
-                    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                    # 'yolo_model' is only needed when region == 'head' and your SubjectCrop uses YOLO for it.
-                    # Add it if your SubjectCrop config requires it for head mode.
-                    # 'yolo_model': 'yolov8n.pt',
-                },
+                'model': model_spec,
                 'params': mask_params,
             },
         )

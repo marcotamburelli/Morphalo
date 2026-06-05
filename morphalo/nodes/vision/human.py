@@ -890,266 +890,202 @@ def select_person_bbox_xyxy(
     return best_box
 
 
-def mp_face_landmarks(
-    img_rgb: np.ndarray,
+def head_area_xyxy_from_pose(
+    pose_xy: np.ndarray,
     *,
-    face_landmarker,
-) -> np.ndarray:
+    full_w: int,
+    full_h: int,
+    expansion: float = 1.6,
+) -> tuple[int, int, int, int]:
     """
-    Detect face landmarks and return the most prominent face.
-
-    Returns pixel-space landmarks (N, 2).
+    Derive a pose-guided upper-body area suitable for downstream face detection.
     """
-    import mediapipe as mp
+    def _valid(i: int) -> bool:
+        return (
+            0 <= i < pose_xy.shape[0]
+            and pose_xy[i, 0] >= 0
+            and pose_xy[i, 1] >= 0
+        )
 
-    h, w = img_rgb.shape[:2]
+    def _clip_box(
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> tuple[int, int, int, int]:
+        ix1 = max(0, min(full_w, int(math.floor(x1))))
+        iy1 = max(0, min(full_h, int(math.floor(y1))))
+        ix2 = max(0, min(full_w, int(math.ceil(x2))))
+        iy2 = max(0, min(full_h, int(math.ceil(y2))))
 
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=img_rgb,
+        if ix2 <= ix1 or iy2 <= iy1:
+            raise RuntimeError('Invalid pose-derived head area.')
+
+        return ix1, iy1, ix2, iy2
+
+    face_ids = [0, 2, 5, 7, 8]
+    face_pts = [
+        pose_xy[i].astype(np.float32)
+        for i in face_ids
+        if _valid(i)
+    ]
+
+    has_torso = all(_valid(i) for i in [11, 12, 23, 24])
+
+    if has_torso:
+        ls = pose_xy[11].astype(np.float32)
+        rs = pose_xy[12].astype(np.float32)
+        lh = pose_xy[23].astype(np.float32)
+        rh = pose_xy[24].astype(np.float32)
+
+        shoulder_center = 0.5 * (ls + rs)
+        hip_center = 0.5 * (lh + rh)
+
+        torso_vec = shoulder_center - hip_center
+        torso_len = float(np.linalg.norm(torso_vec))
+        if torso_len < 1.0:
+            raise RuntimeError(
+                'Cannot derive head area from pose: torso too small.'
+            )
+
+        head_dir = torso_vec / torso_len
+        shoulder_width = float(np.linalg.norm(ls - rs))
+        hip_width = float(np.linalg.norm(lh - rh))
+
+        if face_pts:
+            face_pts_arr = np.stack(face_pts, axis=0)
+            face_center = np.mean(face_pts_arr, axis=0)
+            top_center = 0.7 * face_center + 0.3 * (
+                shoulder_center + head_dir * (0.35 * torso_len)
+            )
+
+            face_y_min = float(np.min(face_pts_arr[:, 1]))
+            top_y = min(
+                face_y_min - 0.35 * shoulder_width,
+                top_center[1] - 0.8 * shoulder_width,
+            )
+            x_center = float(top_center[0])
+        else:
+            top_center = shoulder_center + head_dir * (0.55 * torso_len)
+            top_y = float(top_center[1] - 0.6 * shoulder_width)
+            x_center = float(top_center[0])
+
+        bottom_center = hip_center
+        bottom_y = float(bottom_center[1] + 0.25 * torso_len)
+
+        region_width = max(
+            1.35 * shoulder_width,
+            1.15 * hip_width,
+            0.9 * torso_len,
+        ) * float(expansion)
+
+        half_w = max(12.0, 0.5 * region_width)
+
+        return _clip_box(
+            x_center - half_w,
+            top_y,
+            x_center + half_w,
+            bottom_y,
+        )
+
+    if len(face_pts) >= 2:
+        face_pts_arr = np.stack(face_pts, axis=0)
+
+        fx_min = float(np.min(face_pts_arr[:, 0]))
+        fy_min = float(np.min(face_pts_arr[:, 1]))
+        fx_max = float(np.max(face_pts_arr[:, 0]))
+        fy_max = float(np.max(face_pts_arr[:, 1]))
+
+        face_w = max(1.0, fx_max - fx_min)
+        face_h = max(1.0, fy_max - fy_min)
+        face_span = max(face_w, face_h)
+
+        cx = 0.5 * (fx_min + fx_max)
+        cy = 0.5 * (fy_min + fy_max)
+
+        half_w = max(8.0, 1.2 * face_span * float(expansion))
+        top_pad = 0.9 * face_span * float(expansion)
+        bottom_pad = 1.8 * face_span * float(expansion)
+
+        return _clip_box(
+            cx - half_w,
+            cy - top_pad,
+            cx + half_w,
+            cy + bottom_pad,
+        )
+
+    raise RuntimeError(
+        'Cannot derive head area from pose: insufficient face or torso landmarks.'
     )
 
-    result = face_landmarker.detect(mp_image)
-    face_landmarks_list = result.face_landmarks or []
 
-    if not face_landmarks_list:
-        raise RuntimeError('MediaPipe found no face landmarks.')
-
-    best_xy = None
-    best_area = None
-
-    for landmarks in face_landmarks_list:
-        face_xy = np.empty((len(landmarks), 2), dtype=np.int32)
-
-        for i, lm in enumerate(landmarks):
-            x = int(round(float(lm.x) * w))
-            y = int(round(float(lm.y) * h))
-            x = max(0, min(w - 1, x))
-            y = max(0, min(h - 1, y))
-            face_xy[i] = (x, y)
-
-        x1 = np.min(face_xy[:, 0])
-        y1 = np.min(face_xy[:, 1])
-        x2 = np.max(face_xy[:, 0]) + 1
-        y2 = np.max(face_xy[:, 1]) + 1
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        area = float((x2 - x1) * (y2 - y1))
-
-        if best_area is None or area > best_area:
-            best_area = area
-            best_xy = face_xy
-
-    if best_xy is None:
-        raise RuntimeError('Could not derive valid face landmarks.')
-
-    return best_xy
-
-
-def face_bbox_xyxy_from_landmarks(
-    face_xy: np.ndarray,
-    image_shape: tuple[int, ...],
+def crop_head_area_from_pose(
+    img_rgb: np.ndarray,
     *,
-    expansion: float = 1.0,
-) -> tuple[int, int, int, int]:
+    pose_xy: np.ndarray,
+    expansion: float = 1.6,
+) -> tuple[np.ndarray, int, int]:
     """
-    Compute an end-exclusive face bounding box from face landmarks.
-
-    The returned box is derived from the min/max landmark coordinates and can be
-    optionally expanded around its center. This is useful because MediaPipe face
-    landmarks usually describe the visible facial feature region more tightly than
-    the full face silhouette.
-
-    Parameters
-    ----------
-    face_xy : np.ndarray
-        Face landmark coordinates with shape ``(N, 2)`` in image-local pixel
-        coordinates.
-
-    image_shape : tuple[int, ...]
-        Source image shape. Only the first two dimensions are used as ``(H, W)``.
-
-    expansion : float, default=1.0
-        Multiplicative bbox expansion factor.
-
-        - ``1.0`` keeps the landmark-tight bbox.
-        - values greater than ``1.0`` expand the bbox around its center.
-        - values between ``0.0`` and ``1.0`` shrink the bbox, although this is
-          usually not recommended for face crops.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        End-exclusive bounding box ``(x1, y1, x2, y2)`` clipped to image bounds.
-
-    Raises
-    ------
-    RuntimeError
-        If landmarks are malformed or the resulting bbox is invalid.
-
-    ValueError
-        If ``expansion`` is negative.
+    Crop a coarse head area from the input image using pose landmarks.
     """
-    if face_xy.ndim != 2 or face_xy.shape[1] != 2:
-        raise RuntimeError('Invalid face landmarks.')
+    h, w = img_rgb.shape[:2]
 
-    if expansion < 0:
-        raise ValueError(
-            f'Invalid expansion={expansion!r}; expected >= 0.'
-        )
+    x1, y1, x2, y2 = head_area_xyxy_from_pose(
+        pose_xy,
+        full_w=w,
+        full_h=h,
+        expansion=expansion,
+    )
 
-    h, w = image_shape[:2]
+    head_area_rgb = img_rgb[y1:y2, x1:x2, :]
+    if head_area_rgb.size == 0:
+        raise RuntimeError('Pose-derived head area is empty.')
 
-    x1 = int(np.min(face_xy[:, 0]))
-    y1 = int(np.min(face_xy[:, 1]))
-    x2 = int(np.max(face_xy[:, 0])) + 1
-    y2 = int(np.max(face_xy[:, 1])) + 1
-
-    x1 = max(0, min(w - 1, x1))
-    y1 = max(0, min(h - 1, y1))
-    x2 = max(x1 + 1, min(w, x2))
-    y2 = max(y1 + 1, min(h, y2))
-
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError('Invalid face bbox.')
-
-    if expansion != 1.0:
-        bw = x2 - x1
-        bh = y2 - y1
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-
-        bw *= float(expansion)
-        bh *= float(expansion)
-
-        x1 = int(np.floor(cx - bw / 2.0))
-        y1 = int(np.floor(cy - bh / 2.0))
-        x2 = int(np.ceil(cx + bw / 2.0))
-        y2 = int(np.ceil(cy + bh / 2.0))
-
-        x1 = max(0, min(w - 1, x1))
-        y1 = max(0, min(h - 1, y1))
-        x2 = max(x1 + 1, min(w, x2))
-        y2 = max(y1 + 1, min(h, y2))
-
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError('Invalid face bbox.')
-
-    return x1, y1, x2, y2
+    return np.ascontiguousarray(head_area_rgb), x1, y1
 
 
-def eye_bbox_xyxy_from_landmarks(
-    face_xy: np.ndarray,
-    image_shape: tuple[int, ...],
-    *,
-    which: str,
-    expansion: float = 1.2,
-) -> tuple[int, int, int, int]:
-    """
-    Compute eye bbox from face landmarks.
-    """
-    h, w = image_shape[:2]
-
-    left_ids = list(range(33, 133))
-    right_ids = list(range(362, 463))
-
-    if which == 'left':
-        ids = left_ids
-    elif which == 'right':
-        ids = right_ids
-    elif which == 'both':
-        ids = left_ids + right_ids
-    else:
-        raise ValueError(f'Invalid which={which!r}')
-
-    pts = face_xy[np.asarray(ids)]
-
-    x1 = int(np.min(pts[:, 0]))
-    y1 = int(np.min(pts[:, 1]))
-    x2 = int(np.max(pts[:, 0])) + 1
-    y2 = int(np.max(pts[:, 1])) + 1
-
-    x1 = max(0, min(w - 1, x1))
-    y1 = max(0, min(h - 1, y1))
-    x2 = max(x1 + 1, min(w, x2))
-    y2 = max(y1 + 1, min(h, y2))
-
-    bw = x2 - x1
-    bh = y2 - y1
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-
-    bw *= expansion
-    bh *= expansion
-
-    ex1 = int(cx - bw / 2)
-    ex2 = int(cx + bw / 2)
-    ey1 = int(cy - bh / 2)
-    ey2 = int(cy + bh / 2)
-
-    ex1 = max(0, ex1)
-    ey1 = max(0, ey1)
-    ex2 = min(w, ex2)
-    ey2 = min(h, ey2)
-
-    return ex1, ey1, ex2, ey2
-
-
-def eye_mask_from_landmarks(
-    face_xy: np.ndarray,
-    image_shape: tuple[int, ...],
-    *,
-    which: str,
+def square_head_bbox_from_face_bbox(
+    x1: int, y1: int, x2: int, y2: int,
+    w: int, h: int,
     expansion: float,
-) -> np.ndarray:
-    """
-    Build eye mask from face landmarks.
-    """
-    import cv2
+) -> tuple[int, int, int, int]:
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
 
-    h, w = image_shape[:2]
+    x1 = max(0, min(w, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h, y1))
+    y2 = max(0, min(h, y2))
 
-    left_ids = [
-        33, 7, 163, 144, 145, 153, 154, 155,
-        133, 173, 157, 158, 159, 160, 161, 246,
-    ]
-    right_ids = [
-        362, 382, 381, 380, 374, 373, 390, 249,
-        263, 466, 388, 387, 386, 385, 384, 398,
-    ]
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError(f"Invalid face bbox: {(x1, y1, x2, y2)}")
 
-    def _points(ids):
-        pts = []
-        for i in ids:
-            x, y = face_xy[int(i)]
-            x = max(0, min(w - 1, x))
-            y = max(0, min(h - 1, y))
-            pts.append([x, y])
-        return np.asarray(pts, dtype=np.int32)
+    fw = x2 - x1
+    fh = y2 - y1
+    face_size = max(fw, fh)
 
-    mask = np.zeros((h, w), dtype=np.uint8)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
 
-    if which in ('left', 'both'):
-        pts = _points(left_ids)
-        if pts.size > 0:
-            cv2.fillConvexPoly(mask, cv2.convexHull(pts), 255)
+    cy -= 0.15 * face_size
+    radius = max(1.0, 0.75 * face_size * float(expansion))
 
-    if which in ('right', 'both'):
-        pts = _points(right_ids)
-        if pts.size > 0:
-            cv2.fillConvexPoly(mask, cv2.convexHull(pts), 255)
+    bx1 = int(math.floor(cx - radius))
+    by1 = int(math.floor(cy - radius))
+    bx2 = int(math.ceil(cx + radius))
+    by2 = int(math.ceil(cy + radius))
 
-    if expansion > 1.0:
-        radius = max(1, int(round((expansion - 1.0) * 8)))
-        k = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * radius + 1, 2 * radius + 1),
-        )
-        mask = cv2.dilate(mask, k, iterations=1)
+    bx1 = max(0, bx1)
+    by1 = max(0, by1)
+    bx2 = min(w, bx2)
+    by2 = min(h, by2)
 
-    return (mask > 0)
+    if bx2 <= bx1 or by2 <= by1:
+        raise RuntimeError(f"Invalid square head bbox: {(bx1, by1, bx2, by2)}")
+
+    return bx1, by1, bx2, by2
 
 
 def hand_bbox_xyxy(
@@ -1360,9 +1296,9 @@ def hands_bbox_xyxy_from_landmarks(
         Which hand(s) to include.
 
         - ``'left'``:
-          subject's left hand
+          hand appearing on the left side of the image
         - ``'right'``:
-          subject's right hand
+          hand appearing on the right side of the image
         - ``'both'``:
           union of all detected valid hands
     expansion : float, optional
@@ -1451,9 +1387,9 @@ def hands_mask_from_landmarks(
         Which hand(s) to include.
 
         - ``'left'``:
-          subject's left hand
+          hand appearing on the left side of the image
         - ``'right'``:
-          subject's right hand
+          hand appearing on the right side of the image
         - ``'both'``:
           union of all detected valid hands
     expansion : float, optional

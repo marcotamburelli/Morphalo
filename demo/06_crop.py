@@ -1,30 +1,34 @@
 r"""
-SubjectCrop demo: semantic crops, masks, and bbox-based framing from a single image.
+Semantic crop demo: subject, face-detail, and prompt-guided crops from one image.
 
-This demo showcases ``SubjectCrop`` across three complementary use cases:
+This demo showcases three complementary crop families:
 
-1) **semantic crops**
-    Extract meaningful regions such as person, head, face, eyes, and hands.
+1) **subject and face-detail crops**
+    Extract person/body regions with ``SubjectCrop`` and face-local regions with
+    ``FaceCrop``.
 
 2) **full-frame masks**
-    Generate positive and negative masks aligned with the original image,
-    suitable for inpainting or region-constrained generation.
+    Generate positive and negative subject masks aligned with the original image,
+    suitable for inpainting or region-constrained editing.
 
 3) **bbox-based crops with aspect ratio control**
-    Expand semantic regions into rectangular crops with optional ratio targets
+    Expand subject regions into rectangular crops with optional ratio targets
     such as ``1:1`` or ``16:9``.
 
-The goal is to demonstrate how a single preprocessing node can provide reusable,
-task-oriented outputs for downstream DAGs, and how prompt-based AnyCrop can
-extract arbitrary regions such as pants and a blouse.
+The goal is to demonstrate how specialized preprocessing nodes can provide
+reusable, task-oriented outputs for downstream DAGs, and how prompt-based
+AnyCrop can extract arbitrary regions such as pants and a blouse.
 
-Why SubjectCrop?
-----------------
+Why Split The Nodes?
+--------------------
 ``SubjectCrop`` is not a generic geometric crop. It is a *semantic crop node*
-that combines detection, landmarks, and segmentation to isolate regions that are
-meaningful for image editing workflows.
+that combines detection, pose, hand landmarks, and segmentation to isolate
+person/body-level regions.
 
-Depending on the selected ``target``, it may use:
+``FaceCrop`` handles face-local regions using face landmarks and, for the
+whole-face target, SAM segmentation.
+
+Depending on the selected node and target, the pipeline may use:
 
 - YOLO-style person detection
 - MediaPipe pose landmarks
@@ -34,10 +38,18 @@ Depending on the selected ``target``, it may use:
 
 Supported targets
 -----------------
+``SubjectCrop``:
 - ``person``:
     full subject extraction, typically using YOLO + SAM/SAM-HQ
 - ``head``:
     head-oriented region derived from face landmarks, with hair-friendly framing
+- ``hands``:
+    combined crop covering all visible hands of the selected subject
+- ``left-hand`` / ``right-hand``:
+    single-hand crops derived from MediaPipe hand landmarks and subject-guided
+    masking, using image/viewer perspective
+
+``FaceCrop``:
 - ``face``:
     tighter face crop, guided by face landmarks and SAM/SAM-HQ
 - ``eyes``:
@@ -45,11 +57,11 @@ Supported targets
 - ``left-eye`` / ``right-eye``:
     single-eye crops derived from MediaPipe face landmarks, using image/viewer
     perspective
-- ``hands``:
-    combined crop covering all visible hands of the selected subject
-- ``left-hand`` / ``right-hand``:
-    single-hand crops derived from MediaPipe hand landmarks and subject-guided
-    masking, using image/viewer perspective
+- ``eyebrows``:
+    combined region covering both eyebrows
+- ``left-eyebrow`` / ``right-eyebrow``:
+    single-eyebrow crops derived from MediaPipe face landmarks, using
+    image/viewer perspective
 
 Defined DAGs
 ------------
@@ -60,7 +72,7 @@ This file defines four demo DAGs:
     Produces full-frame positive and negative masks for the whole subject.
 
 2) ``subject_crop``
-    Demonstrates semantic crops for multiple targets.
+    Demonstrates subject/body and face-local crops for multiple targets.
 
 3) ``subject_crop_bbox_ratio``
     Demonstrates bbox-based crops with aspect-ratio expansion.
@@ -79,17 +91,18 @@ Input image ---+                  -> positive subject mask
                                  mode='negative-mask')
                                     -> negative subject mask
 
-Conceptual graph (semantic targets)
-----------------------------------
+Conceptual graph (semantic crops)
+---------------------------------
                  -> SubjectCrop(target='person')        -> person crop
                 /
 Input image ---+-> SubjectCrop(target='head')          -> head crop
                 \
-                 +-> SubjectCrop(target='face')        -> face crop
+                 +-> FaceCrop(target='face')           -> face crop
                   \
-                   +-> SubjectCrop(target='eyes')          -> eyes crop
-                    +-> SubjectCrop(target='left-eye')     -> left eye crop
-                    +-> SubjectCrop(target='right-eye')    -> right eye crop
+                   +-> FaceCrop(target='eyes')             -> eyes crop
+                    +-> FaceCrop(target='left-eye')        -> left eye crop
+                    +-> FaceCrop(target='right-eye')       -> right eye crop
+                    +-> FaceCrop(target='eyebrows')        -> eyebrows crop
                     +-> SubjectCrop(target='hands')        -> hands crop
                     +-> SubjectCrop(target='left-hand')    -> left hand crop
                     +-> SubjectCrop(target='right-hand')   -> right hand crop
@@ -177,7 +190,8 @@ Notes
     The ratio is a target, not a strict guarantee: near image borders, the final
     crop may deviate from the requested ratio.
 
-- Crops operate in local coordinates unless ``crop_mode='full_frame'`` is used.
+- Crop metadata uses source-image coordinates. Image pixels are cropped locally
+  unless ``crop_mode='full_frame'`` is used.
 
 - Mask outputs are always full-frame and have the same resolution as the input.
 
@@ -189,15 +203,15 @@ Notes
   hands; in those cases a future pose-based fallback may be useful.
 
 - Left/right semantics follow image/viewer perspective, not anatomical subject
-  perspective. ``left-eye`` and ``left-hand`` mean the region on the left side
-  of the image.
+  perspective. ``left-eye``, ``left-eyebrow`` and ``left-hand`` mean the region
+  on the left side of the image.
 """
 
 from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage
-from morphalo.nodes.preprocess import AnyCrop, SubjectCrop
+from morphalo.nodes.preprocess import AnyCrop, FaceCrop, SubjectCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -210,23 +224,28 @@ ROOT = Path(__file__).resolve().parents[1]
 #
 INIT_IMG = '~/images/init_img_2.png'
 
-# Shared model assets used by SubjectCrop.
+# Model assets.
 #
 # Notes:
 # - sam_model selects the SAM/SAM-HQ backend used for segmentation targets.
-# - MediaPipe Face Landmarker is required for face/head/eye targets.
-# - MediaPipe Hand Landmarker is required for hand targets.
-# - The pose landmarker is used to stabilize subject selection and derive
-#   pose-guided regions such as head crops.
 #
-MODEL_SPEC = {
+# Full SubjectCrop config: person/head/hand targets may need different model
+# families depending on the selected target.
+SUBJECT_MODEL_SPEC = {
     'sam_model': 'facebook/sam-vit-large',
     'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
     'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
 }
 
-# Shared crop parameters reused across all SubjectCrop nodes in this demo.
+# FaceCrop config: all targets need face landmarks; only target='face' uses SAM.
+FACE_MODEL_SPEC = {
+    'sam_model': 'facebook/sam-vit-large',
+    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+}
+
+# Shared crop parameters reused across SubjectCrop and FaceCrop nodes in this demo.
 #
 # `mode='default'`:
 #     emit an RGBA crop rather than a full-frame mask.
@@ -235,11 +254,11 @@ MODEL_SPEC = {
 #     return a tight RGBA cutout trimmed to the non-transparent mask area.
 #
 # `box_margin`:
-#     expands the initial detection box before segmentation/cropping.
+#     expands the SAM prompt box for segmentation-backed targets.
 #
 # `expansion`:
-#     target-specific enlargement factor, especially meaningful for head, eye,
-#     and hand crops.
+#     target-specific enlargement factor, especially meaningful for head,
+#     face-detail, and hand crops.
 #
 COMMON_PARAMS = {
     'mode': 'default',
@@ -300,7 +319,7 @@ with DAG(
     subject_mask = SubjectCrop(
         name='subject_mask',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **MASK_PARAMS,
             },
@@ -310,7 +329,7 @@ with DAG(
     subject_negative_mask = SubjectCrop(
         name='subject_negative_mask',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **NEGATIVE_MASK_PARAMS,
             },
@@ -349,7 +368,7 @@ with DAG(
     person_crop = SubjectCrop(
         name='person_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'person',
@@ -361,14 +380,14 @@ with DAG(
     # Head crop
     # -------------------------------------------------------------------------
     #
-    # Produce a head-oriented crop. Compared to `face`, this usually keeps a
+    # Produce a head-oriented crop. Compared to FaceCrop(target='face'), this keeps a
     # larger square region around the face, with more room for hair and framing.
     # Useful when refining portraits while preserving head silhouette/hair volume.
     #
     head_crop = SubjectCrop(
         name='head_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'head',
@@ -383,10 +402,10 @@ with DAG(
     # Tighter crop around the face region. Suitable for face-centric refinement,
     # identity-focused conditioning, or facial analysis workflows.
     #
-    face_crop = SubjectCrop(
+    face_crop = FaceCrop(
         name='face_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': FACE_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'face',
@@ -404,13 +423,10 @@ with DAG(
     #
     # Eye targets are landmark-derived and skip SAM entirely.
     #
-    eyes_crop = SubjectCrop(
+    eyes_crop = FaceCrop(
         name='eyes_crop',
         spec={
-            'model': {
-                'face_landmarker_task': MODEL_SPEC['face_landmarker_task'],
-                'pose_landmarker_task': MODEL_SPEC['pose_landmarker_task'],
-            },
+            'model': FACE_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'eyes',
@@ -426,13 +442,10 @@ with DAG(
     # Note: "left" is in image/viewer perspective, not anatomical subject
     # perspective.
     #
-    left_eye_crop = SubjectCrop(
+    left_eye_crop = FaceCrop(
         name='left_eye_crop',
         spec={
-            'model': {
-                'face_landmarker_task': MODEL_SPEC['face_landmarker_task'],
-                'pose_landmarker_task': MODEL_SPEC['pose_landmarker_task'],
-            },
+            'model': FACE_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'left-eye',
@@ -448,16 +461,53 @@ with DAG(
     # Note: "right" is in image/viewer perspective, not anatomical subject
     # perspective.
     #
-    right_eye_crop = SubjectCrop(
+    right_eye_crop = FaceCrop(
         name='right_eye_crop',
         spec={
-            'model': {
-                'face_landmarker_task': MODEL_SPEC['face_landmarker_task'],
-                'pose_landmarker_task': MODEL_SPEC['pose_landmarker_task'],
-            },
+            'model': FACE_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'right-eye',
+            },
+        },
+    )
+
+    # -------------------------------------------------------------------------
+    # Eyebrow crops
+    # -------------------------------------------------------------------------
+    #
+    # Eyebrow targets mirror the eye targets: they are landmark-derived,
+    # side-specific variants use image/viewer perspective, and SAM is skipped.
+    #
+    eyebrows_crop = FaceCrop(
+        name='eyebrows_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'eyebrows',
+            },
+        },
+    )
+
+    left_eyebrow_crop = FaceCrop(
+        name='left_eyebrow_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'left-eyebrow',
+            },
+        },
+    )
+
+    right_eyebrow_crop = FaceCrop(
+        name='right_eyebrow_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'right-eyebrow',
             },
         },
     )
@@ -479,7 +529,7 @@ with DAG(
     hands_crop = SubjectCrop(
         name='hands_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'hands',
@@ -498,7 +548,7 @@ with DAG(
     left_hand_crop = SubjectCrop(
         name='left_hand_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'left-hand',
@@ -517,7 +567,7 @@ with DAG(
     right_hand_crop = SubjectCrop(
         name='right_hand_crop',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'right-hand',
@@ -529,8 +579,8 @@ with DAG(
     # Wiring
     # -------------------------------------------------------------------------
     #
-    # Fan out the same input image into multiple independent SubjectCrop nodes
-    # so the outputs can be compared side by side.
+    # Fan out the same input image into independent semantic crop nodes so the
+    # outputs can be compared side by side.
     #
     init_img >> [
         person_crop,
@@ -539,6 +589,9 @@ with DAG(
         eyes_crop,
         left_eye_crop,
         right_eye_crop,
+        eyebrows_crop,
+        left_eyebrow_crop,
+        right_eyebrow_crop,
         hands_crop,
         left_hand_crop,
         right_hand_crop,
@@ -573,7 +626,7 @@ with DAG(
     person_bbox = SubjectCrop(
         name='person_bbox',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'person',
@@ -595,7 +648,7 @@ with DAG(
     person_bbox_square = SubjectCrop(
         name='person_bbox_square',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'person',
@@ -615,7 +668,7 @@ with DAG(
     person_bbox_wide = SubjectCrop(
         name='person_bbox_wide',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'person',
@@ -635,7 +688,7 @@ with DAG(
     head_bbox = SubjectCrop(
         name='head_bbox',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'head',
@@ -655,7 +708,7 @@ with DAG(
     head_bbox_square = SubjectCrop(
         name='head_bbox_square',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'head',
@@ -674,7 +727,7 @@ with DAG(
     left_hand_bbox_square = SubjectCrop(
         name='left_hand_bbox_square',
         spec={
-            'model': MODEL_SPEC,
+            'model': SUBJECT_MODEL_SPEC,
             'params': {
                 **COMMON_PARAMS,
                 'target': 'left-hand',

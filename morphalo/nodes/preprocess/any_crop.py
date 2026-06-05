@@ -14,11 +14,11 @@ from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec,
+                                             expand_clip_bbox,
                                              expand_bbox_toward_ratio,
                                              parse_crop_mode, postprocess_mask,
                                              tight_alpha_bbox)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
-from morphalo.nodes.vision.face_region import expand_clip_bbox
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 

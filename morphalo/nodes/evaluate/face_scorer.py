@@ -18,11 +18,10 @@ from morphalo.nodes.common.io import load_faceid_embeds, write_json
 from morphalo.nodes.evaluate.helper import clamp01
 from morphalo.nodes.evaluate.img_wiring_mixin import ImgBundle, ImgWiringMixin
 from morphalo.nodes.vision.face_region import (
-    face_landmarks_from_pose_guided_head_area, square_head_bbox_from_face_bbox)
-from morphalo.nodes.vision.human import (eye_bbox_xyxy_from_landmarks,
-                                         face_bbox_xyxy_from_landmarks,
-                                         mp_face_landmarks,
-                                         mp_pose_landmarks_full)
+    eye_bbox_xyxy_from_landmarks, face_bbox_xyxy_from_landmarks,
+    face_landmarks_from_pose_guided_head_area, mp_face_landmarks)
+from morphalo.nodes.vision.human import (mp_pose_landmarks_full,
+                                         square_head_bbox_from_face_bbox)
 
 
 @dataclass
