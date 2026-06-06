@@ -106,6 +106,29 @@ class RotatedRect:
     corners: List[Tuple[float, float]]
 
 
+@dataclass(frozen=True)
+class RectFitResult:
+    """
+    Result of fitting a placement rectangle inside a binary mask.
+
+    Parameters
+    ----------
+    rect : RotatedRect
+        Final rectangle selected for placement.
+    inner_rect : RotatedRect
+        Largest fully-inscribed rectangle.
+    outer_rect : RotatedRect
+        Rotated foreground bounding box.
+    alignment_angle : float
+        Alignment angle used for fitting, in degrees.
+    """
+
+    rect: RotatedRect
+    inner_rect: RotatedRect
+    outer_rect: RotatedRect
+    alignment_angle: float
+
+
 @dataclass
 class Config:
     """
@@ -124,6 +147,14 @@ class Config:
         Vertical padding applied inside the fitted rectangle before placing
         the overlay.
 
+    box_blend : float
+        Blend factor between the largest fully-inscribed rectangle and the
+        rotated foreground bounding box.
+
+        ``0.0`` keeps the strict inner rectangle.
+        ``1.0`` uses the full rotated foreground bounding box.
+        Intermediate values expand the inner rectangle toward the outer box.
+
     max_bridge_distance : str or None
         Maximum percentage distance used to connect nearby mask components before
         fitting.
@@ -138,6 +169,7 @@ class Config:
     threshold: int
     padding_x: SizeExpr
     padding_y: SizeExpr
+    box_blend: float
     max_bridge_distance: Optional[str]
     fill_holes: bool
     save_debug: bool
@@ -169,10 +201,18 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             f"'{node_id}': invalid threshold={threshold!r}; expected 0..255."
         )
 
+    box_blend = float(params.get('box_blend', 0.0))
+    if not isfinite(box_blend) or not 0.0 <= box_blend <= 1.0:
+        raise ValueError(
+            f"'{node_id}': invalid box_blend={box_blend!r}; "
+            'expected a finite value in [0, 1].'
+        )
+
     return Config(
         threshold=threshold,
         padding_x=params.get('padding_x', '0%'),
         padding_y=params.get('padding_y', '0%'),
+        box_blend=box_blend,
         max_bridge_distance=validate_percentage_size_expr(
             params.get('max_bridge_distance', None),
             node_id=node_id,
@@ -671,6 +711,98 @@ def _largest_axis_aligned_rect(mask: np.ndarray) -> Tuple[int, int, int, int]:
     return best_rect
 
 
+def _foreground_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Find the minimal axis-aligned rectangle containing all foreground pixels.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Boolean mask with shape ``(H, W)``.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Rectangle ``(x, y, width, height)`` in mask coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If the mask contains no foreground pixels.
+    """
+
+    if mask.ndim != 2:
+        raise ValueError('mask must have shape (H, W).')
+
+    ys, xs = np.where(mask)
+
+    if xs.size == 0 or ys.size == 0:
+        raise RuntimeError('Cannot find foreground bbox in an empty mask.')
+
+    x1 = int(xs.min())
+    y1 = int(ys.min())
+    x2 = int(xs.max()) + 1
+    y2 = int(ys.max()) + 1
+
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def _blend_axis_aligned_rects(
+    inner: Tuple[int, int, int, int],
+    outer: Tuple[int, int, int, int],
+    *,
+    box_blend: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Blend an inner rectangle toward an outer rectangle.
+
+    ``box_blend=0`` returns the inner rectangle.
+    ``box_blend=1`` returns the outer rectangle.
+
+    Parameters
+    ----------
+    inner : tuple[int, int, int, int]
+        Inner rectangle ``(x, y, width, height)``.
+    outer : tuple[int, int, int, int]
+        Outer rectangle ``(x, y, width, height)``.
+    box_blend : float
+        Blend factor in ``[0, 1]``.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        Blended rectangle ``(x, y, width, height)``.
+    """
+
+    t = float(box_blend)
+
+    if not isfinite(t) or not 0.0 <= t <= 1.0:
+        raise ValueError(f'box_blend must be in [0, 1], got {box_blend!r}.')
+
+    ix, iy, iw, ih = inner
+    ox, oy, ow, oh = outer
+
+    ix1 = float(ix)
+    iy1 = float(iy)
+    ix2 = float(ix + iw)
+    iy2 = float(iy + ih)
+
+    ox1 = float(ox)
+    oy1 = float(oy)
+    ox2 = float(ox + ow)
+    oy2 = float(oy + oh)
+
+    x1 = ix1 + t * (ox1 - ix1)
+    y1 = iy1 + t * (oy1 - iy1)
+    x2 = ix2 + t * (ox2 - ix2)
+    y2 = iy2 + t * (oy2 - iy2)
+
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+
+    return x1, y1, width, height
+
+
 def _rect_to_corners(
     *,
     x: float,
@@ -840,9 +972,10 @@ def _fit_rect_at_angle(
     mask: np.ndarray,
     *,
     angle_deg: float,
-) -> RotatedRect:
+    box_blend: float = 0.0,
+) -> Tuple[RotatedRect, RotatedRect, RotatedRect]:
     """
-    Fit the largest axis-aligned rectangle after rotating the mask by one angle.
+    Fit an axis-aligned placement rectangle after rotating the mask by one angle.
 
     Parameters
     ----------
@@ -850,42 +983,87 @@ def _fit_rect_at_angle(
         Boolean mask with shape ``(H, W)``.
     angle_deg : float
         Candidate rectangle angle in degrees.
+    box_blend : float, default=0.0
+        Blend factor between the largest fully-inscribed rectangle and the
+        rotated foreground bounding box. ``0.0`` preserves the strict inner
+        rectangle; ``1.0`` uses the foreground bounding box.
 
     Returns
     -------
-    RotatedRect
-        Fitted rectangle in the coordinate system of the input mask.
+    tuple[RotatedRect, RotatedRect, RotatedRect]
+        Final blended rectangle, strict inner rectangle, and rotated foreground
+        bounding box, all mapped back into the coordinate system of the input mask.
     """
 
     rotated_mask, matrix = _rotate_mask(mask, angle_deg=-float(angle_deg))
 
-    x, y, width, height = _largest_axis_aligned_rect(rotated_mask)
+    inner_axis = _largest_axis_aligned_rect(rotated_mask)
+    outer_axis = _foreground_bbox(rotated_mask)
 
-    corners_rot = _rect_to_corners(
+    if box_blend > 0.0:
+        x, y, width, height = _blend_axis_aligned_rects(
+            inner_axis,
+            outer_axis,
+            box_blend=box_blend,
+        )
+    else:
+        x, y, width, height = inner_axis
+
+    final_corners_rot = _rect_to_corners(
         x=float(x),
         y=float(y),
         width=float(width),
         height=float(height),
     )
+    inner_corners_rot = _rect_to_corners(
+        x=float(inner_axis[0]),
+        y=float(inner_axis[1]),
+        width=float(inner_axis[2]),
+        height=float(inner_axis[3]),
+    )
+    outer_corners_rot = _rect_to_corners(
+        x=float(outer_axis[0]),
+        y=float(outer_axis[1]),
+        width=float(outer_axis[2]),
+        height=float(outer_axis[3]),
+    )
 
-    corners = _invert_affine_points(corners_rot, matrix)
+    final_rect = _rect_from_corners(
+        _invert_affine_points(final_corners_rot, matrix)
+    )
+    inner_rect = _rect_from_corners(
+        _invert_affine_points(inner_corners_rot, matrix)
+    )
+    outer_rect = _rect_from_corners(
+        _invert_affine_points(outer_corners_rot, matrix)
+    )
 
-    return _rect_from_corners(corners)
+    return final_rect, inner_rect, outer_rect
 
 
-def _fit_rect_on_mask_axis(mask: np.ndarray) -> Tuple[RotatedRect, float]:
+def _fit_rect_on_mask_axis(
+    mask: np.ndarray,
+    *,
+    box_blend: float = 0.0,
+) -> RectFitResult:
     """
-    Fit a rectangle aligned with the visual slant of the mask.
+    Fit placement rectangles aligned with the visual slant of the mask.
     """
 
     alignment_angle = _estimate_mask_alignment_angle(mask)
 
-    rect = _fit_rect_at_angle(
+    rect, inner_rect, outer_rect = _fit_rect_at_angle(
         mask,
         angle_deg=alignment_angle,
+        box_blend=box_blend,
     )
 
-    return rect, alignment_angle
+    return RectFitResult(
+        rect=rect,
+        inner_rect=inner_rect,
+        outer_rect=outer_rect,
+        alignment_angle=alignment_angle,
+    )
 
 
 def _warp_local_to_rect(
@@ -1031,6 +1209,8 @@ def _make_debug_image(
     mask: np.ndarray,
     rect: RotatedRect,
     *,
+    inner_rect: Optional[RotatedRect] = None,
+    outer_rect: Optional[RotatedRect] = None,
     content_box: Optional[Tuple[int, int, int, int]] = None,
 ) -> Image.Image:
     """
@@ -1042,6 +1222,10 @@ def _make_debug_image(
         Boolean mask with shape ``(H, W)``.
     rect : RotatedRect
         Fitted rectangle in full-image coordinates.
+    inner_rect : RotatedRect, optional
+        Strict largest fully-inscribed rectangle, drawn as diagnostic overlay.
+    outer_rect : RotatedRect, optional
+        Rotated foreground bounding box, drawn as diagnostic overlay.
     content_box : tuple[int, int, int, int], optional
         Optional local content box ``(x, y, width, height)`` after padding.
         When provided, it is projected into full-image coordinates and drawn
@@ -1053,6 +1237,21 @@ def _make_debug_image(
         RGB debug image showing the mask, fitted rectangle, and optional content
         box.
     """
+
+    def _draw_rect(
+        rct: RotatedRect,
+        *,
+        color: Tuple[int, int, int],
+        width: int,
+    ) -> None:
+        pts = [(float(x), float(y)) for x, y in rct.corners]
+        if len(pts) != 4:
+            raise ValueError('rect.corners must contain exactly 4 points.')
+        draw.line(
+            pts + [pts[0]],
+            fill=color,
+            width=width,
+        )
 
     if mask.ndim != 2:
         raise ValueError('mask must have shape (H, W).')
@@ -1068,9 +1267,24 @@ def _make_debug_image(
         raise ValueError('rect.corners must contain exactly 4 points.')
 
     # Fitted rectangle.
-    draw.line(
-        corners + [corners[0]],
-        fill=(255, 0, 0),
+    if outer_rect is not None:
+        _draw_rect(
+            outer_rect,
+            color=(180, 80, 255),
+            width=2,
+        )
+
+    if inner_rect is not None:
+        _draw_rect(
+            inner_rect,
+            color=(0, 128, 255),
+            width=2,
+        )
+
+    # Final fitted / blended rectangle.
+    _draw_rect(
+        rect,
+        color=(255, 0, 0),
         width=3,
     )
 
@@ -1463,17 +1677,20 @@ class MaskInsertLayer(NodeRef):
     4. Estimate the visual vertical axis of the fitting mask.
     5. Rotate the fitting mask once, using the estimated visual axis, so the
        desired rectangle becomes axis-aligned in the temporary rotated mask.
-    6. Find the largest axis-aligned rectangle inside the rotated foreground.
-    7. Map that rectangle back into the original image coordinates.
-    8. Load the attached overlay image from the ``overlay`` input sink.
-    9. Apply the optional manual overlay rotation.
-    10. Resize the overlay against the rectangle content area using the selected
+    6. Compute the largest fully-inscribed rectangle and the rotated foreground
+       bounding box.
+    7. Blend the inner rectangle toward the foreground bounding box according to
+       ``params.box_blend``.
+    8. Map the selected rectangle back into the original image coordinates.
+    9. Load the attached overlay image from the ``overlay`` input sink.
+    10. Apply the optional manual overlay rotation.
+    11. Resize the overlay against the rectangle content area using the selected
         resize mode.
-    11. Place the resized overlay according to the selected local anchor.
-    12. Warp the local overlay canvas into the rotated rectangle in full-image
+    12. Place the resized overlay according to the selected local anchor.
+    13. Warp the local overlay canvas into the rotated rectangle in full-image
         coordinates.
-    13. Clip the final alpha channel to the original mask.
-    14. Save the generated full-frame RGBA layer and JSON sidecar.
+    14. Clip the final alpha channel to the original mask.
+    15. Save the generated full-frame RGBA layer and JSON sidecar.
 
     Rectangle fitting
     -----------------
@@ -1485,8 +1702,12 @@ class MaskInsertLayer(NodeRef):
       the influence of straps, spikes, and noisy protrusions,
     - a line is fitted through the remaining center points to estimate the
       mask's visual vertical axis,
-    - the mask is rotated once so that the rectangle can be found as the largest
-      axis-aligned foreground rectangle,
+    - the mask is rotated once so that the placement rectangle can be computed in
+      axis-aligned coordinates,
+    - the largest fully-inscribed rectangle is computed,
+    - the rotated foreground bounding box is also computed,
+    - ``params.box_blend`` optionally expands the inner rectangle toward the
+      foreground bounding box,
     - the selected rectangle is mapped back into the original image coordinates.
 
     This is not intended to solve the exact maximum-inscribed-rectangle problem.
@@ -1580,6 +1801,18 @@ class MaskInsertLayer(NodeRef):
         Vertical padding applied inside the fitted rectangle content area.
         Percentages are resolved against the rectangle height.
 
+    ``params.box_blend`` : float, default=0.0
+        Blend factor between the largest fully-inscribed rectangle and the rotated
+        foreground bounding box.
+
+        - ``0.0`` uses the fully-inscribed rectangle.
+        - ``1.0`` uses the full rotated foreground bounding box.
+        - intermediate values expand the inner rectangle toward the outer box.
+
+        This is useful when the mask contains holes, occlusions, irregular borders,
+        or disconnected parts that make the strict inner rectangle too small or
+        poorly centered.
+
     ``params.max_bridge_distance`` : str or None, default=None
         Maximum distance used to connect nearby foreground components before fitting
         the rectangle. Only percentage strings are accepted, for example ``'5%'``.
@@ -1591,8 +1824,9 @@ class MaskInsertLayer(NodeRef):
         fitting.
 
     ``debug.save_debug`` : bool, default=False
-        If true, save a debug image showing the mask, fitted rectangle, rectangle
-        center, local axes, and optional content box after padding.
+        If true, save a debug image showing the mask, final fitted rectangle,
+        diagnostic inner/outer rectangles, rectangle center, local axes, and optional
+        content box after padding.
 
     Outputs
     -------
@@ -1614,6 +1848,9 @@ class MaskInsertLayer(NodeRef):
         - ``rect`` : dict
             Fitted rotated rectangle metadata, including center, width, height,
             angle, and corners.
+        - ``fit_rects`` : dict
+            Diagnostic fitting metadata, including the strict inner rectangle, the
+            outer rotated foreground bounding box, and the estimated alignment angle.
         - ``placement`` : dict
             Overlay placement metadata, including anchor, resize mode, manual
             rotation, content box, original overlay size, rotated overlay size,
@@ -1766,7 +2003,8 @@ class MaskInsertLayer(NodeRef):
         Place a badge near the top-right corner of the fitted rectangle::
 
             shirt_mask >> mask_insert
-            badge_image >> mask_insert.overlay(position='top-right', resize='fit')
+            badge_image >> mask_insert.overlay(
+                position='top-right', resize='fit')
         """
 
         if position not in ALLOWED_ANCHORS:
@@ -1833,7 +2071,12 @@ class MaskInsertLayer(NodeRef):
             rotation_deg=self._layer.rotation_deg,
         )
 
-        rect, alignment_angle = _fit_rect_on_mask_axis(fit_mask)
+        fit = _fit_rect_on_mask_axis(
+            fit_mask,
+            box_blend=cfg.box_blend,
+        )
+
+        rect = fit.rect
 
         box_width = max(1, int(round(rect.width)))
         box_height = max(1, int(round(rect.height)))
@@ -1881,6 +2124,8 @@ class MaskInsertLayer(NodeRef):
             debug_img = _make_debug_image(
                 mask,
                 rect,
+                inner_rect=fit.inner_rect,
+                outer_rect=fit.outer_rect,
                 content_box=content_box,
             )
 
@@ -1893,6 +2138,16 @@ class MaskInsertLayer(NodeRef):
             debug_img.save(debug_path_obj)
             debug_path = str(debug_path_obj)
 
+        def _rect_to_metadata(rect: RotatedRect) -> Dict[str, Any]:
+            return {
+                'cx': rect.cx,
+                'cy': rect.cy,
+                'width': rect.width,
+                'height': rect.height,
+                'angle_deg': rect.angle_deg,
+                'corners': rect.corners,
+            }
+
         out: Dict[str, Any] = {
             'ok': True,
             'node': self.op,
@@ -1900,14 +2155,11 @@ class MaskInsertLayer(NodeRef):
             'image': str(out_path),
             'mask': str(mask_path),
             'overlay': str(overlay_path),
-            'rect': {
-                'cx': rect.cx,
-                'cy': rect.cy,
-                'width': rect.width,
-                'height': rect.height,
-                'angle_deg': rect.angle_deg,
-                'alignment_angle_deg': alignment_angle,
-                'corners': rect.corners,
+            'rect': _rect_to_metadata(rect),
+            'fit_rects': {
+                'inner': _rect_to_metadata(fit.inner_rect),
+                'outer': _rect_to_metadata(fit.outer_rect),
+                'alignment_angle_deg': fit.alignment_angle,
             },
             'placement': {
                 'position': self._layer.position,
@@ -1924,6 +2176,7 @@ class MaskInsertLayer(NodeRef):
                 'threshold': cfg.threshold,
                 'padding_x': cfg.padding_x,
                 'padding_y': cfg.padding_y,
+                'box_blend': cfg.box_blend,
                 'max_bridge_distance': cfg.max_bridge_distance,
                 'fill_holes': cfg.fill_holes,
             },

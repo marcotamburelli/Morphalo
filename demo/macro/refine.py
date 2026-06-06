@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 from morphalo.dag import NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
-from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.preprocess import (BoxCrop, FaceCrop, ImageStack,
                                        ImgAuxMap, SubjectCrop)
 
@@ -756,6 +756,7 @@ def refine_sliding_tiles_group(
     struct_compl: float = 0.1,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
+    base_resize: Literal['fit', 'cover'] = 'cover',
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines an image through overlapping tiles.
@@ -796,8 +797,9 @@ def refine_sliding_tiles_group(
         Spec for every internal ``Img2Img`` refinement node.
 
     image_size : tuple[int, int]
-        Source image size as ``(width, height)``. This is required because the
-        tile boxes are generated statically when the group is built.
+        Input image size fallback as ``(width, height)``. If ``stack_spec``
+        declares ``params.width`` / ``params.height``, that canvas size is used
+        for the initial resize stack and for static tile generation.
 
     grid : tuple[int, int], optional
         Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
@@ -837,6 +839,12 @@ def refine_sliding_tiles_group(
     layer_corner_radius : int or str, optional
         Corner radius applied to every refined tile mask.
 
+    base_resize : {'fit', 'cover'}, optional
+        Resize mode used only when ``stack_spec.params.width`` / ``height``
+        differ from ``image_size``. In that case the input image is first placed
+        on an ``ImageStack`` canvas with this resize mode, and all subsequent
+        crops operate on that resized canvas.
+
     Returns
     -------
     NodeGroup
@@ -863,8 +871,15 @@ def refine_sliding_tiles_group(
     overlapping crop is regenerated independently and then propagated to subsequent
     tiles.
     """
+    stack_cfg = resolve_spec(stack_spec)
+    stack_params = stack_cfg.get('params', {})
+    canvas_size = (
+        int(stack_params.get('width', image_size[0])),
+        int(stack_params.get('height', image_size[1])),
+    )
+
     bboxes = _sliding_window_bboxes_xyxy(
-        image_size=image_size,
+        image_size=canvas_size,
         grid=grid,
         window_fraction=window_fraction,
     )
@@ -882,6 +897,14 @@ def refine_sliding_tiles_group(
         tap_style_struct = Tap(name='in_struct')
 
         previous_image = tap_image
+
+        if canvas_size != image_size:
+            base_stack = ImageStack(
+                name='base_canvas',
+                spec=stack_spec,
+            )
+            tap_image >> base_stack.image(0, resize=base_resize)
+            previous_image = base_stack
 
         for idx, bbox in enumerate(bboxes):
             is_last = idx == len(bboxes) - 1
@@ -986,6 +1009,7 @@ def refine_sliding_tiles_with_controlnet_group(
     struct_compl: float = 0.1,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
+    base_resize: Literal['fit', 'cover'] = 'cover',
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines an image through overlapping tiles with ControlNet.
@@ -1029,8 +1053,9 @@ def refine_sliding_tiles_with_controlnet_group(
         Spec for every internal ``Img2Img`` refinement node.
 
     image_size : tuple[int, int]
-        Source image size as ``(width, height)``. This is required because the
-        tile boxes are generated statically when the group is built.
+        Input image size fallback as ``(width, height)``. If ``stack_spec``
+        declares ``params.width`` / ``params.height``, that canvas size is used
+        for the initial resize stack and for static tile generation.
 
     grid : tuple[int, int], optional
         Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
@@ -1079,6 +1104,12 @@ def refine_sliding_tiles_with_controlnet_group(
     layer_corner_radius : int or str, optional
         Corner radius applied to every refined tile mask.
 
+    base_resize : {'fit', 'cover'}, optional
+        Resize mode used only when ``stack_spec.params.width`` / ``height``
+        differ from ``image_size``. In that case the input image is first placed
+        on an ``ImageStack`` canvas with this resize mode, and all subsequent
+        crops operate on that resized canvas.
+
     Returns
     -------
     NodeGroup
@@ -1097,8 +1128,15 @@ def refine_sliding_tiles_with_controlnet_group(
         - cfg/guidance_scale between 2.0 and 3.5
         - short prompts only
     """
+    stack_cfg = resolve_spec(stack_spec)
+    stack_params = stack_cfg.get('params', {})
+    canvas_size = (
+        int(stack_params.get('width', image_size[0])),
+        int(stack_params.get('height', image_size[1])),
+    )
+
     bboxes = _sliding_window_bboxes_xyxy(
-        image_size=image_size,
+        image_size=canvas_size,
         grid=grid,
         window_fraction=window_fraction,
     )
@@ -1116,6 +1154,14 @@ def refine_sliding_tiles_with_controlnet_group(
         tap_style_struct = Tap(name='in_struct')
 
         previous_image = tap_image
+
+        if canvas_size != image_size:
+            base_stack = ImageStack(
+                name='base_canvas',
+                spec=stack_spec,
+            )
+            tap_image >> base_stack.image(0, resize=base_resize)
+            previous_image = base_stack
 
         for idx, bbox in enumerate(bboxes):
             is_last = idx == len(bboxes) - 1
