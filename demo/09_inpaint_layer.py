@@ -160,9 +160,11 @@ with DAG(
             'params': {
                 'threshold': 128,
 
-                # Padding inside the selected rectangle.
-                'padding_x': '6%',
-                'padding_y': '10%',
+                # Content insets inside the selected rectangle.
+                'inset_left': '6%',
+                'inset_right': '6%',
+                'inset_top': '10%',
+                'inset_bottom': '10%',
 
                 # Optional fitting helpers.
                 # None means: do not connect disconnected foreground components.

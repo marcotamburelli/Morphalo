@@ -4,9 +4,9 @@ from typing import Literal, Optional
 
 from morphalo.dag import NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
-from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import (BoxCrop, FaceCrop, ImageStack,
-                                       ImgAuxMap, SubjectCrop)
+                                       ImgAuxMap, ResizeImage, SubjectCrop)
 
 FineRegion = Literal[
     'face',
@@ -747,7 +747,6 @@ def refine_sliding_tiles_group(
     image_size: tuple[int, int],
     grid: tuple[int, int] = (3, 3),
     window_fraction: tuple[float, float] = (0.5, 0.5),
-    stack_spec: SpecInput = {},
     texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
     struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
     texture_weight: float = 0.75,
@@ -756,37 +755,14 @@ def refine_sliding_tiles_group(
     struct_compl: float = 0.1,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
-    base_resize: Literal['fit', 'cover'] = 'cover',
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines an image through overlapping tiles.
 
-    This group applies a sliding-window refinement strategy. The input image is
-    divided into overlapping rectangular regions, each region is refined with
-    ``Img2Img`` using two IP-Adapter references, and the refined crop is
+    The upstream image is first resized to ``image_size``. The resized image is
+    then divided into overlapping rectangular regions, each region is refined
+    with ``Img2Img`` using two IP-Adapter references, and the refined crop is
     composited back onto the progressively updated image.
-
-    The macro is intended to improve small or mid-sized details that global
-    generation often approximates poorly, such as malformed hands, feet, small
-    objects, distorted background details, accessories, fabric folds, or local
-    artifacts.
-
-    Unlike semantic refinement macros, this group does not detect a specific
-    target. It scans the image using a fixed overlapping grid.
-
-    Ports
-    -----
-    in_image
-        Base image to refine.
-
-    in_prompt
-        Optional prompt payload wired into every internal ``Img2Img`` node.
-
-    in_texture
-        Style reference used mostly for texture/detail conditioning.
-
-    in_struct
-        Style reference used mostly for structure/composition conditioning.
 
     Parameters
     ----------
@@ -797,23 +773,18 @@ def refine_sliding_tiles_group(
         Spec for every internal ``Img2Img`` refinement node.
 
     image_size : tuple[int, int]
-        Input image size fallback as ``(width, height)``. If ``stack_spec``
-        declares ``params.width`` / ``params.height``, that canvas size is used
-        for the initial resize stack and for static tile generation.
+        Working image size as ``(width, height)``.
+
+        The macro resizes the upstream image to this exact size before generating
+        tile boxes. All crop coordinates, crop metadata, and internal stack
+        canvases use this same coordinate space.
 
     grid : tuple[int, int], optional
-        Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
+        Number of tile positions as ``(cols, rows)``.
 
     window_fraction : tuple[float, float], optional
-        Tile size as a fraction of the image size, expressed as
+        Tile size as a fraction of ``image_size``, expressed as
         ``(width_fraction, height_fraction)``.
-
-        With ``grid=(3, 3)`` and ``window_fraction=(0.5, 0.5)``, the image is
-        refined using nine half-image crops whose origins slide over the image
-        with a stride of one quarter of the image size.
-
-    stack_spec : SpecInput, optional
-        Spec for every internal ``ImageStack`` node.
 
     texture_weight_name : str, optional
         IP-Adapter weight name used for the texture reference.
@@ -839,12 +810,6 @@ def refine_sliding_tiles_group(
     layer_corner_radius : int or str, optional
         Corner radius applied to every refined tile mask.
 
-    base_resize : {'fit', 'cover'}, optional
-        Resize mode used only when ``stack_spec.params.width`` / ``height``
-        differ from ``image_size``. In that case the input image is first placed
-        on an ``ImageStack`` canvas with this resize mode, and all subsequent
-        crops operate on that resized canvas.
-
     Returns
     -------
     NodeGroup
@@ -852,34 +817,26 @@ def refine_sliding_tiles_group(
 
     Notes
     -----
+    This macro intentionally owns its working canvas size. The upstream image may
+    have any size, but it is resized to ``image_size`` before the first tile is
+    cropped.
+
+    When ``image_size`` has a different aspect ratio from the upstream image,
+    the initial resize may stretch the image. This is intentional: ``image_size``
+    defines the exact coordinate space used by the tiled refinement pass.
+
     Tiles are processed sequentially. Each tile is cropped from the progressively
-    updated image produced by the previous tile. This makes overlapping regions
-    accumulate refinements instead of having every tile compete directly against
-    the original image.
-
-    This is usually safer than refining all tiles in parallel and stacking them
-    at the end, because parallel tiles may disagree in overlapping regions.
-
-    This macro is intended for conservative refinement.
-
-    Recommended settings:
-        - strength <= 0.30
-        - cfg/guidance_scale between 2.0 and 3.5
-        - short prompts only
-
-    High denoising strength or high CFG values may cause tiled drift, because each
-    overlapping crop is regenerated independently and then propagated to subsequent
-    tiles.
+    updated image produced by the previous tile.
     """
-    stack_cfg = resolve_spec(stack_spec)
-    stack_params = stack_cfg.get('params', {})
-    canvas_size = (
-        int(stack_params.get('width', image_size[0])),
-        int(stack_params.get('height', image_size[1])),
-    )
+    stack_spec = {
+        'params': {
+            'width': int(image_size[0]),
+            'height': int(image_size[1]),
+        },
+    }
 
     bboxes = _sliding_window_bboxes_xyxy(
-        image_size=canvas_size,
+        image_size=image_size,
         grid=grid,
         window_fraction=window_fraction,
     )
@@ -896,15 +853,20 @@ def refine_sliding_tiles_group(
         tap_style_texture = Tap(name='in_texture')
         tap_style_struct = Tap(name='in_struct')
 
-        previous_image = tap_image
+        resized_image = ResizeImage(
+            name='resize_input',
+            spec={
+                'params': {
+                    'size': [
+                        int(image_size[0]),
+                        int(image_size[1]),
+                    ],
+                },
+            },
+        )
 
-        if canvas_size != image_size:
-            base_stack = ImageStack(
-                name='base_canvas',
-                spec=stack_spec,
-            )
-            tap_image >> base_stack.image(0, resize=base_resize)
-            previous_image = base_stack
+        tap_image >> resized_image
+        previous_image = resized_image
 
         for idx, bbox in enumerate(bboxes):
             is_last = idx == len(bboxes) - 1
@@ -995,7 +957,6 @@ def refine_sliding_tiles_with_controlnet_group(
     image_size: tuple[int, int],
     grid: tuple[int, int] = (3, 3),
     window_fraction: tuple[float, float] = (0.5, 0.5),
-    stack_spec: SpecInput = {},
     controlnet_model: str = 'diffusers/controlnet-depth-sdxl-1.0',
     controlnet_conditioning_scale: float = 0.7,
     aux_map_spec: SpecInput = {
@@ -1009,40 +970,15 @@ def refine_sliding_tiles_with_controlnet_group(
     struct_compl: float = 0.1,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
-    base_resize: Literal['fit', 'cover'] = 'cover',
 ) -> NodeGroup:
     """
-    Create a reusable NodeGroup that refines an image through overlapping tiles with ControlNet.
+    Create a reusable NodeGroup that refines an image through overlapping tiles
+    with ControlNet.
 
-    Similar to `refine_sliding_tiles_group`, but each tile refinement is additionally
-    constrained by a geometric conditioning signal (e.g., depth, canny edges) via ControlNet.
-
-    The macro:
-    1. Divides the input image into overlapping rectangular tiles.
-    2. For each tile:
-       - Crops the current (progressively refined) image.
-       - Generates an auxiliary map (depth, canny, etc.) from the tile using ``ImgAuxMap``.
-       - Refines the tile with ``Img2Img`` using:
-         * Two IP-Adapter references (texture and structure)
-         * The auxiliary map as ControlNet conditioning
-       - Composites the refined tile back onto the progressively updated image.
-
-    This approach combines both semantic (style via IP-Adapters) and geometric (structure
-    via ControlNet) constraints to improve detail coherence.
-
-    Ports
-    -----
-    in_image
-        Base image to refine.
-
-    in_prompt
-        Optional prompt payload wired into every internal ``Img2Img`` node.
-
-    in_texture
-        Style reference used mostly for texture/detail conditioning.
-
-    in_struct
-        Style reference used mostly for structure/composition conditioning.
+    The upstream image is first resized to ``image_size``. Each tile is then
+    cropped from the progressively refined image, converted into an auxiliary
+    conditioning map, refined with ``Img2Img`` using IP-Adapter and ControlNet
+    constraints, and composited back into the same coordinate space.
 
     Parameters
     ----------
@@ -1053,32 +989,29 @@ def refine_sliding_tiles_with_controlnet_group(
         Spec for every internal ``Img2Img`` refinement node.
 
     image_size : tuple[int, int]
-        Input image size fallback as ``(width, height)``. If ``stack_spec``
-        declares ``params.width`` / ``params.height``, that canvas size is used
-        for the initial resize stack and for static tile generation.
+        Working image size as ``(width, height)``.
+
+        The macro resizes the upstream image to this exact size before generating
+        tile boxes. All crop coordinates, crop metadata, auxiliary maps, and
+        internal stack canvases use this same coordinate space.
 
     grid : tuple[int, int], optional
         Number of tile positions as ``(cols, rows)``. Default is ``(3, 3)``.
 
     window_fraction : tuple[float, float], optional
-        Tile size as a fraction of the image size, expressed as
+        Tile size as a fraction of ``image_size``, expressed as
         ``(width_fraction, height_fraction)``. Default is ``(0.5, 0.5)``.
 
-    stack_spec : SpecInput, optional
-        Spec for every internal ``ImageStack`` node.
-
     controlnet_model : str, optional
-        ControlNet model identifier (e.g., ``'diffusers/controlnet-depth-sdxl-1.0'``).
-        Default is ``'diffusers/controlnet-depth-sdxl-1.0'``.
+        ControlNet model identifier used by every tile refinement node.
 
     controlnet_conditioning_scale : float, optional
-        Conditioning scale for the ControlNet adapter. Default is ``0.7``.
+        Conditioning scale for the ControlNet adapter.
 
     aux_map_spec : SpecInput, optional
         Spec for every internal ``ImgAuxMap`` node used to generate the geometric
-        constraint. By default this uses MiDaS depth, matching ``controlnet_model``:
-        ``{'processor': 'depth_midas'}``.
-        Pass a matching processor/model pair when using a different ControlNet.
+        constraint. By default this uses MiDaS depth, matching
+        ``controlnet_model``.
 
     texture_weight_name : str, optional
         IP-Adapter weight name used for the texture reference.
@@ -1104,12 +1037,6 @@ def refine_sliding_tiles_with_controlnet_group(
     layer_corner_radius : int or str, optional
         Corner radius applied to every refined tile mask.
 
-    base_resize : {'fit', 'cover'}, optional
-        Resize mode used only when ``stack_spec.params.width`` / ``height``
-        differ from ``image_size``. In that case the input image is first placed
-        on an ``ImageStack`` canvas with this resize mode, and all subsequent
-        crops operate on that resized canvas.
-
     Returns
     -------
     NodeGroup
@@ -1117,26 +1044,41 @@ def refine_sliding_tiles_with_controlnet_group(
 
     Notes
     -----
-    Tiles are processed sequentially. Each tile is cropped from the progressively
-    updated image produced by the previous tile.
+    This macro intentionally owns its working canvas size. The upstream image may
+    have any size, but it is resized to ``image_size`` before the first tile is
+    cropped.
 
-    The auxiliary map is generated only for the current tile (not the full image),
-    which keeps ControlNet conditioning spatially aligned with the local refinement.
+    When ``image_size`` has a different aspect ratio from the upstream image,
+    the initial resize may stretch the image. This is intentional: ``image_size``
+    defines the exact coordinate space used by the tiled refinement pass.
+
+    Tiles are processed sequentially. Each tile is cropped from the progressively
+    updated image produced by the previous tile. This makes overlapping regions
+    accumulate refinements instead of having every tile compete directly against
+    the original image.
+
+    The auxiliary map is generated only for the current tile, not for the full
+    image. This keeps ControlNet conditioning spatially aligned with the local
+    refinement.
 
     Recommended settings:
-        - refine_spec strength <= 0.30
+        - strength <= 0.30
         - cfg/guidance_scale between 2.0 and 3.5
         - short prompts only
+
+    High denoising strength or high CFG values may cause tiled drift, because each
+    overlapping crop is regenerated independently and then propagated to subsequent
+    tiles.
     """
-    stack_cfg = resolve_spec(stack_spec)
-    stack_params = stack_cfg.get('params', {})
-    canvas_size = (
-        int(stack_params.get('width', image_size[0])),
-        int(stack_params.get('height', image_size[1])),
-    )
+    stack_spec = {
+        'params': {
+            'width': int(image_size[0]),
+            'height': int(image_size[1]),
+        },
+    }
 
     bboxes = _sliding_window_bboxes_xyxy(
-        image_size=canvas_size,
+        image_size=image_size,
         grid=grid,
         window_fraction=window_fraction,
     )
@@ -1153,15 +1095,20 @@ def refine_sliding_tiles_with_controlnet_group(
         tap_style_texture = Tap(name='in_texture')
         tap_style_struct = Tap(name='in_struct')
 
-        previous_image = tap_image
+        resized_image = ResizeImage(
+            name='resize_input',
+            spec={
+                'params': {
+                    'size': [
+                        int(image_size[0]),
+                        int(image_size[1]),
+                    ],
+                },
+            },
+        )
 
-        if canvas_size != image_size:
-            base_stack = ImageStack(
-                name='base_canvas',
-                spec=stack_spec,
-            )
-            tap_image >> base_stack.image(0, resize=base_resize)
-            previous_image = base_stack
+        tap_image >> resized_image
+        previous_image = resized_image
 
         for idx, bbox in enumerate(bboxes):
             is_last = idx == len(bboxes) - 1
@@ -1180,7 +1127,7 @@ def refine_sliding_tiles_with_controlnet_group(
             )
 
             # -------------------
-            # Generate auxiliary map (depth/canny/etc) for the cropped tile
+            # Generate auxiliary map from the cropped tile
             # -------------------
             aux_map = ImgAuxMap(
                 name=f'aux_map_{idx:02d}',
@@ -1195,7 +1142,6 @@ def refine_sliding_tiles_with_controlnet_group(
                 spec=refine_spec,
             )
 
-            # Texture IP-Adapter
             texture_sink = refine_tile.ip_adapter.add(
                 'h94/IP-Adapter',
                 subfolder='sdxl_models',
@@ -1207,7 +1153,6 @@ def refine_sliding_tiles_with_controlnet_group(
                 key='texture',
             )
 
-            # Structure IP-Adapter
             struct_sink = refine_tile.ip_adapter.add(
                 'h94/IP-Adapter',
                 subfolder='sdxl_models',
@@ -1219,7 +1164,6 @@ def refine_sliding_tiles_with_controlnet_group(
                 key='structure',
             )
 
-            # ControlNet from auxiliary map
             controlnet_sink = refine_tile.controlnet.add(
                 controlnet_model,
                 conditioning_scale=controlnet_conditioning_scale,
@@ -1242,7 +1186,7 @@ def refine_sliding_tiles_with_controlnet_group(
             # 2) Crop the current tile from the progressively refined image.
             previous_image >> crop_tile
 
-            # 3) Generate auxiliary map from the cropped tile.
+            # 3) Generate the auxiliary map from the cropped tile.
             crop_tile >> aux_map
 
             # 4) Refine the tile with all constraints.

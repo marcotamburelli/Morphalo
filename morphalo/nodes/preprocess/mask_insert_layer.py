@@ -12,7 +12,11 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.preprocess.mask_geometry import (
+    estimate_mask_centerline_alignment_angle,
+    estimate_mask_quad_alignment_angle)
 from morphalo.nodes.preprocess.utils import (resolve_size_expr,
+                                             validate_size_expr,
                                              validate_percentage_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
@@ -29,6 +33,7 @@ Anchor = Literal[
 ]
 SizeExpr = Union[int, str]
 ResizeMode = Literal['fit', 'cover', 'stretch']
+NormalizedBoxBlend = Tuple[float, float, float, float]
 
 ALLOWED_ANCHORS = {
     'center',
@@ -121,12 +126,15 @@ class RectFitResult:
         Rotated foreground bounding box.
     alignment_angle : float
         Alignment angle used for fitting, in degrees.
+    alignment_method : str
+        Name of the alignment estimator used to compute ``alignment_angle``.
     """
 
     rect: RotatedRect
     inner_rect: RotatedRect
     outer_rect: RotatedRect
     alignment_angle: float
+    alignment_method: str
 
 
 @dataclass
@@ -139,21 +147,36 @@ class Config:
     threshold : int
         Grayscale threshold used to binarize the mask.
 
-    padding_x : int or str
-        Horizontal padding applied inside the fitted rectangle before placing
-        the overlay.
+    inset_left : int or str
+        Left content inset applied to the fitted rectangle before placing the
+        overlay. Positive values move the content edge inward; negative values
+        expand it outward.
 
-    padding_y : int or str
-        Vertical padding applied inside the fitted rectangle before placing
-        the overlay.
+    inset_right : int or str
+        Right content inset applied to the fitted rectangle before placing the
+        overlay. Positive values move the content edge inward; negative values
+        expand it outward.
 
-    box_blend : float
-        Blend factor between the largest fully-inscribed rectangle and the
-        rotated foreground bounding box.
+    inset_top : int or str
+        Top content inset applied to the fitted rectangle before placing the
+        overlay. Positive values move the content edge inward; negative values
+        expand it outward.
 
-        ``0.0`` keeps the strict inner rectangle.
-        ``1.0`` uses the full rotated foreground bounding box.
-        Intermediate values expand the inner rectangle toward the outer box.
+    inset_bottom : int or str
+        Bottom content inset applied to the fitted rectangle before placing the
+        overlay. Positive values move the content edge inward; negative values
+        expand it outward.
+
+    box_blend : tuple[float, float, float, float]
+        Normalized per-side blend factors between the largest fully-inscribed
+        rectangle and the rotated foreground bounding box.
+
+        Values are stored in ``(left, top, right, bottom)`` order.
+
+        ``0.0`` keeps the corresponding side from the strict inner rectangle.
+        ``1.0`` moves the corresponding side to the rotated foreground bounding
+        box.
+        Intermediate values expand that side toward the outer box.
 
     max_bridge_distance : str or None
         Maximum percentage distance used to connect nearby mask components before
@@ -167,12 +190,87 @@ class Config:
     """
 
     threshold: int
-    padding_x: SizeExpr
-    padding_y: SizeExpr
-    box_blend: float
+    inset_left: SizeExpr
+    inset_right: SizeExpr
+    inset_top: SizeExpr
+    inset_bottom: SizeExpr
+    box_blend: NormalizedBoxBlend
     max_bridge_distance: Optional[str]
     fill_holes: bool
     save_debug: bool
+
+
+def _normalize_box_blend(
+    value: Any,
+    *,
+    node_id: str,
+) -> NormalizedBoxBlend:
+    """
+    Normalize a box blend specification to per-side factors.
+
+    Parameters
+    ----------
+    value : Any
+        Blend specification. Accepted forms are:
+
+        - ``float``:
+          Same blend factor for all sides.
+
+        - ``(horizontal, vertical)``:
+          Horizontal factor is applied to left/right sides; vertical factor is
+          applied to top/bottom sides.
+
+        - ``(left, top, right, bottom)``:
+          Per-side blend factors.
+
+    node_id : str
+        Node id used in error messages.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        Normalized blend factors in ``(left, top, right, bottom)`` order.
+
+    Raises
+    ------
+    ValueError
+        If the value cannot be interpreted or if any factor is outside ``[0, 1]``.
+    """
+
+    if isinstance(value, (int, float)):
+        vals = (float(value),) * 4
+
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 2:
+            horizontal = float(value[0])
+            vertical = float(value[1])
+            vals = (
+                horizontal,
+                vertical,
+                horizontal,
+                vertical,
+            )
+        elif len(value) == 4:
+            vals = tuple(float(x) for x in value)
+        else:
+            raise ValueError(
+                f"'{node_id}': invalid box_blend={value!r}; "
+                'expected a number, a 2-item sequence, or a 4-item sequence.'
+            )
+
+    else:
+        raise ValueError(
+            f"'{node_id}': invalid box_blend={value!r}; "
+            'expected a number, a 2-item sequence, or a 4-item sequence.'
+        )
+
+    if any(not isfinite(x) or not 0.0 <= x <= 1.0 for x in vals):
+        raise ValueError(
+            f"'{node_id}': invalid box_blend={value!r}; "
+            'all blend factors must be finite values in [0, 1].'
+        )
+
+    return vals
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -201,17 +299,17 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             f"'{node_id}': invalid threshold={threshold!r}; expected 0..255."
         )
 
-    box_blend = float(params.get('box_blend', 0.0))
-    if not isfinite(box_blend) or not 0.0 <= box_blend <= 1.0:
-        raise ValueError(
-            f"'{node_id}': invalid box_blend={box_blend!r}; "
-            'expected a finite value in [0, 1].'
-        )
+    box_blend = _normalize_box_blend(
+        params.get('box_blend', 0.0),
+        node_id=node_id,
+    )
 
     return Config(
         threshold=threshold,
-        padding_x=params.get('padding_x', '0%'),
-        padding_y=params.get('padding_y', '0%'),
+        inset_left=params.get('inset_left', '0%'),
+        inset_right=params.get('inset_right', '0%'),
+        inset_top=params.get('inset_top', '0%'),
+        inset_bottom=params.get('inset_bottom', '0%'),
         box_blend=box_blend,
         max_bridge_distance=validate_percentage_size_expr(
             params.get('max_bridge_distance', None),
@@ -509,105 +607,6 @@ def _connect_nearby_components(
     return out > 0
 
 
-def _estimate_mask_alignment_angle(
-    mask: np.ndarray,
-    *,
-    min_row_width_fraction: float = 0.25,
-    trim_top_fraction: float = 0.10,
-    trim_bottom_fraction: float = 0.05,
-) -> float:
-    """
-    Estimate the rectangle alignment angle from a binary mask.
-
-    The function estimates the visual slant of the mask by fitting a line to
-    row midpoints. The returned value is expressed in the same convention used
-    by ``_fit_rect_at_angle``: it is the angle passed directly to the fitting
-    function.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Boolean mask with shape ``(H, W)``.
-    min_row_width_fraction : float, default=0.25
-        Minimum row width, expressed as a fraction of the maximum foreground row
-        width. Rows narrower than this threshold are ignored.
-    trim_top_fraction : float, default=0.10
-        Fraction of valid centerline samples removed from the top before fitting.
-    trim_bottom_fraction : float, default=0.05
-        Fraction of valid centerline samples removed from the bottom before fitting.
-
-    Returns
-    -------
-    float
-        Alignment angle in degrees, using the same convention expected by
-        ``_fit_rect_at_angle``.
-    """
-
-    if mask.ndim != 2:
-        raise ValueError('mask must have shape (H, W).')
-
-    ys = []
-    xs = []
-    widths = []
-
-    h, _ = mask.shape[:2]
-
-    for y in range(h):
-        row_xs = np.flatnonzero(mask[y])
-        if row_xs.size == 0:
-            continue
-
-        x_left = float(row_xs[0])
-        x_right = float(row_xs[-1])
-        width = x_right - x_left + 1.0
-
-        ys.append(float(y))
-        xs.append(0.5 * (x_left + x_right))
-        widths.append(width)
-
-    if len(xs) < 2:
-        return 0.0
-
-    xs_arr = np.asarray(xs, dtype=np.float64)
-    ys_arr = np.asarray(ys, dtype=np.float64)
-    widths_arr = np.asarray(widths, dtype=np.float64)
-
-    max_width = float(np.max(widths_arr))
-    if max_width <= 0.0:
-        return 0.0
-
-    keep = widths_arr >= float(min_row_width_fraction) * max_width
-
-    xs_arr = xs_arr[keep]
-    ys_arr = ys_arr[keep]
-
-    if xs_arr.size < 2:
-        return 0.0
-
-    order = np.argsort(ys_arr)
-    xs_arr = xs_arr[order]
-    ys_arr = ys_arr[order]
-
-    n = xs_arr.size
-    top_cut = int(round(n * float(trim_top_fraction)))
-    bottom_cut = int(round(n * float(trim_bottom_fraction)))
-
-    end = n - bottom_cut
-    if end <= top_cut + 1:
-        top_cut = 0
-        end = n
-
-    xs_arr = xs_arr[top_cut:end]
-    ys_arr = ys_arr[top_cut:end]
-
-    if xs_arr.size < 2:
-        return 0.0
-
-    slope, _ = np.polyfit(ys_arr, xs_arr, deg=1)
-
-    return float(np.degrees(np.arctan(float(slope))))
-
-
 def _rotate_mask(
     mask: np.ndarray,
     *,
@@ -751,13 +750,10 @@ def _blend_axis_aligned_rects(
     inner: Tuple[int, int, int, int],
     outer: Tuple[int, int, int, int],
     *,
-    box_blend: float,
+    box_blend: NormalizedBoxBlend,
 ) -> Tuple[float, float, float, float]:
     """
-    Blend an inner rectangle toward an outer rectangle.
-
-    ``box_blend=0`` returns the inner rectangle.
-    ``box_blend=1`` returns the outer rectangle.
+    Blend an inner rectangle toward an outer rectangle, independently per side.
 
     Parameters
     ----------
@@ -765,8 +761,13 @@ def _blend_axis_aligned_rects(
         Inner rectangle ``(x, y, width, height)``.
     outer : tuple[int, int, int, int]
         Outer rectangle ``(x, y, width, height)``.
-    box_blend : float
-        Blend factor in ``[0, 1]``.
+    box_blend : tuple[float, float, float, float]
+        Per-side blend factors in ``(left, top, right, bottom)`` order.
+
+        Each value must be in ``[0, 1]``:
+
+        - ``0.0`` keeps the corresponding side from the inner rectangle.
+        - ``1.0`` moves the corresponding side to the outer rectangle.
 
     Returns
     -------
@@ -774,10 +775,7 @@ def _blend_axis_aligned_rects(
         Blended rectangle ``(x, y, width, height)``.
     """
 
-    t = float(box_blend)
-
-    if not isfinite(t) or not 0.0 <= t <= 1.0:
-        raise ValueError(f'box_blend must be in [0, 1], got {box_blend!r}.')
+    left_blend, top_blend, right_blend, bottom_blend = box_blend
 
     ix, iy, iw, ih = inner
     ox, oy, ow, oh = outer
@@ -792,10 +790,10 @@ def _blend_axis_aligned_rects(
     ox2 = float(ox + ow)
     oy2 = float(oy + oh)
 
-    x1 = ix1 + t * (ox1 - ix1)
-    y1 = iy1 + t * (oy1 - iy1)
-    x2 = ix2 + t * (ox2 - ix2)
-    y2 = iy2 + t * (oy2 - iy2)
+    x1 = ix1 + left_blend * (ox1 - ix1)
+    y1 = iy1 + top_blend * (oy1 - iy1)
+    x2 = ix2 + right_blend * (ox2 - ix2)
+    y2 = iy2 + bottom_blend * (oy2 - iy2)
 
     width = max(1.0, x2 - x1)
     height = max(1.0, y2 - y1)
@@ -972,7 +970,7 @@ def _fit_rect_at_angle(
     mask: np.ndarray,
     *,
     angle_deg: float,
-    box_blend: float = 0.0,
+    box_blend: NormalizedBoxBlend = (0.0, 0.0, 0.0, 0.0),
 ) -> Tuple[RotatedRect, RotatedRect, RotatedRect]:
     """
     Fit an axis-aligned placement rectangle after rotating the mask by one angle.
@@ -983,10 +981,16 @@ def _fit_rect_at_angle(
         Boolean mask with shape ``(H, W)``.
     angle_deg : float
         Candidate rectangle angle in degrees.
-    box_blend : float, default=0.0
-        Blend factor between the largest fully-inscribed rectangle and the
-        rotated foreground bounding box. ``0.0`` preserves the strict inner
-        rectangle; ``1.0`` uses the foreground bounding box.
+    box_blend : tuple[float, float, float, float], default=(0.0, 0.0, 0.0, 0.0)
+        Per-side blend factors between the largest fully-inscribed rectangle
+        and the rotated foreground bounding box, in ``(left, top, right, bottom)``
+        order.
+
+        Each value controls one side independently:
+
+        - ``0.0`` keeps the corresponding side from the strict inner rectangle.
+        - ``1.0`` moves the corresponding side to the rotated foreground bounding
+          box.
 
     Returns
     -------
@@ -1000,7 +1004,7 @@ def _fit_rect_at_angle(
     inner_axis = _largest_axis_aligned_rect(rotated_mask)
     outer_axis = _foreground_bbox(rotated_mask)
 
-    if box_blend > 0.0:
+    if any(x > 0.0 for x in box_blend):
         x, y, width, height = _blend_axis_aligned_rects(
             inner_axis,
             outer_axis,
@@ -1044,13 +1048,21 @@ def _fit_rect_at_angle(
 def _fit_rect_on_mask_axis(
     mask: np.ndarray,
     *,
-    box_blend: float = 0.0,
+    box_blend: NormalizedBoxBlend = (0.0, 0.0, 0.0, 0.0),
 ) -> RectFitResult:
     """
-    Fit placement rectangles aligned with the visual slant of the mask.
+    Fit placement rectangles aligned with the estimated mask axis.
+
+    The function first tries the quadrilateral-frame estimator and falls back to the
+    centerline estimator if the quadrilateral frame cannot be estimated.
     """
 
-    alignment_angle = _estimate_mask_alignment_angle(mask)
+    try:
+        alignment_angle = estimate_mask_quad_alignment_angle(mask)
+        alignment_method = 'quad'
+    except RuntimeError:
+        alignment_angle = estimate_mask_centerline_alignment_angle(mask)
+        alignment_method = 'centerline'
 
     rect, inner_rect, outer_rect = _fit_rect_at_angle(
         mask,
@@ -1063,6 +1075,7 @@ def _fit_rect_on_mask_axis(
         inner_rect=inner_rect,
         outer_rect=outer_rect,
         alignment_angle=alignment_angle,
+        alignment_method=alignment_method,
     )
 
 
@@ -1227,9 +1240,9 @@ def _make_debug_image(
     outer_rect : RotatedRect, optional
         Rotated foreground bounding box, drawn as diagnostic overlay.
     content_box : tuple[int, int, int, int], optional
-        Optional local content box ``(x, y, width, height)`` after padding.
-        When provided, it is projected into full-image coordinates and drawn
-        inside the fitted rectangle.
+        Optional local content box ``(x, y, width, height)`` after applying
+        content insets. When provided, it is projected into full-image
+        coordinates and drawn relative to the fitted rectangle.
 
     Returns
     -------
@@ -1310,7 +1323,7 @@ def _make_debug_image(
         width=2,
     )
 
-    # Optional content box after padding.
+    # Optional content box after applying content insets.
     if content_box is not None:
         bx, by, bw, bh = content_box
 
@@ -1408,12 +1421,14 @@ def _resize_overlay_to_box(
     *,
     box_width: int,
     box_height: int,
-    padding_x: SizeExpr,
-    padding_y: SizeExpr,
+    inset_left: SizeExpr,
+    inset_right: SizeExpr,
+    inset_top: SizeExpr,
+    inset_bottom: SizeExpr,
     resize: ResizeMode,
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
-    Resize an overlay image to fit inside a local rectangle canvas.
+    Resize an overlay image against a local rectangle content box.
 
     Parameters
     ----------
@@ -1423,10 +1438,18 @@ def _resize_overlay_to_box(
         Local rectangle canvas width.
     box_height : int
         Local rectangle canvas height.
-    padding_x : int or str
-        Horizontal padding applied to the available area.
-    padding_y : int or str
-        Vertical padding applied to the available area.
+    inset_left : int or str
+        Left content inset. Positive values move the content edge inward;
+        negative values expand it outward.
+    inset_right : int or str
+        Right content inset. Positive values move the content edge inward;
+        negative values expand it outward.
+    inset_top : int or str
+        Top content inset. Positive values move the content edge inward;
+        negative values expand it outward.
+    inset_bottom : int or str
+        Bottom content inset. Positive values move the content edge inward;
+        negative values expand it outward.
     resize : {'fit', 'cover', 'stretch'}
         Resize mode.
 
@@ -1440,21 +1463,38 @@ def _resize_overlay_to_box(
     if box_width <= 0 or box_height <= 0:
         raise ValueError(f'invalid box size {box_width}x{box_height}')
 
-    pad_x = resolve_size_expr(
-        padding_x,
-        reference=box_width,
-        min_size=0,
-        allow_unitless=True,
-    )
-    pad_y = resolve_size_expr(
-        padding_y,
-        reference=box_height,
-        min_size=0,
-        allow_unitless=True,
-    )
+    def _resolve_inset(value: SizeExpr, *, reference: int) -> int:
+        validate_size_expr(
+            value,
+            allow_unitless=True,
+            allow_negative=True,
+        )
 
-    avail_w = max(1, box_width - 2 * pad_x)
-    avail_h = max(1, box_height - 2 * pad_y)
+        if isinstance(value, int):
+            return value
+
+        s = value.strip().lower()
+        if s.endswith('px'):
+            return int(round(float(s[:-2])))
+        if s.endswith('%'):
+            return int(round(reference * float(s[:-1]) / 100.0))
+
+        return int(round(float(s)))
+
+    left = _resolve_inset(inset_left, reference=box_width)
+    right = _resolve_inset(inset_right, reference=box_width)
+    top = _resolve_inset(inset_top, reference=box_height)
+    bottom = _resolve_inset(inset_bottom, reference=box_height)
+
+    avail_w = box_width - left - right
+    avail_h = box_height - top - bottom
+
+    if avail_w <= 0 or avail_h <= 0:
+        raise ValueError(
+            'content box collapsed after applying insets: '
+            f'box={box_width}x{box_height}, '
+            f'insets=(left={left}, right={right}, top={top}, bottom={bottom})'
+        )
 
     overlay = overlay.convert('RGBA')
     src_w, src_h = overlay.size
@@ -1477,7 +1517,7 @@ def _resize_overlay_to_box(
         resample=Image.LANCZOS,
     )
 
-    return resized, (pad_x, pad_y, avail_w, avail_h)
+    return resized, (left, top, avail_w, avail_h)
 
 
 def _rotate_overlay(
@@ -1579,7 +1619,7 @@ def _place_overlay_on_local_canvas(
     box_height: int,
     content_box: Tuple[int, int, int, int],
     position: Anchor,
-    allow_overflow: bool = False,
+    allow_overflow: bool = True,
 ) -> Tuple[Image.Image, Tuple[float, float]]:
     """
     Place a resized overlay on a local transparent rectangle canvas.
@@ -1593,12 +1633,16 @@ def _place_overlay_on_local_canvas(
     box_height : int
         Local canvas height.
     content_box : tuple[int, int, int, int]
-        Available box ``(x, y, width, height)`` inside the local canvas.
+        Content box ``(x, y, width, height)`` in local rectangle coordinates.
+        Its origin may be outside the fitted rectangle when negative insets are
+        used.
     position : Anchor
         Anchor inside ``content_box``.
-    allow_overflow : bool, default=False
-        If true, expand the local canvas so overlay pixels outside the fitted
-        rectangle are preserved until the final mask clipping step.
+    allow_overflow : bool, default=True
+        If true, expand the local canvas to include placed overlay pixels that
+        fall outside the fitted rectangle. The fitted rectangle remains the
+        coordinate frame; final visibility is controlled by downstream mask
+        clipping.
 
     Returns
     -------
@@ -1674,7 +1718,8 @@ class MaskInsertLayer(NodeRef):
     1. Load and binarize the input mask.
     2. Optionally connect nearby foreground components in the fitting mask.
     3. Optionally fill enclosed holes in the fitting mask.
-    4. Estimate the visual vertical axis of the fitting mask.
+    4. Estimate the visual vertical axis of the fitting mask using a quadrilateral
+       frame heuristic, with centerline fallback.
     5. Rotate the fitting mask once, using the estimated visual axis, so the
        desired rectangle becomes axis-aligned in the temporary rotated mask.
     6. Compute the largest fully-inscribed rectangle and the rotated foreground
@@ -1694,14 +1739,18 @@ class MaskInsertLayer(NodeRef):
 
     Rectangle fitting
     -----------------
-    The fitted rectangle is computed from the mask using a pragmatic heuristic:
+    The fitted rectangle is computed from the mask using a pragmatic geometric
+    heuristic:
 
-    - one center point is computed for each foreground row, using the midpoint
-      between its left and right foreground boundary,
-    - very narrow rows and configurable top/bottom tails are ignored to reduce
-      the influence of straps, spikes, and noisy protrusions,
-    - a line is fitted through the remaining center points to estimate the
-      mask's visual vertical axis,
+    - four approximate border lines are fitted from the mask foreground:
+      left/right borders are fitted from row extrema, while top/bottom borders
+      are fitted from column extrema,
+    - the intersections of those fitted border lines define an approximate
+      quadrilateral frame,
+    - the alignment axis is estimated from the line connecting the midpoint of
+      the top side to the midpoint of the bottom side,
+    - if the quadrilateral frame cannot be estimated, the node falls back to a
+      centerline estimate based on row midpoints,
     - the mask is rotated once so that the placement rectangle can be computed in
       axis-aligned coordinates,
     - the largest fully-inscribed rectangle is computed,
@@ -1717,6 +1766,11 @@ class MaskInsertLayer(NodeRef):
     Overlay placement
     -----------------
     The overlay image is inserted into the local rectangle coordinate system.
+    Content insets define the local content area used for resizing and anchoring:
+    positive values move the corresponding edge inward, while negative values
+    expand it outward beyond the fitted rectangle. Overlay pixels outside the
+    fitted rectangle are preserved during local placement and final clipping is
+    performed only against the source mask.
 
     ``resize='fit'``
         Preserve aspect ratio and scale the overlay so that it is fully contained
@@ -1725,8 +1779,7 @@ class MaskInsertLayer(NodeRef):
     ``resize='cover'``
         Preserve aspect ratio and scale the overlay so that it covers the whole
         available content area. The resized overlay may exceed both the content box
-        and the fitted rectangle. Overflow is preserved during local placement and
-        final clipping is performed only against the source mask.
+        and the fitted rectangle.
 
     ``resize='stretch'``
         Resize the overlay exactly to the available content area, without
@@ -1793,25 +1846,49 @@ class MaskInsertLayer(NodeRef):
         Threshold used to binarize the grayscale mask. Pixels greater than or
         equal to this value are treated as foreground.
 
-    ``params.padding_x`` : int or str, default='0%'
-        Horizontal padding applied inside the fitted rectangle content area.
-        Percentages are resolved against the rectangle width.
+    ``params.inset_left`` : int or str, default='0%'
+        Left content inset. Percentages are resolved against the rectangle width.
+        Positive values move the content edge inward; negative values expand it
+        outward.
 
-    ``params.padding_y`` : int or str, default='0%'
-        Vertical padding applied inside the fitted rectangle content area.
-        Percentages are resolved against the rectangle height.
+    ``params.inset_right`` : int or str, default='0%'
+        Right content inset. Percentages are resolved against the rectangle width.
+        Positive values move the content edge inward; negative values expand it
+        outward.
 
-    ``params.box_blend`` : float, default=0.0
+    ``params.inset_top`` : int or str, default='0%'
+        Top content inset. Percentages are resolved against the rectangle height.
+        Positive values move the content edge inward; negative values expand it
+        outward.
+
+    ``params.inset_bottom`` : int or str, default='0%'
+        Bottom content inset. Percentages are resolved against the rectangle height.
+        Positive values move the content edge inward; negative values expand it
+        outward.
+
+    ``params.box_blend`` : float or sequence, default=0.0
         Blend factor between the largest fully-inscribed rectangle and the rotated
         foreground bounding box.
 
-        - ``0.0`` uses the fully-inscribed rectangle.
-        - ``1.0`` uses the full rotated foreground bounding box.
-        - intermediate values expand the inner rectangle toward the outer box.
+        Accepted forms are:
 
-        This is useful when the mask contains holes, occlusions, irregular borders,
-        or disconnected parts that make the strict inner rectangle too small or
-        poorly centered.
+        - ``0.25``:
+            Apply the same blend factor to all sides.
+
+        - ``[0.30, 0.10]``:
+            Apply horizontal and vertical factors. The first value is used for
+            left/right sides; the second value is used for top/bottom sides.
+
+        - ``[0.50, 0.10, 0.20, 0.30]``:
+            Apply per-side factors in ``left, top, right, bottom`` order.
+
+        Each factor must be in ``[0, 1]``:
+
+        - ``0.0`` keeps the corresponding side from the fully-inscribed rectangle.
+        - ``1.0`` moves the corresponding side to the rotated foreground bounding box.
+
+        This is useful when the strict inner rectangle is too small, poorly centered,
+        or must be expanded more on one side than on another.
 
     ``params.max_bridge_distance`` : str or None, default=None
         Maximum distance used to connect nearby foreground components before fitting
@@ -1826,7 +1903,7 @@ class MaskInsertLayer(NodeRef):
     ``debug.save_debug`` : bool, default=False
         If true, save a debug image showing the mask, final fitted rectangle,
         diagnostic inner/outer rectangles, rectangle center, local axes, and optional
-        content box after padding.
+        content box after applying content insets.
 
     Outputs
     -------
@@ -1850,7 +1927,8 @@ class MaskInsertLayer(NodeRef):
             angle, and corners.
         - ``fit_rects`` : dict
             Diagnostic fitting metadata, including the strict inner rectangle, the
-            outer rotated foreground bounding box, and the estimated alignment angle.
+            outer rotated foreground bounding box, the estimated alignment angle, and the
+            alignment estimator used.
         - ``placement`` : dict
             Overlay placement metadata, including anchor, resize mode, manual
             rotation, content box, original overlay size, rotated overlay size,
@@ -1914,7 +1992,8 @@ class MaskInsertLayer(NodeRef):
             of the fitted rectangle.
 
             The anchor is evaluated in the rectangle local coordinate system, after
-            ``padding_x`` and ``padding_y`` have been applied.
+            ``inset_left``, ``inset_right``, ``inset_top``, and
+            ``inset_bottom`` have been applied.
 
             Supported values are:
 
@@ -1991,8 +2070,10 @@ class MaskInsertLayer(NodeRef):
                 name='shirt_logo',
                 spec={
                     'params': {
-                        'padding_x': '6%',
-                        'padding_y': '6%',
+                        'inset_left': '6%',
+                        'inset_right': '6%',
+                        'inset_top': '6%',
+                        'inset_bottom': '6%',
                     },
                 },
             )
@@ -2085,12 +2166,12 @@ class MaskInsertLayer(NodeRef):
             placed_overlay,
             box_width=box_width,
             box_height=box_height,
-            padding_x=cfg.padding_x,
-            padding_y=cfg.padding_y,
+            inset_left=cfg.inset_left,
+            inset_right=cfg.inset_right,
+            inset_top=cfg.inset_top,
+            inset_bottom=cfg.inset_bottom,
             resize=self._layer.resize,
         )
-
-        allow_overflow = self._layer.resize == 'cover'
 
         local_layer, local_origin = _place_overlay_on_local_canvas(
             fitted_overlay,
@@ -2098,7 +2179,6 @@ class MaskInsertLayer(NodeRef):
             box_height=box_height,
             content_box=content_box,
             position=self._layer.position,
-            allow_overflow=allow_overflow,
         )
 
         h, w = mask.shape[:2]
@@ -2160,6 +2240,7 @@ class MaskInsertLayer(NodeRef):
                 'inner': _rect_to_metadata(fit.inner_rect),
                 'outer': _rect_to_metadata(fit.outer_rect),
                 'alignment_angle_deg': fit.alignment_angle,
+                'alignment_method': fit.alignment_method,
             },
             'placement': {
                 'position': self._layer.position,
@@ -2174,9 +2255,11 @@ class MaskInsertLayer(NodeRef):
             },
             'params': {
                 'threshold': cfg.threshold,
-                'padding_x': cfg.padding_x,
-                'padding_y': cfg.padding_y,
-                'box_blend': cfg.box_blend,
+                'inset_left': cfg.inset_left,
+                'inset_right': cfg.inset_right,
+                'inset_top': cfg.inset_top,
+                'inset_bottom': cfg.inset_bottom,
+                'box_blend': list(cfg.box_blend),
                 'max_bridge_distance': cfg.max_bridge_distance,
                 'fill_holes': cfg.fill_holes,
             },

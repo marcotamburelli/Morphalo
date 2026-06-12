@@ -522,6 +522,7 @@ def cutout_stack_ip_img2img_group(
     ip_adapter_model_id: str = 'h94/IP-Adapter',
     ip_adapter_subfolder: str = 'sdxl_models',
     ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
+    min_landmark_fraction: float= 0.8
 ) -> NodeGroup:
     """
     Compose a trimmed cut-out subject over a background, then harmonize the
@@ -621,6 +622,7 @@ def cutout_stack_ip_img2img_group(
                     'target': 'person',
                     'mode': 'default',
                     'crop_mode': 'trim',
+                    'min_landmark_fraction': min_landmark_fraction
                 },
             },
         )
@@ -635,7 +637,10 @@ def cutout_stack_ip_img2img_group(
             },
         )
 
-        bg >> stack.image(0)
+        bg >> stack.image(
+            0,
+            resize='cover',
+        )
 
         fg >> crop
         fg_layer = stack.image(
