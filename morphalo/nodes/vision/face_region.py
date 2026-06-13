@@ -286,7 +286,11 @@ def eyebrow_bbox_xyxy_from_landmarks(
 
     return ex1, ey1, ex2, ey2
 
-
+# TODO:
+# Eyebrow masks are landmark-based and approximate. In difficult cases
+# (arched brows, 3/4 faces, landmark drift), the convex hull may include
+# some skin below the eyebrow. For precise eyebrow segmentation, prefer
+# a semantic segmentation path such as AnyCrop.
 def eyebrow_mask_from_landmarks(
     face_xy: np.ndarray,
     image_shape: tuple[int, ...],
