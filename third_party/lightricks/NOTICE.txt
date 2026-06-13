@@ -8,5 +8,6 @@ File:
 
 Copyright (c) Lightricks
 Licensed under the Apache License, Version 2.0.
+The complete license text is available in the repository root LICENSE file.
 
 No modifications have been made to the original source code.

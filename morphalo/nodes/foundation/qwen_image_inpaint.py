@@ -10,7 +10,8 @@ from morphalo.cache.models import (evict_qwen_image_inpaint_controlnet,
                                    get_qwen_image_inpaint_pipe)
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import cleanup_torch_cuda
+from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+                                            synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
@@ -112,6 +113,10 @@ class QwenImageInpaint(QwenImageInpaintMixin, PromptMixin, NodeRef):
 
     spec: SpecInput = field(default_factory=dict)
     evict_after_run: bool = False
+
+    @property
+    def uses_cuda(self) -> bool:
+        return True
 
     def run(
         self,
@@ -239,44 +244,49 @@ class QwenImageInpaint(QwenImageInpaintMixin, PromptMixin, NodeRef):
         image inpainting pipeline and ControlNet corresponding to the resolved
         runtime configuration, then triggers best-effort Python/CUDA cleanup.
         """
+        if self.uses_cuda:
+            synchronize_torch_cuda()
+
         if not self.evict_after_run:
             return
 
-        spec = resolve_spec(self.spec)
+        try:
+            spec = resolve_spec(self.spec)
 
-        model_cfg = resolve_qwen_model_config(
-            spec,
-            default_model_id='Qwen/Qwen-Image',
-            node_name='QwenImageInpaint',
-            supported_by='QwenImageInpaint',
-        )
-
-        model = spec.get('model', {}) if isinstance(spec, dict) else {}
-        controlnet_model_id = model.get(
-            'controlnet_id',
-            DEFAULT_QWEN_IMAGE_INPAINT_CONTROLNET,
-        )
-
-        pipe = evict_qwen_image_inpaint_pipe(
-            model_id=model_cfg.model_id,
-            controlnet_model_id=controlnet_model_id,
-            dtype=model_cfg.dtype,
-            device_map=model_cfg.device_map,
-        )
-        controlnet = evict_qwen_image_inpaint_controlnet(
-            model_id=controlnet_model_id,
-            dtype=model_cfg.dtype,
-        )
-
-        if pipe is None and controlnet is None:
-            raise RuntimeError(
-                'QwenImageInpaint cache objects not found for eviction: '
-                f'model_id={model_cfg.model_id!r}, '
-                f'controlnet_id={controlnet_model_id!r}, '
-                f'device_map={model_cfg.device_map!r}, '
-                f'dtype={model_cfg.dtype!r}'
+            model_cfg = resolve_qwen_model_config(
+                spec,
+                default_model_id='Qwen/Qwen-Image',
+                node_name='QwenImageInpaint',
+                supported_by='QwenImageInpaint',
             )
 
-        del pipe
-        del controlnet
-        cleanup_torch_cuda()
+            model = spec.get('model', {}) if isinstance(spec, dict) else {}
+            controlnet_model_id = model.get(
+                'controlnet_id',
+                DEFAULT_QWEN_IMAGE_INPAINT_CONTROLNET,
+            )
+
+            pipe = evict_qwen_image_inpaint_pipe(
+                model_id=model_cfg.model_id,
+                controlnet_model_id=controlnet_model_id,
+                dtype=model_cfg.dtype,
+                device_map=model_cfg.device_map,
+            )
+            controlnet = evict_qwen_image_inpaint_controlnet(
+                model_id=controlnet_model_id,
+                dtype=model_cfg.dtype,
+            )
+
+            if pipe is None and controlnet is None:
+                raise RuntimeError(
+                    'QwenImageInpaint cache objects not found for eviction: '
+                    f'model_id={model_cfg.model_id!r}, '
+                    f'controlnet_id={controlnet_model_id!r}, '
+                    f'device_map={model_cfg.device_map!r}, '
+                    f'dtype={model_cfg.dtype!r}'
+                )
+
+            del pipe
+            del controlnet
+        finally:
+            cleanup_torch_cuda()

@@ -14,6 +14,8 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag.core import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import load_faceid_embeds, write_json
 from morphalo.nodes.evaluate.helper import clamp01
 from morphalo.nodes.evaluate.img_wiring_mixin import ImgBundle, ImgWiringMixin
@@ -711,7 +713,7 @@ def _aggregate_face_score(
 
 
 @dataclass
-class FaceScorer(ImgWiringMixin, NodeRef):
+class FaceScorer(CudaPostRunMixin, ImgWiringMixin, NodeRef):
     """
     Evaluate and rank one or more person images based on face plausibility and,
     optionally, identity similarity.
@@ -980,6 +982,11 @@ class FaceScorer(ImgWiringMixin, NodeRef):
     """
 
     spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def identity(self) -> AttachmentSink:
         """

@@ -10,6 +10,8 @@ import torch
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.ltx.preprocess.utils.depth_extractor import \
     DepthVideoExtractor
 
@@ -19,7 +21,7 @@ _autocast: bool = True
 
 
 @dataclass
-class VideoDepthMap(NodeRef):
+class VideoDepthMap(CudaPostRunMixin, NodeRef):
     """
     Video depth preprocessing node producing a single packed control video.
 
@@ -31,6 +33,13 @@ class VideoDepthMap(NodeRef):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(
+            spec.get('model', {}).get('device', _device)
+        )
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         input = input or {}

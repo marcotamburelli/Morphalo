@@ -52,6 +52,15 @@ def run_dags(
         '--force-upstream',
         help='When used with --node, execute missing upstream nodes to materialize inputs'
     ),
+    cuda_chunk_size: int = typer.Option(
+        8,
+        '--cuda-chunk-size',
+        min=1,
+        help=(
+            'Restart the node worker after this many CUDA node executions '
+            'to limit CUDA context lifetime'
+        )
+    ),
 ):
     """
     Import a module that declares one or more DAGs and execute them.
@@ -108,6 +117,11 @@ def run_dags(
     force_upstream : bool, optional
         When used with ``--node`` (and optionally ``--downstream``), execute
         missing upstream nodes recursively to materialize required inputs.
+    cuda_chunk_size : int, optional
+        Maximum number of CUDA node executions per worker process. The worker
+        restart destroys the current CUDA context before the next chunk, as a
+        mitigation for observed low-level GPU/driver instability after long
+        inference sequences. Must be greater than zero.
 
     Raises
     ------
@@ -120,6 +134,9 @@ def run_dags(
     -----
     - DAG discovery occurs at module import time via side effects.
     - Execution is deterministic and single-threaded.
+    - CUDA work is divided into worker-process chunks to limit CUDA context
+      lifetime. This is a defensive mitigation for observed driver/GSP-level
+      instability, not a substitute for normal OOM handling.
     - All node execution relies on filesystem side effects for input/output
       materialization (JSON artifacts).
     - This command does not return values; results are persisted to disk.
@@ -154,7 +171,7 @@ def run_dags(
         dags = [_d]
 
     for d in dags:
-        runner = DAGRunner(d)
+        runner = DAGRunner(d, max_cuda_nodes=cuda_chunk_size)
         if node is not None:
             if downstream:
                 runner.run_node_downstream(node, force_upstream=force_upstream)

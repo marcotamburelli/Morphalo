@@ -13,6 +13,8 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.sdxl_resolve import resolve_image_paths
 
@@ -63,7 +65,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
 
 @dataclass
-class FaceIdEmbedImage(NodeRef):
+class FaceIdEmbedImage(CudaPostRunMixin, NodeRef):
     """
     Extract and serialize FaceID identity embeddings from one or more reference images.
 
@@ -187,6 +189,11 @@ class FaceIdEmbedImage(NodeRef):
 
     path: Union[str, Path, List[Union[str, Path]]] = None
     spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cpu'))
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # Local imports to avoid hard dependency if node unused

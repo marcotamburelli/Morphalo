@@ -6,8 +6,8 @@ from typing import Any, Dict, Optional
 import pytest
 
 import morphalo.dag.runner as runner_mod
-from morphalo.dag import DAG
-from morphalo.dag.runner import DAGRunner, Execution, SingleNodeRunner
+from morphalo.dag import DAG, get_entry_nodes
+from morphalo.dag.runner import Execution, SingleNodeRunner, _execute
 from tests.dag.nodes import MergeNode, PassNode, SourceNode
 
 
@@ -581,7 +581,12 @@ def test_run_downstream_replay_must_not_use_stale_cache_for_node_inside_current_
         a >> x >> m.sink(name='X_to_M', input_id='attachment')
 
     # First run: populate cache for the whole DAG.
-    DAGRunner(dag).run()
+    _execute(
+        out_dir=dag.out_dir,
+        entries=get_entry_nodes(dag.nodes, dag.edges),
+        nodes=dag.nodes,
+        executions=_build_executions(dag),
+    )
 
     # Sanity check: cache really contains previous-run outputs.
     assert cache[a.id]['value'] == 1

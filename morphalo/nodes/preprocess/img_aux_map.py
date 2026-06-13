@@ -11,6 +11,8 @@ from morphalo.cache.models import get_controlnet_aux_annotator
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
                                              resize_long_side_rgb, round_up)
@@ -19,7 +21,7 @@ from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 
 
 @dataclass
-class ImgAuxMap(NodeRef):
+class ImgAuxMap(CudaPostRunMixin, NodeRef):
     """
     Single-image auxiliary preprocessing node producing a ControlNet-ready map.
 
@@ -278,6 +280,16 @@ class ImgAuxMap(NodeRef):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        processor = spec.get('processor', 'openpose_full')
+        model = MODELS.get(processor)
+        return (
+            bool(model and model['checkpoint'])
+            and is_cuda_device(spec.get('device', 'cuda'))
+        )
 
     def _build_annotator(self, processor: str, device: str):
         if processor not in MODELS:

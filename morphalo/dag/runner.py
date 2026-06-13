@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional
 from morphalo.core.paths import load_latest_output
 from morphalo.dag import NodeRef
 from morphalo.dag.core import DAG, Edge, get_entry_nodes
+from morphalo.dag.process_executor import ProcessNodeExecutor
 from morphalo.dag.validation import DagValidationError, validate_dag
 
 Output = Dict[str, Any]
@@ -20,8 +21,23 @@ def _execute(
     entries: List[NodeRef],
     nodes: List[NodeRef],
     executions: List[Execution],
-    load_output: Optional[Callable[[str], Optional[Output]]] = None
+    load_output: Optional[Callable[[str], Optional[Output]]] = None,
+    node_executor: Optional[ProcessNodeExecutor] = None,
 ):
+    def _run_node(node: NodeRef, input_map: Dict[str, Output]) -> Output:
+        if node_executor is not None:
+            return node_executor.run(
+                node=node,
+                out_dir=out_dir,
+                input_map=input_map,
+            )
+
+        out = node.run(out_dir, input=input_map)
+        node.post_run()
+        if out is None:
+            raise DagValidationError(f"No output for node '{node.id}'")
+        return out
+
     def _resolve_output(e: Execution):
         out = e.output
         if out is None and load_output:
@@ -63,13 +79,7 @@ def _execute(
                 pending.add(node_id)
                 continue
 
-            # Post-run hook for runtime cleanup (e.g. optional model cache eviction).
-            # Most nodes implement it as a no-op.
-            out = node.run(out_dir, input=in_ups)
-            # Call post-run hook only after successful execution.
-            node.post_run()
-            if out is None:
-                raise DagValidationError(f"No output for node '{node_id}'")
+            out = _run_node(node, in_ups)
 
             executed.add(node_id)
 
@@ -163,12 +173,14 @@ class SingleNodeRunner:
         executions: List[Execution],
         force_upstream: bool,
         load_output: Callable[[str], Optional[Output]],
+        node_executor: Optional[ProcessNodeExecutor] = None,
     ):
         self.node_id = node_id
         self.__dag = dag
         self._executions = executions
         self.force_upstream = force_upstream
         self.load_output = load_output
+        self.node_executor = node_executor
 
         self.stack: set[str] = set()
 
@@ -222,14 +234,20 @@ class SingleNodeRunner:
             }
 
             node = self.nodes_by_id[node_id]
-            # Post-run hook for runtime cleanup (e.g. optional model cache eviction).
-            # Most nodes implement it as a no-op.
-            out = node.run(
-                self.__dag.out_dir,
-                input=input_map
-            )
-            # Call post-run hook only after successful execution.
-            node.post_run()
+
+            if self.node_executor is not None:
+                out = self.node_executor.run(
+                    node=node,
+                    out_dir=self.__dag.out_dir,
+                    input_map=input_map,
+                )
+            else:
+                out = node.run(
+                    self.__dag.out_dir,
+                    input=input_map
+                )
+                node.post_run()
+
             if out is None:
                 raise RuntimeError(f'No output for node {node_id!r}')
 
@@ -306,6 +324,7 @@ class SingleNodeRunner:
             executions=executions_R,
             nodes=nodes_R,
             load_output=_load_output_wrapped,
+            node_executor=self.node_executor,
         )
 
 
@@ -331,12 +350,16 @@ class DAGRunner:
     - Nodes with no incoming edges are considered source nodes and are
       executed with an empty input dictionary.
 
-    The runner is deterministic and single-threaded.
+    The runner is deterministic and sequential. Node execution is delegated
+    to a restartable worker process so CUDA contexts can be recycled after a
+    bounded number of CUDA node executions. This is a defensive mitigation for
+    observed low-level GPU/driver instability associated with long-lived CUDA
+    contexts; it is not primarily an out-of-memory recovery mechanism.
     Parallelism, retries, and partial re-execution are intentionally
     out of scope.
     """
 
-    def __init__(self, dag: DAG):
+    def __init__(self, dag: DAG, *, max_cuda_nodes: int = 8):
         """
         Initializes a DAGRunner for a given DAG.
 
@@ -353,9 +376,19 @@ class DAGRunner:
         dag : DAG
             The directed acyclic graph to be executed. The DAG is assumed
             to be immutable during execution.
+        max_cuda_nodes : int, optional
+            Maximum number of successful CUDA node executions per worker
+            process. CPU nodes do not increment the counter and may continue
+            in the current worker after the limit is reached. Recycling the
+            worker destroys its CUDA context before the next CUDA chunk.
         """
 
         self.__dag = dag
+        if max_cuda_nodes <= 0:
+            raise ValueError(
+                f'max_cuda_nodes must be > 0, got {max_cuda_nodes}'
+            )
+        self.max_cuda_nodes = int(max_cuda_nodes)
         self._executions = [Execution(edge=edge)
                             for edge in self.__dag.edges]
 
@@ -386,8 +419,7 @@ class DAGRunner:
         Notes
         -----
         - This method assumes the DAG has already been validated.
-        - The runner does not catch exceptions raised by node execution;
-          failures propagate immediately.
+        - Worker failures are raised as process execution errors.
         - Execution is strictly sequential and deterministic.
 
         Returns
@@ -400,15 +432,19 @@ class DAGRunner:
         # Validating the DAG
         validate_dag(self.__dag)
 
-        _execute(
-            out_dir=self.__dag.out_dir,
-            entries=get_entry_nodes(
+        with ProcessNodeExecutor(
+            max_cuda_nodes=self.max_cuda_nodes
+        ) as node_executor:
+            _execute(
+                out_dir=self.__dag.out_dir,
+                entries=get_entry_nodes(
+                    nodes=self.__dag.nodes,
+                    edges=self.__dag.edges
+                ),
+                executions=self._executions,
                 nodes=self.__dag.nodes,
-                edges=self.__dag.edges
-            ),
-            executions=self._executions,
-            nodes=self.__dag.nodes,
-        )
+                node_executor=node_executor,
+            )
 
     def run_node(self, target_id: str, force_upstream: bool = False):
         """
@@ -460,16 +496,20 @@ class DAGRunner:
         returned to the caller.
         """
 
-        SingleNodeRunner(
-            node_id=target_id,
-            dag=self.__dag,
-            executions=self._executions,
-            force_upstream=force_upstream,
-            load_output=lambda n: load_latest_output(
-                out_dir=self.__dag.out_dir,
-                node_id=n
-            )
-        ).run()
+        with ProcessNodeExecutor(
+            max_cuda_nodes=self.max_cuda_nodes
+        ) as node_executor:
+            SingleNodeRunner(
+                node_id=target_id,
+                dag=self.__dag,
+                executions=self._executions,
+                force_upstream=force_upstream,
+                load_output=lambda n: load_latest_output(
+                    out_dir=self.__dag.out_dir,
+                    node_id=n
+                ),
+                node_executor=node_executor,
+            ).run()
 
     def run_node_downstream(self, target_id: str, force_upstream: bool = False):
         """
@@ -533,13 +573,17 @@ class DAGRunner:
         and in-memory propagation through :meth:`_execute_downstream`.
         """
 
-        SingleNodeRunner(
-            node_id=target_id,
-            dag=self.__dag,
-            executions=self._executions,
-            force_upstream=force_upstream,
-            load_output=lambda n: load_latest_output(
-                out_dir=self.__dag.out_dir,
-                node_id=n
-            )
-        ).run_downstream()
+        with ProcessNodeExecutor(
+            max_cuda_nodes=self.max_cuda_nodes
+        ) as node_executor:
+            SingleNodeRunner(
+                node_id=target_id,
+                dag=self.__dag,
+                executions=self._executions,
+                force_upstream=force_upstream,
+                load_output=lambda n: load_latest_output(
+                    out_dir=self.__dag.out_dir,
+                    node_id=n
+                ),
+                node_executor=node_executor,
+            ).run_downstream()

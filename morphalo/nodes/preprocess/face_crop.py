@@ -13,6 +13,8 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec,
@@ -130,7 +132,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
 
 @dataclass
-class FaceCrop(NodeRef):
+class FaceCrop(CudaPostRunMixin, NodeRef):
     """
     Face-aware crop and inpaint-mask generator using MediaPipe Pose,
     MediaPipe Face Landmarker, and optional SAM-compatible segmentation.
@@ -573,6 +575,15 @@ class FaceCrop(NodeRef):
 
     path: Optional[Union[str, Path]] = None
     spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        target = spec.get('params', {}).get('target', 'face')
+        return (
+            target == 'face'
+            and is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
+        )
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         import cv2

@@ -7,16 +7,22 @@ Instead of exposing the internal components of diffusion models, Morphalo treats
 complete diffusion pipelines as **high-level operators** that can be composed into
 larger image-processing workflows.
 
-Diffusers pipelines (`txt2img`, `img2img`, `inpaint`) become building blocks inside a DAG,
-alongside other tools such as MediaPipe, Segment Anything, or custom preprocessing steps.
+Diffusers pipelines (`txt2img`, `img2img`, `inpaint`, foundation-model editing,
+and experimental video generation) become building blocks inside a DAG,
+alongside tools such as MediaPipe, Segment Anything, image preprocessors, and
+scoring nodes.
 
 The core idea is simple:
 
 - You describe a pipeline as a graph of nodes (e.g. `Prompt` → `Txt2Img` → `Img2Img` → `Inpaint`).
 - Each node materializes its output to disk (JSON sidecars + images), making runs **inspectable** and **restartable**.
-- A lightweight runner executes the graph deterministically.
+- A lightweight runner executes the graph in dependency order and supports
+  full, partial, and downstream runs.
 
-Under the hood, Morphalo focuses on wiring together modern diffusion tooling (Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter) along with useful preprocessors (aux maps, subject crop, etc.) in a way that is **composable**, **reproducible**, and **easy to iterate on**.
+Under the hood, Morphalo focuses on wiring together modern diffusion tooling
+(Diffusers, ControlNet, IP-Adapter, FaceID, T2I-Adapter, Qwen Image, OmniGen,
+and LTX-Video) with useful preprocessors and evaluators in a way that is
+**composable**, **inspectable**, and **easy to iterate on**.
 
 > **Status:** this repository is primarily intended for personal/local use for now. Expect breaking changes.
 
@@ -42,7 +48,8 @@ This approach introduces a few key improvements:
   Dependencies between steps are expressed directly in the graph wiring.
 
 - **Artifact-based execution**  
-  Every node materializes its outputs to disk, enabling caching and reproducible runs.
+  Nodes materialize their outputs to disk, enabling inspection, incremental
+  execution, and reuse of previously generated upstream artifacts.
 
 - **Incremental execution**  
   Individual nodes or subgraphs can be re-executed without recomputing the entire pipeline.
@@ -52,6 +59,10 @@ This approach introduces a few key improvements:
 
 - **CLI-driven workflows**  
   DAGs can be executed, inspected, and partially rerun via a simple command-line interface.
+
+- **Bounded CUDA worker lifetime**
+  Nodes execute in a separate worker process. The worker is restarted after a
+  configurable number of CUDA node executions to limit CUDA context lifetime.
 
 ### Relationship to existing tools
 
@@ -105,10 +116,10 @@ Because workflows are represented as graphs with explicit channels, it would be 
   materialized artifacts. Nodes are connected via a lightweight wiring DSL
   (`NodeRef`, `AttachmentSink`, and channel-based connections).
 
-- **Deterministic DAG execution via CLI**  
-  A CLI runner discovers DAGs at module import time and executes them
-  deterministically. The runner supports full DAG execution as well as
-  partial runs (single node, downstream, or forced upstream).
+- **Dependency-ordered DAG execution via CLI**
+  A CLI runner discovers DAGs at module import time and executes nodes according
+  to their declared dependencies. The runner supports full DAG execution as
+  well as partial runs (single node, downstream, or forced upstream).
 
 - **Artifact-based execution model**  
   Each node materializes its outputs to disk (images, video frames, metadata).
@@ -136,7 +147,9 @@ Because workflows are represented as graphs with explicit channels, it would be 
 - **Preprocessing nodes**  
   Several nodes prepare conditioning data for downstream models, including:
   - auxiliary maps (e.g. Canny, depth, pose)
-  - subject or face cropping
+  - subject- and face-aware cropping
+  - prompt-guided object extraction with `AnyCrop`
+  - basic image transformations such as resize, transpose, and flip
   - image compositing and stacking
   - conditioning preparation for adapters.
 
@@ -148,6 +161,27 @@ Because workflows are represented as graphs with explicit channels, it would be 
   - `inpaint`
 
   with optional ControlNet, IP-Adapter, FaceID, and T2I-Adapter conditioning.
+
+- **Foundation image nodes**
+  Higher-level image generation and editing workflows are available through:
+
+  - `QwenImage`
+  - `QwenImageEdit`
+  - `QwenImageEditPlus`
+  - `QwenImageInpaint`
+  - `OmniGen`
+
+  These are large models with substantial memory and runtime requirements.
+  Although their pipelines use CUDA-aware dispatch strategies such as
+  `device_map='balanced'`, long or complex workloads may still expose GPU
+  instability on consumer graphics cards.
+
+- **Image evaluation nodes**
+  Candidate images can be ranked using composable person, face, identity, and
+  prompt-alignment scoring stages. This remains an experimental feature and is
+  not a replacement for human evaluation. In many workflows, the more reliable
+  approach is still to rerun a generation node with `--node` and manually select
+  the best result.
 
 - **Experimental video generation nodes**  
   Early support for video workflows is included (still under development):
@@ -176,6 +210,8 @@ A node is a lightweight object that:
 - receives a **spec** (configuration)
 - optionally consumes artifacts produced by upstream nodes
 - materializes its outputs to disk
+- declares whether its configured execution may use CUDA
+- may perform post-run synchronization or cleanup
 
 Conceptually:
 
@@ -183,7 +219,9 @@ Conceptually:
 Node
  ├ name        (identifier within the DAG)
  ├ spec        (configuration dictionary or layered spec)
+ ├ uses_cuda   (runtime capability derived from configuration)
  ├ run(...)    (execution logic)
+ ├ post_run()  (optional synchronization or cleanup hook)
  └ artifacts   (files written to disk)
 ```
 
@@ -191,8 +229,18 @@ The `run(...)` method is responsible for executing the node's logic and
 producing its artifacts. These artifacts are later consumed by downstream
 nodes through the DAG wiring system.
 
-This design keeps nodes deterministic and makes pipeline execution
-inspectable and reproducible.
+Node objects are sent to a worker process before execution. Custom nodes should
+therefore keep their declared state serializable and create heavyweight runtime
+objects such as model pipelines, adapters, and device resources lazily during
+`run()`.
+
+`uses_cuda` defaults to `False`. Nodes that may execute CUDA work override it
+and derive the result from their resolved configuration. CUDA-aware nodes use
+`post_run()` to synchronize pending work before the runner proceeds or begins
+resource cleanup.
+
+This design makes pipeline execution explicit and inspectable while preserving
+the ability to rerun only selected parts of a workflow.
 
 A typical graph might look like this:
 
@@ -307,18 +355,21 @@ Each node writes its outputs to disk using a node-local artifact directory:
 
 ```
 outputs/
-  dag_name/
-    node_id/
-      image.png
-      artifact.json
+  node_id/
+    2026-06-13_142530_seed1234.png
+    2026-06-13_142530_seed1234.json
 ```
 
-The `artifact.json` file records:
+The base directory is the `out_dir` supplied when the DAG is declared. Dotted
+node identifiers are mapped to nested directories, so a node named
+`refine.face.out` writes under `out_dir/refine/face/out/`.
 
-- resolved configuration
-- parameters used
+JSON sidecars typically record:
+
+- generation parameters and model information
 - produced files
-- dependency information
+- timing and optional CUDA memory statistics
+- conditioning metadata where applicable
 
 These artifacts act as **persistent checkpoints**, allowing:
 
@@ -327,6 +378,12 @@ These artifacts act as **persistent checkpoints**, allowing:
 - reuse of upstream results
 
 without recomputing the entire pipeline.
+
+When a partial run needs an upstream output, Morphalo loads the most recent
+timestamped JSON sidecar in that node's artifact directory. This is deliberately
+simple: artifacts are not automatically invalidated when code, model versions,
+or node specifications change. The user decides when an upstream node should be
+rerun.
 
 ## Repository layout (typical)
 
@@ -340,7 +397,12 @@ The repository is structured as a small execution engine plus optional local wor
     - Node implementations (txt2img, img2img, inpaint, controlnet, ip_adapter, face_id, t2i_adapter, etc.)
     - Conditioning and wiring utilities
 
-- `demo/` - Example DAGs and macro workflows (e.g. compositing, stylization, reconstruction, face pipelines). These serve as reference implementations.
+- `demo/` - Example DAGs and macro workflows. Useful starting points include:
+    - `01_minimal_txt2img.py` for the smallest image-generation DAG
+    - `10_foundation_minimal.py` for Qwen Image and OmniGen
+    - `12_scorers.py` for candidate ranking and chained evaluators
+    - `14_video_wip.py` for current LTX-Video workflows
+    - `macro/` for reusable higher-level graph composition
 - `tests/` - Unit tests (including DAG-level tests).
 - `third_party/`
 Wrapped or vendored utilities (e.g. controlnet aux processors, external helpers).
@@ -421,10 +483,24 @@ Helper scripts are provided:
 The main CLI is `morphalo.cli`. The most common command is:
 
 ```bash
-python -m morphalo.cli run-dags <module> [--dag <name>] [--node <id>] [--downstream] [--force-upstream]
+python -m morphalo.cli run-dags <module> \
+    [--dag <name>] \
+    [--node <id>] \
+    [--downstream] \
+    [--force-upstream] \
+    [--cuda-chunk-size <count>]
 ```
 
-The runner discovers DAGs **at import time** via `DagRegistry`, then executes them deterministically.
+The runner discovers DAGs **at import time** via `DagRegistry`, then executes
+their nodes in dependency order.
+
+The CLI also provides a small configuration inspection command:
+
+```bash
+python -m morphalo.cli dump path/to/spec.conf
+```
+
+This parses a HOCON specification and prints the resolved configuration as JSON.
 
 ### Convenience script
 
@@ -664,7 +740,8 @@ keeping configuration files compact and composable.
 
 ## CLI Usage and Execution Model
 
-Morphalo is designed around a small but flexible CLI runner that executes DAGs deterministically and supports partial execution.
+Morphalo is designed around a small but flexible CLI runner that executes DAGs
+in dependency order and supports partial execution.
 
 The main entrypoint is:
 
@@ -686,7 +763,9 @@ If a module defines multiple DAGs, you can select one explicitly:
 ./bin/run_dag.sh my_dags.some_pipeline --dag my_dag_name
 ```
 
-If `--dag` is omitted and the module defines only one DAG, it will be executed automatically.
+If `--dag` is omitted, a full run executes all DAGs registered by the module in
+definition order. When `--node` is used and the module contains multiple DAGs,
+`--dag` is required to identify the target graph.
 
 ### Partial execution (node-level runs)
 
@@ -726,26 +805,63 @@ This makes it possible to:
 - re-run only what is necessary,
 - avoid recomputing expensive preprocessing steps.
 
+### CUDA worker chunking
+
+All node execution performed by `DAGRunner` takes place in a spawned worker
+process. By default, the worker is restarted before the next CUDA node after it
+has executed eight CUDA nodes:
+
+```bash
+python -m morphalo.cli run-dags my_dags.some_pipeline \
+    --cuda-chunk-size 8
+```
+
+`--cuda-chunk-size` must be greater than zero. CPU nodes may continue in the
+current worker after the threshold is reached; the restart occurs immediately
+before the next CUDA node.
+
+This mechanism limits the lifetime of a CUDA context. It was introduced as a
+defensive mitigation for severe driver/GSP-level instability observed after
+long and complex sequences of otherwise successful CUDA inference calls. It is
+not an out-of-memory recovery mechanism and does not prove that a long-lived
+context is the underlying cause.
+
+Before a worker is replaced, the runner waits for the previous process to exit.
+CUDA-aware nodes also synchronize pending CUDA work in their post-run lifecycle
+before cleanup or eviction.
+
+### Worker-process contract
+
+Because jobs cross a multiprocessing boundary:
+
+- node objects and their input maps must be picklable;
+- node outputs must be serializable dictionaries;
+- custom node classes should be defined at module scope and remain importable by
+  a spawned Python process;
+- `run()` and `post_run()` execute inside the worker;
+- mutations made to a node instance during execution are not reflected in the
+  original object held by the parent process;
+- models, adapters, handles, and other runtime resources should normally be
+  created lazily inside `run()` or through process-local caches.
+
+The worker process owns its CUDA context and model caches. Restarting it also
+discards those process-local resources, trading some cache reuse for a shorter
+CUDA context lifetime.
+
 ## Artifact Model (Caching & Checkpointing)
 
-Each node materializes its output to disk.
+Each successful node execution returns a dictionary and normally materializes
+its files and JSON metadata under the DAG's `out_dir`. These sidecars serve as
+persistent checkpoints for partial graph execution and upstream reuse.
 
-Artifacts typically include:
-- Generated image(s) or video(s)
-- A JSON sidecar describing:
-  - the resolved specification
-  - parameters used
-  - produced files
-  - dependency structure
+Morphalo does not currently maintain a content-addressed cache or automatically
+compare stored metadata against the current code and specification. A cached
+artifact means "the most recent available output for this node id", not
+"guaranteed valid for the current source tree".
 
-The JSON artifact is not primarily for debugging.  
-It serves as a persistent checkpoint mechanism, enabling:
-
-- deterministic re-execution,
-- partial graph execution,
-- reuse of upstream outputs without recomputation.
-
-This design makes DAG execution resumable and reproducible by construction.
+Fixed seeds and explicit specifications improve repeatability, but exact output
+reproduction may still depend on model versions, downloaded weights, PyTorch,
+CUDA kernels, and other runtime details.
 
 ## Notes
 
@@ -754,4 +870,9 @@ This design makes DAG execution resumable and reproducible by construction.
 
 ## License
 
-TBD.
+Morphalo is licensed under the [Apache License 2.0](LICENSE).
+Copyright 2026 Marco Tamburelli.
+
+Third-party components under `third_party/` remain subject to their respective
+licenses and attribution notices. Model weights and other externally downloaded
+assets are distributed separately and may have additional license terms.

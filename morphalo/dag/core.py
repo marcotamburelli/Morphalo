@@ -864,6 +864,11 @@ class NodeRef:
                 f"Cannot wire {type(self).__name__} >>= {type(other).__name__}")
         return self
 
+    @property
+    def uses_cuda(self) -> bool:
+        """Return whether this node executes work on a CUDA device."""
+        return False
+
     @abstractmethod
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
         """

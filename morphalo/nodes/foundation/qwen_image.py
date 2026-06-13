@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional
 from morphalo.cache.models import evict_qwen_image, get_qwen_image
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import cleanup_torch_cuda
+from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+                                            synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
@@ -178,6 +179,10 @@ class QwenImage(PromptMixin, NodeRef):
     spec: SpecInput = field(default_factory=dict)
     evict_after_run: bool = False
 
+    @property
+    def uses_cuda(self) -> bool:
+        return True
+
     def run(
         self,
         output_dir: str | Path,
@@ -288,31 +293,36 @@ class QwenImage(PromptMixin, NodeRef):
         QwenImage pipeline corresponding to the resolved runtime configuration
         and then triggers best-effort Python/CUDA cleanup.
         """
+        if self.uses_cuda:
+            synchronize_torch_cuda()
+
         if not self.evict_after_run:
             return
 
-        spec = resolve_spec(self.spec)
+        try:
+            spec = resolve_spec(self.spec)
 
-        model_cfg = resolve_qwen_model_config(
-            spec,
-            default_model_id='Qwen/Qwen-Image',
-            node_name='QwenImage',
-            supported_by='QwenImage',
-        )
-
-        obj = evict_qwen_image(
-            model_id=model_cfg.model_id,
-            device_map=model_cfg.device_map,
-            dtype=model_cfg.dtype,
-        )
-
-        if obj is None:
-            raise RuntimeError(
-                f'QwenImage cache model not found for eviction: '
-                f'model_id={model_cfg.model_id!r}, '
-                f'device_map={model_cfg.device_map!r}, dtype={model_cfg.dtype!r}'
+            model_cfg = resolve_qwen_model_config(
+                spec,
+                default_model_id='Qwen/Qwen-Image',
+                node_name='QwenImage',
+                supported_by='QwenImage',
             )
 
-        del obj
+            obj = evict_qwen_image(
+                model_id=model_cfg.model_id,
+                device_map=model_cfg.device_map,
+                dtype=model_cfg.dtype,
+            )
 
-        cleanup_torch_cuda()
+            if obj is None:
+                raise RuntimeError(
+                    f'QwenImage cache model not found for eviction: '
+                    f'model_id={model_cfg.model_id!r}, '
+                    f'device_map={model_cfg.device_map!r}, '
+                    f'dtype={model_cfg.dtype!r}'
+                )
+
+            del obj
+        finally:
+            cleanup_torch_cuda()

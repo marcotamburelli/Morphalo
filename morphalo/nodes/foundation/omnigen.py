@@ -10,9 +10,11 @@ from morphalo.cache.models import evict_omnigen, get_omnigen
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
-from morphalo.nodes.common.cuda_mem import cleanup_torch_cuda
+from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+                                            synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.wiring import (OmniGenImageBundle,
@@ -195,6 +197,11 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
     spec: SpecInput = field(default_factory=dict)
     evict_after_run: bool = False
 
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
+
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # --- HF env ---
         setup_env()
@@ -307,28 +314,33 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
         OmniGen pipeline corresponding to the resolved runtime configuration
         and then triggers best-effort Python/CUDA cleanup.
         """
+        if self.uses_cuda:
+            synchronize_torch_cuda()
+
         if not self.evict_after_run:
             return
 
-        spec = resolve_spec(self.spec)
+        try:
+            spec = resolve_spec(self.spec)
 
-        model = spec.get('model', {}) if isinstance(spec, dict) else {}
-        model_id = model.get('id', 'Shitao/OmniGen-v1-diffusers')
-        device = model.get('device', 'cuda')
-        dtype = resolve_dtype(model.get('dtype', 'bf16'))
+            model = spec.get('model', {}) if isinstance(spec, dict) else {}
+            model_id = model.get('id', 'Shitao/OmniGen-v1-diffusers')
+            device = model.get('device', 'cuda')
+            dtype = resolve_dtype(model.get('dtype', 'bf16'))
 
-        obj = evict_omnigen(
-            model_id=model_id,
-            device=device,
-            dtype=dtype,
-        )
-
-        if obj is None:
-            raise RuntimeError(
-                f'OmniGen cache model not found for eviction: '
-                f'model_id={model_id!r}, device={device!r}, dtype={dtype!r}'
+            obj = evict_omnigen(
+                model_id=model_id,
+                device=device,
+                dtype=dtype,
             )
 
-        del obj
+            if obj is None:
+                raise RuntimeError(
+                    f'OmniGen cache model not found for eviction: '
+                    f'model_id={model_id!r}, device={device!r}, '
+                    f'dtype={dtype!r}'
+                )
 
-        cleanup_torch_cuda()
+            del obj
+        finally:
+            cleanup_torch_cuda()

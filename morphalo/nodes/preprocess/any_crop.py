@@ -11,6 +11,8 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec,
@@ -360,7 +362,7 @@ def _clip_grounded_bbox(
 
 
 @dataclass
-class AnyCrop(PromptMixin, NodeRef):
+class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
     """
     Open-vocabulary crop and inpaint-mask generator using Grounding DINO and
     SAM/SAM-HQ segmentation.
@@ -715,6 +717,11 @@ class AnyCrop(PromptMixin, NodeRef):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(
         self,

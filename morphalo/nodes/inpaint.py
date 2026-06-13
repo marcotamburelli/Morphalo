@@ -9,9 +9,11 @@ from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
 from morphalo.dag import AttachmentSink, NodeRef
-from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.img import resolve_long_side_size
@@ -95,7 +97,7 @@ def _resolve_inpaint_size(
 
 
 @dataclass
-class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
+class Inpaint(CudaPostRunMixin, ControlNetMixin, PromptMixin, NodeRef):
     """
     SDXL inpainting node with optional ControlNet and IP-Adapter/FaceID conditioning.
 
@@ -296,6 +298,11 @@ class Inpaint(ControlNetMixin, PromptMixin, NodeRef):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def mask(self):
         """

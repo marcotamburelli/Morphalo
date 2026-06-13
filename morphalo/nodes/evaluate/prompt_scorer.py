@@ -13,6 +13,8 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag.core import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json
 from morphalo.nodes.evaluate.helper import clamp01
 from morphalo.nodes.evaluate.img_wiring_mixin import ImgBundle, ImgWiringMixin
@@ -440,7 +442,7 @@ def _prompt_alignment_from_timesteps(
 
 
 @dataclass
-class PromptScorer(ImgWiringMixin, PromptMixin, NodeRef):
+class PromptScorer(CudaPostRunMixin, ImgWiringMixin, PromptMixin, NodeRef):
     """
     Evaluate and rank images based on alignment with a given text prompt using
     a diffusion-based consistency signal.
@@ -670,6 +672,11 @@ class PromptScorer(ImgWiringMixin, PromptMixin, NodeRef):
     """
 
     spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         spec = resolve_spec(self.spec)

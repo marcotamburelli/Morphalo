@@ -6,6 +6,7 @@ https://github.com/huggingface/controlnet_aux
 Copyright (c) Hugging Face
 
 Licensed under the Apache License, Version 2.0.
+The complete license text is available in the repository root LICENSE file.
 
 The code has been copied and modified to:
 - remove deprecated APIs

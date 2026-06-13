@@ -6,9 +6,11 @@ from typing import Any, Dict, Optional
 from morphalo.cache.ltx_models import (get_ltx_condition,
                                        get_ltx_latent_upsample)
 from morphalo.dag import NodeRef
-from morphalo.nodes.common.config_resolve import SpecInput
+from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.ltx.conditioning import build_image_condition
 from morphalo.nodes.ltx.io import finalize_video_output, save_video
@@ -19,7 +21,7 @@ from morphalo.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class Img2Video(PromptMixin, NodeRef):
+class Img2Video(CudaPostRunMixin, PromptMixin, NodeRef):
     """
     Image-to-video node based on LTX-Video (single-keyframe conditioning).
 
@@ -144,6 +146,11 @@ class Img2Video(PromptMixin, NodeRef):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         # HF env

@@ -3,6 +3,12 @@ import gc
 import torch
 
 
+def synchronize_torch_cuda() -> None:
+    """Wait for pending CUDA work without initializing CUDA."""
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+
+
 def cleanup_torch_cuda() -> None:
     """
     Perform best-effort Python and CUDA memory cleanup.
@@ -16,6 +22,16 @@ def cleanup_torch_cuda() -> None:
     """
     gc.collect()
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if torch.cuda.is_initialized():
+        synchronize_torch_cuda()
         torch.cuda.empty_cache()
+
+
+class CudaPostRunMixin:
+    """Synchronize CUDA work after nodes that may execute on CUDA."""
+
+    def post_run(self) -> None:
+        if self.uses_cuda:
+            synchronize_torch_cuda()
+
+        super().post_run()

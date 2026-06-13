@@ -7,6 +7,8 @@ from morphalo.const import ENG
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.wiring.prompt import PromptValue, norm_prompt_pair
 
@@ -129,7 +131,7 @@ def translate_prompt_value(
 
 
 @dataclass
-class Prompt(NodeRef):
+class Prompt(CudaPostRunMixin, NodeRef):
     """
     Prepare and normalize text prompts from a configuration specification.
 
@@ -220,6 +222,16 @@ class Prompt(NodeRef):
       consumption by downstream generator nodes.
     """
     spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        spec = resolve_spec(self.spec)
+        src_lang = spec.get('lang', ENG)
+        return (
+            bool(src_lang)
+            and src_lang != ENG
+            and is_cuda_device(spec.get('device', 'cuda'))
+        )
 
     def run(self, output_dir, input: Dict[str, Dict] = None) -> Dict:
         spec = resolve_spec(self.spec)

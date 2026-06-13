@@ -9,7 +9,8 @@ from morphalo.cache.models import (dtype_key, evict_qwen_image_edit_plus_pipe,
                                    get_qwen_image_edit_plus_pipe)
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import cleanup_torch_cuda
+from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+                                            synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.env import setup_env
@@ -135,6 +136,10 @@ class QwenImageEditPlus(ImageSequenceMixin, PromptMixin, NodeRef):
 
     spec: SpecInput = field(default_factory=dict)
     evict_after_run: bool = False
+
+    @property
+    def uses_cuda(self) -> bool:
+        return True
 
     def condition(self, idx: int) -> AttachmentSink:
         """
@@ -300,29 +305,35 @@ class QwenImageEditPlus(ImageSequenceMixin, PromptMixin, NodeRef):
         Qwen Image Edit Plus pipeline corresponding to the resolved runtime
         configuration and then triggers best-effort Python/CUDA cleanup.
         """
+        if self.uses_cuda:
+            synchronize_torch_cuda()
+
         if not self.evict_after_run:
             return
 
-        spec = resolve_spec(self.spec)
-        model_cfg = resolve_qwen_model_config(
-            spec,
-            default_model_id='Qwen/Qwen-Image-Edit-2509',
-            node_name='QwenImageEditPlus',
-            supported_by='QwenImageEditPlusPipeline',
-        )
-
-        obj = evict_qwen_image_edit_plus_pipe(
-            model_id=model_cfg.model_id,
-            dtype=model_cfg.dtype,
-            device_map=model_cfg.device_map,
-        )
-
-        if obj is None:
-            raise RuntimeError(
-                'QwenImageEditPlus cache model not found for eviction: '
-                f'model_id={model_cfg.model_id!r}, '
-                f'device_map={model_cfg.device_map!r}, dtype={model_cfg.dtype!r}'
+        try:
+            spec = resolve_spec(self.spec)
+            model_cfg = resolve_qwen_model_config(
+                spec,
+                default_model_id='Qwen/Qwen-Image-Edit-2509',
+                node_name='QwenImageEditPlus',
+                supported_by='QwenImageEditPlusPipeline',
             )
 
-        del obj
-        cleanup_torch_cuda()
+            obj = evict_qwen_image_edit_plus_pipe(
+                model_id=model_cfg.model_id,
+                dtype=model_cfg.dtype,
+                device_map=model_cfg.device_map,
+            )
+
+            if obj is None:
+                raise RuntimeError(
+                    'QwenImageEditPlus cache model not found for eviction: '
+                    f'model_id={model_cfg.model_id!r}, '
+                    f'device_map={model_cfg.device_map!r}, '
+                    f'dtype={model_cfg.dtype!r}'
+                )
+
+            del obj
+        finally:
+            cleanup_torch_cuda()
