@@ -66,3 +66,28 @@ def test_nodegroup_injection_raises_on_node_id_collision(tmp_path):
 
         with pytest.raises(RuntimeError, match='node id collision'):
             src >> g
+
+
+def test_injected_nested_groups_are_registered_by_qualified_id(tmp_path):
+    with DAG('nested_groups', out_dir=tmp_path) as dag:
+        src = SourceNode(name='SRC', value=1)
+
+        with NodeGroup('outer') as outer:
+            outer_out = PassNode(name='out')
+
+            with NodeGroup('inner') as inner:
+                inner_in = PassNode(name='in')
+
+            inner >> outer_out
+
+        src >> outer
+
+    assert dag.node_groups == {
+        'outer': outer,
+        'outer.inner': inner,
+    }
+    assert {node.id for node in outer.nodes} == {
+        'outer.inner.in',
+        'outer.out',
+    }
+    assert {node.id for node in inner.nodes} == {'outer.inner.in'}

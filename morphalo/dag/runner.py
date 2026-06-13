@@ -44,9 +44,6 @@ def _execute(
             out = load_output(e.edge.node_from)
         return out
 
-    debug_limit = 1000
-    debug_iter = 0
-
     nodes_map = {n.id: n for n in nodes}
 
     incoming: Dict[str, List[Execution]] = {}
@@ -63,40 +60,136 @@ def _execute(
     # incoming edges have already been materialized, either in memory or
     # via `load_output`.
     while entries:
-        debug_iter += 1
-
         pending: set[str] = set()
         to_execute: set[str] = set()
+        executed_this_round: set[str] = set()
+        missing_inputs: dict[str, list[Edge]] = {}
 
         for node in entries:
             node_id = node.id
-            in_ups = {
-                e.edge.input_id: _resolve_output(e)
-                for e in incoming.get(node_id, [])
-            }
+            in_ups: Dict[str, Optional[Output]] = {}
+            for execution in incoming.get(node_id, []):
+                out = _resolve_output(execution)
+                in_ups[execution.edge.input_id] = out
+                if out is None:
+                    missing_inputs.setdefault(node_id, []).append(
+                        execution.edge
+                    )
 
             if any(x is None for x in in_ups.values()):
                 pending.add(node_id)
                 continue
 
-            out = _run_node(node, in_ups)
+            out = _run_node(
+                node,
+                {input_id: value for input_id, value in in_ups.items()
+                 if value is not None},
+            )
 
             executed.add(node_id)
+            executed_this_round.add(node_id)
 
             for e in outgoing.get(node_id, []):
                 e.output = out
                 to_execute.add(e.edge.node_to)
 
-        if debug_iter > debug_limit:
+        if pending and not executed_this_round:
+            details = []
+            for node_id in sorted(pending):
+                missing = ', '.join(
+                    f'{edge.node_from!r} on input {edge.input_id!r}'
+                    for edge in missing_inputs[node_id]
+                )
+                details.append(f'- {node_id!r} requires {missing}')
             raise DagValidationError(
-                'Potential loop detected:\n'
-                f'entries    - {[n.id for n in entries]}\n'
-                f'pending    - {sorted(pending)}\n'
-                f'to_execute - {sorted(to_execute)}\n'
-                f'executed   - {sorted(executed)}'
+                'Execution stalled because no node can make progress. '
+                'Missing upstream outputs:\n'
+                + '\n'.join(details)
             )
 
         entries = [nodes_map[n] for n in (pending | to_execute) - executed]
+
+
+def _execute_subgraph(
+    *,
+    dag: DAG,
+    executions: List[Execution],
+    target_ids: set[str],
+    downstream: bool,
+    force_upstream: bool,
+    load_output: Callable[[str], Optional[Output]],
+    node_executor: Optional[ProcessNodeExecutor] = None,
+) -> None:
+    validate_dag(dag)
+
+    nodes_by_id = {node.id: node for node in dag.nodes}
+    unknown = target_ids - nodes_by_id.keys()
+    if unknown:
+        raise ValueError(f'Unknown node ids: {sorted(unknown)}')
+    if not target_ids:
+        raise ValueError('At least one target node id is required')
+
+    down: dict[str, list[str]] = {}
+    up: dict[str, list[str]] = {}
+    for edge in dag.edges:
+        down.setdefault(edge.node_from, []).append(edge.node_to)
+        up.setdefault(edge.node_to, []).append(edge.node_from)
+
+    execution_ids = set(target_ids)
+
+    if downstream:
+        stack = list(target_ids)
+        while stack:
+            node_id = stack.pop()
+            for child_id in down.get(node_id, []):
+                if child_id in execution_ids:
+                    continue
+                execution_ids.add(child_id)
+                stack.append(child_id)
+
+    if force_upstream:
+        cached = {
+            node.id for node in dag.nodes
+            if load_output(node.id) is not None
+        }
+
+        stack = list(execution_ids)
+        while stack:
+            node_id = stack.pop()
+            for upstream_id in up.get(node_id, []):
+                if upstream_id in cached or upstream_id in execution_ids:
+                    continue
+                execution_ids.add(upstream_id)
+                stack.append(upstream_id)
+
+    nodes = [
+        node for node in dag.nodes
+        if node.id in execution_ids
+    ]
+    edges = [
+        edge for edge in dag.edges
+        if edge.node_from in execution_ids and edge.node_to in execution_ids
+    ]
+
+    # External incoming edges remain available for cache hydration.
+    subgraph_executions = [
+        execution for execution in executions
+        if execution.edge.node_to in execution_ids
+    ]
+
+    def load_external_output(node_id: str) -> Optional[Output]:
+        if node_id in execution_ids:
+            return None
+        return load_output(node_id)
+
+    _execute(
+        out_dir=dag.out_dir,
+        entries=get_entry_nodes(nodes=nodes, edges=edges),
+        executions=subgraph_executions,
+        nodes=nodes,
+        load_output=load_external_output,
+        node_executor=node_executor,
+    )
 
 
 class SingleNodeRunner:
@@ -259,71 +352,13 @@ class SingleNodeRunner:
         self._run(self.node_id)
 
     def run_downstream(self):
-        # building adjacency lists
-        down: dict[str, list[str]] = {}
-        up: dict[str, list[str]] = {}
-        for e in self.__dag.edges:
-            down.setdefault(e.node_from, []).append(e.node_to)
-            up.setdefault(e.node_to, []).append(e.node_from)
-
-        down_closure = {self.node_id}
-
-        stack = list(down.get(self.node_id, []))
-
-        while stack:
-            n = stack.pop()
-
-            if n in down_closure:
-                continue
-
-            down_closure.add(n)
-            stack.extend(down.get(n, []))
-
-        R = set(down_closure)
-
-        if self.force_upstream:
-            cached = {
-                n.id for n in self.__dag.nodes
-                if self.load_output(n.id) is not None
-            }
-
-            # expand with uncached upstream
-            q = list(down_closure)
-            while q:
-                r = q.pop()
-                for u in up.get(r, []):
-                    if u in cached or u in R:
-                        continue
-                    R.add(u)
-                    q.append(u)
-
-        # Build the induced subgraph over R.
-        nodes_R = [
-            n for n in self.__dag.nodes if n.id in R
-        ]
-        edges_R = [
-            e for e in self.__dag.edges if e.node_from in R and e.node_to in R
-        ]
-
-        # Keep all executions whose destination is in R so inputs for nodes in R
-        # can still be hydrated, including lateral dependencies resolved from cache
-        # outside the induced execution subgraph.
-        executions_R = [
-            ex for ex in self._executions
-            if ex.edge.node_to in R
-        ]
-
-        def _load_output_wrapped(node_id: str) -> Optional[Output]:
-            if node_id in R:
-                return None
-            return self.load_output(node_id)
-
-        _execute(
-            out_dir=self.__dag.out_dir,
-            entries=get_entry_nodes(nodes=nodes_R, edges=edges_R),
-            executions=executions_R,
-            nodes=nodes_R,
-            load_output=_load_output_wrapped,
+        _execute_subgraph(
+            dag=self.__dag,
+            executions=self._executions,
+            target_ids={self.node_id},
+            downstream=True,
+            force_upstream=self.force_upstream,
+            load_output=self.load_output,
             node_executor=self.node_executor,
         )
 
@@ -587,3 +622,41 @@ class DAGRunner:
                 ),
                 node_executor=node_executor,
             ).run_downstream()
+
+    def run_group(
+        self,
+        group_id: str,
+        *,
+        downstream: bool = False,
+        force_upstream: bool = False,
+    ):
+        """
+        Re-execute all nodes in an injected node group.
+
+        External inputs are loaded from cache unless ``force_upstream`` is
+        enabled, in which case missing prerequisites are executed recursively.
+        When ``downstream`` is enabled, all nodes reachable from any node in
+        the group are re-executed as well.
+        """
+        group = self.__dag.node_groups.get(group_id)
+        if group is None:
+            raise ValueError(
+                f'Unknown node group {group_id!r}. '
+                f'Available: {sorted(self.__dag.node_groups)}'
+            )
+
+        with ProcessNodeExecutor(
+            max_cuda_nodes=self.max_cuda_nodes
+        ) as node_executor:
+            _execute_subgraph(
+                dag=self.__dag,
+                executions=self._executions,
+                target_ids={node.id for node in group.nodes},
+                downstream=downstream,
+                force_upstream=force_upstream,
+                load_output=lambda node_id: load_latest_output(
+                    out_dir=self.__dag.out_dir,
+                    node_id=node_id,
+                ),
+                node_executor=node_executor,
+            )

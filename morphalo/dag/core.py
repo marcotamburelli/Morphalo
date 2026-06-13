@@ -137,6 +137,11 @@ class GraphScope:
     - ``NodeGroup`` instances act as composable subgraphs and are not registered.
     - Node identifiers generated inside a scope are automatically qualified by
       the active scope path to prevent collisions.
+
+    Attributes
+    ----------
+    node_groups : dict[str, NodeGroup]
+        Injected child groups keyed by their scope-qualified identifiers.
     """
 
     def __init__(self, name: str):
@@ -144,6 +149,7 @@ class GraphScope:
         self.name = name
         self.nodes: List['NodeRef'] = []
         self.edges: List['Edge'] = []
+        self.node_groups: Dict[str, 'NodeGroup'] = {}
         self._id_counter = 0
 
     def next_id(self, prefix: str) -> str:
@@ -198,6 +204,17 @@ class GraphScope:
             The directed edge to register.
         """
         self.edges.append(edge)
+
+    def add_node_group(self, group: 'NodeGroup') -> None:
+        """
+        Register an injected node group by its scope-qualified identifier.
+        """
+        existing = self.node_groups.get(group.id)
+        if existing is not None and existing is not group:
+            raise RuntimeError(
+                f'Node group id collision {group.id!r} in parent scope'
+            )
+        self.node_groups[group.id] = group
 
 
 class DAG(GraphScope):
@@ -377,10 +394,17 @@ class NodeGroup(GraphScope):
     -----
     Ports are intentionally thin and do not introduce a separate abstraction
     layer. They are just named references to entry nodes.
+
+    Attributes
+    ----------
+    id : str
+        Scope-qualified group identifier, such as ``outer.inner``.
     """
 
     def __init__(self, name: str):
         super().__init__(name)
+        self.id = _DagContext.prefix() + name
+        validate_dotted_identifier(self.id, kind='Node group id')
         self._ports: Dict[str, PortRef] = {}
         self._injected: bool = False
         self._injected_into: Optional[int] = None
@@ -479,6 +503,10 @@ class NodeGroup(GraphScope):
 
         for e in self.edges:
             parent.add_edge(e)
+
+        parent.add_node_group(self)
+        for group in self.node_groups.values():
+            parent.add_node_group(group)
 
         self._injected = True
         self._injected_into = id(parent)

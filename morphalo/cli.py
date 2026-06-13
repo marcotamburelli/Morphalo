@@ -42,15 +42,20 @@ def run_dags(
         '--node',
         help='Execute only this node id (requires cached upstream outputs)'
     ),
+    group: Optional[str] = typer.Option(
+        None,
+        '--group',
+        help='Execute all nodes in this injected node group'
+    ),
     downstream: bool = typer.Option(
         False,
         '--downstream',
-        help='When used with --node, execute the node and all nodes reachable downstream'
+        help='With --node or --group, also execute all reachable downstream nodes'
     ),
     force_upstream: bool = typer.Option(
         False,
         '--force-upstream',
-        help='When used with --node, execute missing upstream nodes to materialize inputs'
+        help='With --node or --group, execute missing upstream nodes'
     ),
     cuda_chunk_size: int = typer.Option(
         8,
@@ -73,8 +78,8 @@ def run_dags(
     Execution modes
     ---------------
     Full DAG execution (default)
-        If neither ``--node`` nor ``--dag`` are specified, all DAGs declared in
-        the module are executed in definition order via :meth:`DAGRunner.run`.
+        If neither ``--node`` nor ``--group`` are specified, the selected DAGs
+        are executed in definition order via :meth:`DAGRunner.run`.
 
     Single DAG execution
         If ``--dag <name>`` is provided, only the matching DAG is executed.
@@ -89,12 +94,20 @@ def run_dags(
         - If ``--force-upstream`` is set, missing upstream nodes are executed
           recursively (make-like behavior) to materialize required inputs.
 
-    Downstream re-execution
-        If ``--node`` and ``--downstream`` are both specified, the runner
-        re-executes the downstream subgraph rooted at the given node via
-        :meth:`DAGRunner.run_node_downstream`.
+    Node group execution
+        If ``--group <id>`` is provided, every node belonging to the injected
+        group is re-executed via :meth:`DAGRunner.run_group`.
 
-        - The downstream closure of the node is computed.
+        - Inputs from outside the group are loaded from cached outputs.
+        - If ``--force-upstream`` is set, missing external prerequisites are
+          executed recursively.
+        - Nested groups can be selected by qualified id, e.g. ``outer.inner``.
+
+    Downstream re-execution
+        If ``--downstream`` is combined with ``--node`` or ``--group``, the
+        selected target and all reachable downstream nodes are re-executed.
+
+        - The downstream closure of the selected node or group is computed.
         - If ``--force-upstream`` is not set, lateral dependencies outside
           the closure must already be cached on disk.
         - If ``--force-upstream`` is set, uncached upstream dependencies of
@@ -107,16 +120,17 @@ def run_dags(
         (e.g. ``dags.demo_depth_cn``).
     dag : str, optional
         Name of a specific DAG to execute. If multiple DAGs are defined in
-        the module and ``--node`` is used, this option is required to avoid
-        ambiguity.
+        the module and ``--node`` or ``--group`` is used, this option is
+        required to avoid ambiguity.
     node : str, optional
         Identifier of a specific node to execute instead of the full DAG.
+    group : str, optional
+        Qualified identifier of an injected node group to re-execute.
     downstream : bool, optional
-        When used together with ``--node``, execute the node and all nodes
-        reachable downstream from it.
+        Execute all nodes reachable downstream from the selected node or group.
     force_upstream : bool, optional
-        When used with ``--node`` (and optionally ``--downstream``), execute
-        missing upstream nodes recursively to materialize required inputs.
+        Execute missing upstream nodes recursively for the selected node or
+        group.
     cuda_chunk_size : int, optional
         Maximum number of CUDA node executions per worker process. The worker
         restart destroys the current CUDA context before the next chunk, as a
@@ -127,8 +141,9 @@ def run_dags(
     ------
     typer.BadParameter
         If no DAGs are registered in the imported module, if a specified DAG
-        does not exist, if ``--node`` is ambiguous across multiple DAGs, or
-        if ``--downstream`` is used without ``--node``.
+        does not exist, if a partial target is ambiguous across multiple DAGs,
+        if ``--node`` and ``--group`` are combined, or if ``--downstream`` is
+        used without a partial target.
 
     Notes
     -----
@@ -149,16 +164,24 @@ def run_dags(
         raise typer.BadParameter(
             f'No DAGs registered while importing module: {module!r}')
 
-    # If node is requested and multiple DAGs exist, require --dag to avoid ambiguity
-    if node is not None and dag is None and len(dags) > 1:
-        available = [d.name for d in dags]
+    if node is not None and group is not None:
         raise typer.BadParameter(
-            f'--node requires --dag when multiple DAGs are present. Available: {available}'
+            '--node and --group are mutually exclusive'
         )
 
-    if downstream and node is None:
+    partial_target = node is not None or group is not None
+
+    # Partial targets are ambiguous when a module registers multiple DAGs.
+    if partial_target and dag is None and len(dags) > 1:
+        available = [d.name for d in dags]
         raise typer.BadParameter(
-            '--downstream can only be used together with --node'
+            '--node/--group requires --dag when multiple DAGs are present. '
+            f'Available: {available}'
+        )
+
+    if downstream and not partial_target:
+        raise typer.BadParameter(
+            '--downstream can only be used with --node or --group'
         )
 
     if dag is not None:
@@ -177,6 +200,12 @@ def run_dags(
                 runner.run_node_downstream(node, force_upstream=force_upstream)
             else:
                 runner.run_node(node, force_upstream=force_upstream)
+        elif group is not None:
+            runner.run_group(
+                group,
+                downstream=downstream,
+                force_upstream=force_upstream,
+            )
         else:
             runner.run()
 

@@ -232,7 +232,7 @@ def test_execute_load_output_unblocks_pending_node(tmp_path):
     assert c.outputs[-1]['value'] == 42
 
 
-def test_execute_stuck_hits_debug_limit_when_inputs_never_resolve(tmp_path):
+def test_execute_stuck_fails_immediately_with_missing_input_details(tmp_path):
     """
     Scenario
     --------
@@ -243,12 +243,13 @@ def test_execute_stuck_hits_debug_limit_when_inputs_never_resolve(tmp_path):
     --------------
     A -> C(default)
 
-    Node A is missing and load_output always returns None, so C stays pending.
-    The engine keeps iterating until it reaches debug_limit and raises.
+    Node A is missing and load_output always returns None, so C cannot make
+    progress.
 
     Assertions
     ----------
-    - _execute raises DagValidationError with 'Potential loop detected'
+    - _execute raises DagValidationError immediately
+    - the error identifies the blocked node, upstream node, and input id
     """
     with DAG('stuck', out_dir=tmp_path) as dag:
         c = PassNode(name='C')
@@ -260,7 +261,13 @@ def test_execute_stuck_hits_debug_limit_when_inputs_never_resolve(tmp_path):
     def loader(_node_id: str) -> None:
         return None
 
-    with pytest.raises(DagValidationError, match='Potential loop detected'):
+    with pytest.raises(
+        DagValidationError,
+        match=(
+            "Execution stalled because no node can make progress[\\s\\S]*"
+            "'C' requires 'A' on input 'default'"
+        ),
+    ):
         _execute(
             out_dir=str(tmp_path),
             entries=entries,
