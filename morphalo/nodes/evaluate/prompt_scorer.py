@@ -1,11 +1,12 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import StableDiffusionXLPipeline
 from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
@@ -21,6 +22,9 @@ from morphalo.nodes.evaluate.img_wiring_mixin import ImgBundle, ImgWiringMixin
 from morphalo.nodes.sdxl_resolve import ResolvedModelRef, resolve_model_ref
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
+
+if TYPE_CHECKING:
+    from diffusers import StableDiffusionXLPipeline
 
 
 @dataclass

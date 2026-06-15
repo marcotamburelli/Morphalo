@@ -3,8 +3,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
-from diffusers import (StableDiffusionXLControlNetInpaintPipeline,
-                       StableDiffusionXLInpaintPipeline)
 from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
@@ -339,6 +337,9 @@ class Inpaint(CudaPostRunMixin, ControlNetMixin, PromptMixin, NodeRef):
         )
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        from diffusers import (StableDiffusionXLControlNetInpaintPipeline,
+                               StableDiffusionXLInpaintPipeline)
+
         setup_env()
         ctx = resolve_common(self.spec)
 

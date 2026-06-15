@@ -3,8 +3,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
-                       StableDiffusionXLImg2ImgPipeline)
 from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
@@ -237,6 +235,9 @@ class Img2Img(CudaPostRunMixin, ControlNetMixin, PromptMixin, NodeRef):
         return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
+                               StableDiffusionXLImg2ImgPipeline)
+
         # HF env
         setup_env()
 

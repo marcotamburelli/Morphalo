@@ -1,12 +1,16 @@
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from __future__ import annotations
 
-from diffusers import T2IAdapter
-from diffusers.models import MultiAdapter
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
 from PIL import Image
 
 from morphalo.cache.models import get_t2i_adapter
 from morphalo.dag import AttachmentSink, NodeRef
+
+if TYPE_CHECKING:
+    from diffusers import T2IAdapter
+    from diffusers.models import MultiAdapter
 
 
 @dataclass
@@ -114,6 +118,8 @@ class T2IAdapterBundle:
 
     @property
     def adapter_model_arg(self) -> Union[T2IAdapter, MultiAdapter]:
+        from diffusers.models import MultiAdapter
+
         return MultiAdapter(self._models) if len(self._models) > 1 else self._models[0]
 
     @property

@@ -5,19 +5,22 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
-from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
-                       OmniGenPipeline, QwenImageControlNetInpaintPipeline,
-                       QwenImageControlNetModel, QwenImageEditPipeline,
-                       StableDiffusionXLPipeline, T2IAdapter)
-from insightface.app import FaceAnalysis
-from transformers import (CLIPVisionModelWithProjection, DPTForDepthEstimation,
-                          DPTImageProcessor, pipeline)
-from ultralytics import YOLO as YOLOModel
 
 from morphalo.cache import CacheKey, ModelCache
 
 if TYPE_CHECKING:
+    from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
+                           OmniGenPipeline,
+                           QwenImageControlNetInpaintPipeline,
+                           QwenImageControlNetModel, QwenImageEditPipeline,
+                           QwenImageEditPlusPipeline,
+                           StableDiffusionXLPipeline, T2IAdapter)
+    from insightface.app import FaceAnalysis
     from morphalo.nodes.sdxl_resolve import ResolvedModelRef
+    from transformers import (CLIPVisionModelWithProjection,
+                              DPTForDepthEstimation, DPTImageProcessor)
+    from transformers.pipelines.base import Pipeline
+    from ultralytics import YOLO as YOLOModel
 
 
 def dtype_key(dtype: torch.dtype) -> str:
@@ -32,6 +35,7 @@ def get_sdxl_base_pipe(
     dtype: torch.dtype,
     vae_id: Optional[str] = None,
 ) -> StableDiffusionXLPipeline:
+    from diffusers import StableDiffusionXLPipeline
 
     # include vae_id in the cache key to avoid mismatches
     extra = f'vae={vae_id}' if vae_id else 'vae=<default>'
@@ -79,6 +83,8 @@ def get_sdxl_base_pipe(
 
 
 def get_controlnet(*, model_id: str, device: str, dtype: torch.dtype) -> ControlNetModel:
+    from diffusers import ControlNetModel
+
     key = CacheKey(
         kind='controlnet',
         ref=model_id,
@@ -99,6 +105,8 @@ def get_controlnet(*, model_id: str, device: str, dtype: torch.dtype) -> Control
 
 
 def get_vae(*, vae_id: str, device: str, dtype: torch.dtype) -> AutoencoderKL:
+    from diffusers import AutoencoderKL
+
     key = CacheKey(
         kind='vae',
         ref=vae_id,
@@ -119,6 +127,8 @@ def get_vae(*, vae_id: str, device: str, dtype: torch.dtype) -> AutoencoderKL:
 
 
 def get_depth_estimator(*, model_id: str, device: str) -> Tuple[DPTImageProcessor, DPTForDepthEstimation]:
+    from transformers import DPTForDepthEstimation, DPTImageProcessor
+
     proc_key = CacheKey(
         kind='depth_processor',
         ref=model_id,
@@ -154,6 +164,8 @@ def get_ip_image_encoder(
     device: str,
     dtype: torch.dtype
 ) -> CLIPVisionModelWithProjection:
+    from transformers import CLIPVisionModelWithProjection
+
     key = CacheKey(
         kind='ip_image_encoder',
         ref=f'{repo_id}:{subfolder}',
@@ -179,7 +191,9 @@ def get_translator(
     source_lang: str,
     target_lang: str,
     device: str
-) -> pipeline:
+) -> Pipeline:
+    from transformers import pipeline
+
     key = CacheKey(
         kind='translator',
         ref=f'{model_id}:{source_lang}:{target_lang}',
@@ -202,6 +216,8 @@ def get_translator(
 
 
 def get_t2i_adapter(*, model_id: str, device: str, dtype: torch.dtype) -> T2IAdapter:
+    from diffusers import T2IAdapter
+
     key = CacheKey(
         kind='t2i_adapter',
         ref=model_id,
@@ -248,6 +264,8 @@ def get_controlnet_aux_annotator(
 
 
 def get_omnigen(*, model_id: str, device: str, dtype: torch.dtype) -> OmniGenPipeline:
+    from diffusers import OmniGenPipeline
+
     key = CacheKey(
         kind='omnigen',
         ref=model_id,
@@ -315,6 +333,8 @@ def get_qwen_image(
     DiffusionPipeline
         Cached pipeline instance.
     """
+    from diffusers import DiffusionPipeline
+
     key = CacheKey(
         kind='qwen_image',
         ref=model_id,
@@ -360,6 +380,8 @@ def get_qwen_image_edit_pipe(
     """
     Load and cache a Qwen-Image-Edit Diffusers pipeline.
     """
+    from diffusers import QwenImageEditPipeline
+
     key = CacheKey(
         kind='qwen_image_edit',
         ref=model_id,
@@ -421,6 +443,8 @@ def get_qwen_image_inpaint_controlnet(
     object
         Cached ``QwenImageControlNetModel`` instance.
     """
+    from diffusers import QwenImageControlNetModel
+
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
     key = CacheKey(
@@ -488,6 +512,8 @@ def get_qwen_image_inpaint_pipe(
     object
         Cached ``QwenImageControlNetInpaintPipeline`` instance.
     """
+    from diffusers import QwenImageControlNetInpaintPipeline
+
     controlnet_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     key = CacheKey(
@@ -526,7 +552,7 @@ def evict_qwen_image_inpaint_pipe(
     controlnet_model_id: str,
     dtype: torch.dtype,
     device_map: str = 'balanced',
-) -> Any:
+) -> QwenImageControlNetInpaintPipeline:
     """
     Evict a cached Qwen image inpainting pipeline.
     """
@@ -547,7 +573,7 @@ def get_qwen_image_edit_plus_pipe(
     model_id: str,
     dtype: torch.dtype,
     device_map: str = 'balanced',
-) -> Any:
+) -> QwenImageEditPlusPipeline:
     """
     Load and cache a Qwen Image Edit Plus Diffusers pipeline.
 
@@ -593,7 +619,7 @@ def evict_qwen_image_edit_plus_pipe(
     model_id: str,
     dtype: torch.dtype,
     device_map: str = 'balanced',
-) -> Any:
+) -> QwenImageEditPlusPipeline:
     key = CacheKey(
         kind='qwen_image_edit_plus',
         ref=model_id,
@@ -605,6 +631,7 @@ def evict_qwen_image_edit_plus_pipe(
 
 
 def get_yolo(*, model_name: str, device: str) -> YOLOModel:
+    from ultralytics import YOLO as YOLOModel
 
     key = CacheKey(
         kind='yolo',
@@ -699,6 +726,8 @@ def get_insightface(
     det_size: Tuple[int, int],
     device: str,
 ) -> FaceAnalysis:
+    from insightface.app import FaceAnalysis
+
     key = CacheKey(
         kind='insightface',
         ref=f'{model_name}:{int(det_size[0])}x{int(det_size[1])}',

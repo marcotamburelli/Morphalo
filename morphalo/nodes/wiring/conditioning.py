@@ -1,14 +1,23 @@
-from typing import List, Optional, Sequence, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
 
 import torch
-from diffusers import DiffusionPipeline
-from diffusers.loaders import IPAdapterMixin, StableDiffusionXLLoraLoaderMixin
 from PIL import Image
 
 from morphalo.nodes.wiring.face_id import FaceIdBundle
 from morphalo.nodes.wiring.ip_adapter import IpAdapterBundle
 
-SDXLPipeline = DiffusionPipeline | IPAdapterMixin | StableDiffusionXLLoraLoaderMixin
+if TYPE_CHECKING:
+    from diffusers import DiffusionPipeline
+    from diffusers.loaders import (IPAdapterMixin,
+                                   StableDiffusionXLLoraLoaderMixin)
+
+    SDXLPipeline = (
+        DiffusionPipeline | IPAdapterMixin | StableDiffusionXLLoraLoaderMixin
+    )
+else:
+    SDXLPipeline = Any
 
 
 def _as_image_list(x: Union[Image.Image, Sequence[Image.Image]]) -> List[Image.Image]:

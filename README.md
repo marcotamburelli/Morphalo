@@ -817,8 +817,8 @@ python -m morphalo.cli run-dags my_dags.some_pipeline \
 ```
 
 `--cuda-chunk-size` must be greater than zero. CPU nodes may continue in the
-current worker after the threshold is reached; the restart occurs immediately
-before the next CUDA node.
+current worker after the threshold is reached; worker recycling is initiated
+before the next CUDA node, with the cooldowns described below.
 
 This mechanism limits the lifetime of a CUDA context. It was introduced as a
 defensive mitigation for severe driver/GSP-level instability observed after
@@ -827,26 +827,34 @@ not an out-of-memory recovery mechanism and does not prove that a long-lived
 context is the underlying cause.
 
 Before a worker is replaced, the runner waits for the previous process to exit.
-CUDA-aware nodes also synchronize pending CUDA work in their post-run lifecycle
-before cleanup or eviction.
+CUDA-aware nodes also complete pending GPU work before resources are cleaned up
+or the worker is replaced.
+
+> **Note:** Worker recycling includes a short pause around process replacement
+> so GPU teardown and the next model load do not happen back-to-back. `Ctrl+C`
+> also performs an orderly stop: Morphalo waits for the node currently being
+> executed to finish before closing its worker. The interruption may therefore
+> not be immediate, but avoids abandoning active GPU work in an uncertain state.
 
 ### Worker-process contract
 
-Because jobs cross a multiprocessing boundary:
+Before each node is executed, Morphalo transfers the node and its resolved inputs
+to the worker process. The worker performs the operation, completes any required
+resource cleanup, and returns the resulting output to the DAG runner.
 
-- node objects and their input maps must be picklable;
-- node outputs must be serializable dictionaries;
-- custom node classes should be defined at module scope and remain importable by
-  a spawned Python process;
-- `run()` and `post_run()` execute inside the worker;
-- mutations made to a node instance during execution are not reflected in the
-  original object held by the parent process;
-- models, adapters, handles, and other runtime resources should normally be
-  created lazily inside `run()` or through process-local caches.
+Because execution crosses a process boundary, custom nodes and their inputs must
+be transferable between processes, and outputs must use serializable dictionary
+structures. Runtime changes made inside the worker are local to that process and
+do not update the original node object held by the DAG runner.
 
 The worker process owns its CUDA context and model caches. Restarting it also
 discards those process-local resources, trading some cache reuse for a shorter
 CUDA context lifetime.
+
+> **Note:** GPU models and their supporting libraries are loaded only when needed
+> inside the worker. This keeps CUDA activity out of the parent process and
+> preserves a clear ownership boundary: the DAG runner orchestrates execution,
+> while the worker owns GPU resources.
 
 ## Artifact Model (Caching & Checkpointing)
 

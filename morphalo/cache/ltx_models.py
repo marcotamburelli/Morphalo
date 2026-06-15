@@ -1,15 +1,21 @@
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
 
 import torch
-from diffusers import LTXLatentUpsamplePipeline
-from diffusers.hooks import apply_group_offloading
 
 from morphalo.cache import CacheKey, ModelCache
 from morphalo.cache.models import dtype_key
-from third_party.lightricks import LTXConditionPipeline
+
+if TYPE_CHECKING:
+    from diffusers import LTXLatentUpsamplePipeline
+    from third_party.lightricks import LTXConditionPipeline
 
 
 def get_ltx_condition(*, model_id: str, device: str, dtype: torch.dtype) -> LTXConditionPipeline:
+    from diffusers.hooks import apply_group_offloading
+    from third_party.lightricks import LTXConditionPipeline
+
     key = CacheKey(
         kind='ltx_condition',
         ref=model_id,
@@ -73,6 +79,8 @@ def get_ltx_latent_upsample(
         device: str,
         dtype: torch.dtype
 ) -> LTXLatentUpsamplePipeline:
+    from diffusers import LTXLatentUpsamplePipeline
+
     key = CacheKey(
         kind='ltx_latent_upsample',
         ref=f'{upscaler_id}:{model_id}',

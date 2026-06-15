@@ -1376,7 +1376,7 @@ class ImageStack(NodeRef):
             This parameter has no effect when the layer already contains
             transparency (e.g. segmentation masks).
 
-                    alpha : float, optional
+        alpha : float, optional
             Global opacity multiplier applied to the layer before compositing.
 
             The value must be in the ``[0.0, 1.0]`` range:

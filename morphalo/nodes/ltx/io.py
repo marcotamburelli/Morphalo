@@ -2,7 +2,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from diffusers.utils import export_to_video
 
 from morphalo.core.paths import make_node_output_path
 from morphalo.nodes.common.io import write_json_sidecar
@@ -17,6 +16,8 @@ def save_video(
     video_out: torch.Tensor,
     fps: int
 ) -> Path:
+    from diffusers.utils import export_to_video
+
     video_path = make_node_output_path(
         out_dir=out_dir,
         node_id=node_id,

@@ -1,15 +1,21 @@
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from diffusers.utils import export_to_video, load_image, load_video
 
 from morphalo.nodes.ltx.video_utils import read_video_tensor
 from morphalo.nodes.ltx.wiring.ic_lora import ICLoRaBundle
-from third_party.lightricks import LTXConditionPipeline, LTXVideoCondition
+
+if TYPE_CHECKING:
+    from third_party.lightricks import (LTXConditionPipeline,
+                                       LTXVideoCondition)
 
 
 def apply_ic_lora(ic_lora_bundle: ICLoRaBundle, pipe: LTXConditionPipeline, device: str) -> Optional[torch.Tensor]:
+    from diffusers.utils import load_video
+
     if ic_lora_bundle.has_has_ic_lora:
         pipe.load_lora_weights(
             ic_lora_bundle.model_id,
@@ -30,6 +36,9 @@ def apply_ic_lora(ic_lora_bundle: ICLoRaBundle, pipe: LTXConditionPipeline, devi
 
 
 def build_image_condition(*, image_path: str, frame_index: int) -> LTXVideoCondition:
+    from diffusers.utils import export_to_video, load_image, load_video
+    from third_party.lightricks import LTXVideoCondition
+
     """
     Build an LTX one-frame video condition from a single image.
 

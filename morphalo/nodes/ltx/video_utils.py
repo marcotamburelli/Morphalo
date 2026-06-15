@@ -1,11 +1,14 @@
-from typing import List, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Tuple
 
 import cv2
 import PIL.Image
 import torch
 from torchvision import transforms
 
-from third_party.lightricks import LTXConditionPipeline
+if TYPE_CHECKING:
+    from third_party.lightricks import LTXConditionPipeline
 
 
 def read_video_info(cap: cv2.VideoCapture):

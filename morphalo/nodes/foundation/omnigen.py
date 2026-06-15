@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
-from diffusers.utils import load_image
 
 from morphalo.cache.models import evict_omnigen, get_omnigen
 from morphalo.dag import NodeRef
@@ -203,6 +202,8 @@ class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
         return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        from diffusers.utils import load_image
+
         # --- HF env ---
         setup_env()
 

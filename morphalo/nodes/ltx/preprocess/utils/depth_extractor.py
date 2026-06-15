@@ -1,13 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
-from transformers import DPTForDepthEstimation, DPTImageProcessor
 
 from morphalo.cache import CacheKey, ModelCache
 from morphalo.nodes.ltx.preprocess.utils.drawing_utils import resize_long_side
+
+if TYPE_CHECKING:
+    from transformers import DPTForDepthEstimation, DPTImageProcessor
 
 
 @dataclass
@@ -44,6 +48,8 @@ class DepthVideoExtractor:
     _ema_hi: Optional[float] = field(default=None, init=False, repr=False)
 
     def _lazy_load(self) -> None:
+        from transformers import DPTForDepthEstimation, DPTImageProcessor
+
         if self._processor is not None and self._model is not None:
             return
 

@@ -1,14 +1,17 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
-from diffusers.image_processor import IPAdapterMaskProcessor
 from PIL import Image
-from transformers import CLIPVisionModelWithProjection
 
 from morphalo.cache.models import get_ip_image_encoder
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.wiring.utils import infer_image_encoder_subfolder
+
+if TYPE_CHECKING:
+    from transformers import CLIPVisionModelWithProjection
 
 IpAdapterScale = Union[
     float,
@@ -590,6 +593,8 @@ class IpAdapterBundle:
         Output: List[tensor], one per adapter slot.
         Each tensor has shape: (1, num_images_for_that_adapter, H, W)
         """
+        from diffusers.image_processor import IPAdapterMaskProcessor
+
         processor = IPAdapterMaskProcessor()
         out: List[torch.Tensor] = []
 

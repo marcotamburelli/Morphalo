@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import signal
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -42,6 +45,22 @@ class FileTracingNode(NodeRef):
     def post_run(self) -> None:
         with Path(self.trace_path).open('a', encoding='utf-8') as trace:
             trace.write(f'post_run,{self.id},{os.getpid()}\n')
+
+
+@dataclass
+class SlowFileTracingNode(FileTracingNode):
+    delay: float = 0.5
+
+    def run(
+        self,
+        output_dir,
+        input: Dict[str, Dict] = None,
+    ) -> Dict[str, Any]:
+        with Path(self.trace_path).open('a', encoding='utf-8') as trace:
+            trace.write(f'run,{self.id},{os.getpid()}\n')
+
+        time.sleep(self.delay)
+        return {'node_id': self.id, 'pid': os.getpid()}
 
 
 def _run_pids(trace_path: Path) -> dict[str, int]:
@@ -115,6 +134,64 @@ def test_runs_post_run_in_worker_and_closes_after_failure(tmp_path):
     events = trace_path.read_text(encoding='utf-8').splitlines()
     assert any(line.startswith('run,failing,') for line in events)
     assert not any(line.startswith('post_run,failing,') for line in events)
+
+
+def test_keyboard_interrupt_waits_for_worker_teardown(tmp_path):
+    trace_path = tmp_path / 'trace.csv'
+
+    with DAG('process_interrupt', out_dir=tmp_path):
+        node = SlowFileTracingNode(
+            name='slow',
+            trace_path=str(trace_path),
+        )
+
+    def interrupt_when_started() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if trace_path.exists():
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.1)
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            time.sleep(0.01)
+
+    interrupter = threading.Thread(target=interrupt_when_started)
+    interrupter.start()
+
+    executor = ProcessNodeExecutor()
+    with pytest.raises(KeyboardInterrupt):
+        with executor:
+            executor.run(
+                node=node,
+                out_dir=str(tmp_path),
+                input_map={},
+            )
+
+    interrupter.join(timeout=10)
+    assert not interrupter.is_alive()
+    assert executor._process is None
+
+    events = trace_path.read_text(encoding='utf-8').splitlines()
+    assert any(line.startswith('run,slow,') for line in events)
+    assert any(line.startswith('post_run,slow,') for line in events)
+
+
+def test_context_exit_uses_safe_shutdown_for_keyboard_interrupt(monkeypatch):
+    executor = ProcessNodeExecutor()
+    close_calls = []
+
+    monkeypatch.setattr(
+        executor,
+        'close',
+        lambda **kwargs: close_calls.append(kwargs),
+    )
+
+    executor.__exit__(KeyboardInterrupt, KeyboardInterrupt(), None)
+
+    assert close_calls == [{
+        'graceful_timeout': None,
+        'terminate': False,
+    }]
 
 
 def test_dag_runner_dispatches_nodes_to_process_executor(tmp_path):

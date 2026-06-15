@@ -3,9 +3,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
-from diffusers import (StableDiffusionXLAdapterPipeline,
-                       StableDiffusionXLControlNetPipeline,
-                       StableDiffusionXLPipeline)
 from PIL import Image
 
 from morphalo.cache.models import get_sdxl_base_pipe
@@ -382,6 +379,10 @@ class Txt2Img(
         return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        from diffusers import (StableDiffusionXLAdapterPipeline,
+                               StableDiffusionXLControlNetPipeline,
+                               StableDiffusionXLPipeline)
+
         # --- Hugging Face env (must be set before loading) ---
         # HF env
         setup_env()

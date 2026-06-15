@@ -1,11 +1,15 @@
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from __future__ import annotations
 
-from diffusers import ControlNetModel
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
 from PIL import Image
 
 from morphalo.cache.models import get_controlnet
 from morphalo.dag import AttachmentSink, NodeRef
+
+if TYPE_CHECKING:
+    from diffusers import ControlNetModel
 
 
 @dataclass

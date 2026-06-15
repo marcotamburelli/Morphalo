@@ -1,17 +1,20 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from diffusers.image_processor import IPAdapterMaskProcessor
 from PIL import Image
-from transformers import CLIPVisionModelWithProjection
 
 from morphalo.cache.models import get_ip_image_encoder
 from morphalo.dag import NodeRef
 from morphalo.dag.core import AttachmentSink
 from morphalo.nodes.common.io import load_faceid_embeds
 from morphalo.nodes.wiring.utils import infer_image_encoder_subfolder
+
+if TYPE_CHECKING:
+    from transformers import CLIPVisionModelWithProjection
 
 # For FaceID, scale behaves like IP-Adapter scale:
 # float | List[float] | per-block dict (kept for future parity).
@@ -718,6 +721,8 @@ class FaceIdBundle:
         list[torch.Tensor]
             Mask tensors aligned 1:1 with ``self._specs``.
         """
+        from diffusers.image_processor import IPAdapterMaskProcessor
+
         processor = IPAdapterMaskProcessor()
         out: List[torch.Tensor] = []
 
