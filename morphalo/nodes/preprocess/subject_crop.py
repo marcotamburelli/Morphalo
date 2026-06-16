@@ -1025,8 +1025,11 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         Crop metadata useful for reinsertion/compositing:
 
         ``anchor_xy`` : list[int]
-            Center of the effective crop box in absolute source-image
-            coordinates.
+            Local anchor inside the output crop image.
+
+        ``position`` : list[int]
+            Source-image position where ``anchor_xy`` should be placed when
+            reconstructing the original geometry.
 
         ``bbox_size`` : list[int]
             Width and height of the effective crop box in pixels.
@@ -1612,7 +1615,11 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 'min_landmark_fraction': cfg.min_landmark_fraction,
             },
             'crop': {
-                'anchor_xy': [anchor_x, anchor_y],
+                'anchor_xy': [
+                    int(anchor_x - out_x1),
+                    int(anchor_y - out_y1),
+                ],
+                'position': [anchor_x, anchor_y],
                 'bbox_size': [b_width, b_height],
                 'bbox_xyxy': [int(out_x1), int(out_y1), int(out_x2), int(out_y2)],
             }

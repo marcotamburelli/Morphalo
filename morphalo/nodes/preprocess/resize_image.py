@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 from PIL import Image
 
 from morphalo.core.paths import make_node_output_path
-from morphalo.dag import NodeRef
+from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
@@ -17,7 +17,7 @@ ResizeSize = tuple[Optional[SizeExpr], Optional[SizeExpr]]
 
 @dataclass
 class Config:
-    size: ResizeSize
+    size: Optional[ResizeSize]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -25,25 +25,84 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     size_value = params.get('size')
     if size_value is None:
-        raise ValueError(f"'{node_id}': missing params.size")
+        return Config(size=None)
 
-    if not isinstance(size_value, (list, tuple)):
+    return Config(size=_read_size_value(size_value, node_id=node_id, name='params.size'))
+
+
+def _read_size_value(value: Any, *, node_id: str, name: str) -> ResizeSize:
+    """
+    Validate a two-axis resize size expression.
+
+    ``ResizeImage`` accepts the same shape from either ``params.size`` or
+    transform metadata ``bbox_size``. Keeping the validation in one helper makes
+    both sources behave identically.
+    """
+    if not isinstance(value, (list, tuple)):
         raise TypeError(
-            f"'{node_id}': params.size must be a list or tuple, "
-            f'got {type(size_value).__name__}'
+            f"'{node_id}': {name} must be a list or tuple, "
+            f'got {type(value).__name__}'
         )
 
-    if len(size_value) != 2:
+    if len(value) != 2:
         raise ValueError(
-            f"'{node_id}': params.size must contain exactly 2 values, "
-            f'got {len(size_value)}'
+            f"'{node_id}': {name} must contain exactly 2 values, "
+            f'got {len(value)}'
         )
 
-    width_expr, height_expr = size_value
+    width_expr, height_expr = value
     if width_expr is None and height_expr is None:
-        raise ValueError(f"'{node_id}': params.size cannot be [None, None]")
+        raise ValueError(f"'{node_id}': {name} cannot be [None, None]")
 
-    return Config(size=(width_expr, height_expr))
+    return (width_expr, height_expr)
+
+
+def _size_from_transform(
+    transform: Optional[Dict[str, Any]],
+    *,
+    node_id: str,
+) -> Optional[ResizeSize]:
+    """
+    Extract an optional resize size from crop or placement transform metadata.
+
+    The accepted metadata contract mirrors ``ImageStack.transform()``: the
+    upstream node may provide exactly one of ``crop`` or ``placement``. If the
+    chosen block contains ``bbox_size``, that value overrides ``params.size``.
+    If no transform or no ``bbox_size`` is provided, the caller falls back to
+    the configured size.
+    """
+    if not transform:
+        return None
+
+    present = [
+        name for name in ('crop', 'placement')
+        if transform.get(name) is not None
+    ]
+    if len(present) > 1:
+        raise ValueError(
+            f"{node_id}: transform contains both crop and placement metadata; "
+            'expected only one.'
+        )
+    if not present:
+        return None
+
+    transform_name = present[0]
+    transform_prop = transform[transform_name]
+    if not isinstance(transform_prop, dict):
+        raise TypeError(
+            f'{node_id}: transform.{transform_name} must be a dict, '
+            f'got {type(transform_prop).__name__}.'
+        )
+
+    bbox_size = transform_prop.get('bbox_size')
+    if bbox_size is None:
+        return None
+
+    return _read_size_value(
+        bbox_size,
+        node_id=node_id,
+        name=f'transform.{transform_name}.bbox_size',
+    )
 
 
 def _resolve_resize_size(
@@ -112,7 +171,7 @@ class ResizeImage(NodeRef):
         Expected structure:
 
         ``params`` : dict
-            ``size`` : list[int | str | None] or tuple[int | str | None, ...]
+            ``size`` : list[int | str | None] or tuple[int | str | None, ...], optional
                 Target size as ``[width, height]``.
 
                 Each non-``None`` value may be:
@@ -126,6 +185,20 @@ class ResizeImage(NodeRef):
                 that size and the original aspect ratio may change. If one
                 dimension is ``None``, the missing dimension is computed from the
                 original aspect ratio. ``[None, None]`` is invalid.
+
+                This value may be omitted when a transform input provides
+                ``crop.bbox_size`` or ``placement.bbox_size``.
+
+    Transform input
+    ---------------
+    ``ResizeImage`` exposes :meth:`transform`, an optional metadata input that
+    accepts the same ``crop`` / ``placement`` blocks used by ``ImageStack``.
+    When the connected metadata contains ``bbox_size``, that size has
+    precedence over ``params.size``.
+
+    This is useful for workflows where an image is generated or refined at a
+    different resolution and then must be normalized back to the size of an
+    upstream crop before being placed by ``ImageStack``.
 
     Outputs
     -------
@@ -151,6 +224,8 @@ class ResizeImage(NodeRef):
     -----
     - Percentage sizes are resolved against the current upstream image, not
       against a canvas or generation target.
+    - Transform ``bbox_size`` values use the same resolution rules as
+      ``params.size``.
     - The output image is saved as PNG and preserves the input image mode.
     - Resampling uses PIL's Lanczos filter.
     - This node is deterministic and has no model dependencies.
@@ -158,6 +233,25 @@ class ResizeImage(NodeRef):
 
     path: Optional[Union[str, Path]] = None
     spec: SpecInput = field(default_factory=dict)
+
+    def transform(self) -> AttachmentSink:
+        """
+        Declare optional crop / placement metadata used to resolve output size.
+
+        The upstream node should produce either a ``crop`` or ``placement``
+        dictionary. If that dictionary contains ``bbox_size``, the value
+        overrides ``params.size`` for this resize operation.
+
+        Returns
+        -------
+        AttachmentSink
+            Sink bound to this node with ``input_id='transform'``.
+        """
+        return AttachmentSink(
+            name=f'resize_transform:{self.id}',
+            target=self,
+            input_id='transform',
+        )
 
     def run(
         self,
@@ -168,6 +262,17 @@ class ResizeImage(NodeRef):
 
         node_id = self.id
         cfg = _read_cfg(spec, node_id=node_id)
+        transform_size = _size_from_transform(
+            None if input is None else input.get('transform'),
+            node_id=node_id,
+        )
+        size = transform_size or cfg.size
+        size_source = 'transform' if transform_size is not None else 'params'
+        if size is None:
+            raise ValueError(
+                f"'{node_id}': missing params.size and no transform bbox_size "
+                'was provided'
+            )
 
         img_path = resolve_single_image_path(
             node_id=node_id,
@@ -178,7 +283,7 @@ class ResizeImage(NodeRef):
         img = Image.open(img_path)
         input_width, input_height = img.size
         out_width, out_height = _resolve_resize_size(
-            cfg.size,
+            size,
             input_width=input_width,
             input_height=input_height,
         )
@@ -203,11 +308,12 @@ class ResizeImage(NodeRef):
             'input_size': [int(input_width), int(input_height)],
             'output_size': [int(out_width), int(out_height)],
             'resize': {
-                'size': _json_size(cfg.size),
+                'size': _json_size(size),
+                'source': size_source,
                 'resolved_size': [int(out_width), int(out_height)],
             },
             'params': {
-                'size': _json_size(cfg.size),
+                'size': None if cfg.size is None else _json_size(cfg.size),
             },
         }
 

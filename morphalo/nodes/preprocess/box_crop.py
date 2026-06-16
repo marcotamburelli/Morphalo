@@ -209,15 +209,18 @@ class BoxCrop(NodeRef):
         ``crop`` : dict
             Reinsertion metadata computed from the effective clamped crop:
 
-            - ``anchor_xy``: center of the effective crop in source coordinates.
+            - ``anchor_xy``: local anchor inside the cropped image.
+            - ``position``: source-image position where ``anchor_xy`` should be
+              placed when reconstructing the original geometry.
             - ``bbox_size``: width and height of the effective crop.
             - ``bbox_xyxy``: effective clamped bbox.
 
     Notes
     -----
     - All crop metadata is computed after clamping the bbox to the source image
-      bounds. This guarantees that ``crop.anchor_xy`` and ``crop.bbox_size`` are
-      coherent with the image actually written by the node.
+      bounds. This guarantees that ``crop.anchor_xy``, ``crop.position`` and
+      ``crop.bbox_size`` are coherent with the image actually written by the
+      node.
     - The output image is saved as PNG and preserves the input image mode.
     - This node is deterministic and has no model dependencies.
     """
@@ -274,6 +277,8 @@ class BoxCrop(NodeRef):
         b_height = int(out_y2 - out_y1)
         anchor_x = int((out_x1 + out_x2) // 2)
         anchor_y = int((out_y1 + out_y2) // 2)
+        local_anchor_x = int(anchor_x - out_x1)
+        local_anchor_y = int(anchor_y - out_y1)
 
         out = {
             'ok': True,
@@ -290,7 +295,8 @@ class BoxCrop(NodeRef):
                 int(out_y2),
             ],
             'crop': {
-                'anchor_xy': [anchor_x, anchor_y],
+                'anchor_xy': [local_anchor_x, local_anchor_y],
+                'position': [anchor_x, anchor_y],
                 'bbox_size': [b_width, b_height],
                 'bbox_xyxy': [
                     int(out_x1),

@@ -3,20 +3,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Tuple, Union
 
-from PIL import Image, ImageChops, ImageFilter
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter
 
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import resolve_size_expr, validate_size_expr
+from morphalo.nodes.preprocess.utils import (resolve_size_expr,
+                                             validate_size_expr)
 
 SizeExpr = int | str
-Pos = Union[Tuple[int, int], str]
+PositionCoord = int | str | None
+Pos = Union[Tuple[PositionCoord, PositionCoord], str]
 ResizeMode = Tuple[Optional[int | str], Optional[int | str]] \
     | Literal['fit', 'cover'] \
     | None
 CornerDelta = tuple[SizeExpr, SizeExpr] | None
+Point = tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ class LayerSpec:
     resize: ResizeMode = None
     rotation: float = 0.0
     corner_offsets: Optional[CornerOffsets] = None
+    brightness: float = 0.0
     feather: int | str = 0
     corner_radius: Optional[int | str] = None
     alpha: float = 1.0
@@ -141,7 +145,7 @@ def resolve_feather_radius(
     pct = max(0.0, float(s[:-1])) / 100.0
     mean_dim = (width + height) / 2.0
 
-    # I think that feather, if defined non zero, should always be at least 1
+    # Non-zero percentage feathering should resolve to at least one pixel.
     return max(1, int(round(mean_dim * pct)))
 
 
@@ -247,10 +251,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     if width <= 0 or height <= 0:
         raise ValueError(f"'{node_id}': invalid canvas size {width}x{height}")
 
-    # background:
+    # Background configuration:
     # - None -> transparent
-    # - 'white'/'black'/etc accepted by PIL
-    # - [r,g,b] or [r,g,b,a]
+    # - str -> any color accepted by PIL
+    # - [r, g, b] or [r, g, b, a] -> explicit color tuple
     bg = params.get('background', None)
     background: Optional[Union[str, Tuple[int, int, int, int]]]
     if bg is None:
@@ -280,81 +284,159 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     return Config(width=width, height=height, background=background, out_mode=out_mode)
 
 
-def _resolve_center_xy(position: Pos, W: int, H: int, lw: int, lh: int) -> Tuple[int, int]:
+def _resolve_position_xy(
+    position: Pos,
+    W: int,
+    H: int,
+    lw: int,
+    lh: int,
+    anchor_xy: Point,
+) -> Point:
     """
-    Resolve layer center (cx, cy) on a WxH canvas.
+    Resolve a placement specification to canvas coordinates.
 
-    - If position is a tuple (x,y), it's interpreted as the layer center in pixels.
-    - If position is an anchor string, it is interpreted as "attach the layer
-      to the corresponding canvas edge/corner", i.e. the layer's bounding box
-      touches the canvas border (not its center on the border).
+    The returned point is the canvas position where the layer local anchor must
+    be placed. It is not necessarily the geometric center of the layer.
+
+    Parameters
+    ----------
+    position : Pos
+        Placement specification.
+
+        If a tuple is provided, it is interpreted as the target canvas
+        coordinates for the layer anchor. Tuple components may be:
+
+        - ``int``:
+            Absolute canvas coordinate in pixels.
+        - ``'<number>px'``:
+            Explicit pixel coordinate.
+        - ``'<number>%'``:
+            Percentage of the corresponding canvas dimension.
+        - ``None``:
+            Use the center of the corresponding canvas axis.
+
+        If a string is provided, it is interpreted as an edge or corner
+        placement. The layer is positioned so that its transformed bounding box
+        touches the requested canvas edge or corner while preserving the current
+        local anchor.
+
+    W : int
+        Canvas width.
+    H : int
+        Canvas height.
+    lw : int
+        Current transformed layer width.
+    lh : int
+        Current transformed layer height.
+    anchor_xy : tuple[float, float]
+        Current layer anchor in transformed local coordinates.
+
+    Returns
+    -------
+    tuple[float, float]
+        Canvas coordinates where ``anchor_xy`` must be placed.
     """
     if isinstance(position, tuple):
-        return int(position[0]), int(position[1])
+        if len(position) != 2:
+            raise ValueError(
+                f'Position tuple must have length 2, got {position!r}'
+            )
+
+        x_expr, y_expr = position
+
+        if x_expr is None:
+            x = W / 2.0
+        else:
+            x = float(resolve_size_expr(x_expr, max_size=W, min_size=0))
+
+        if y_expr is None:
+            y = H / 2.0
+        else:
+            y = float(resolve_size_expr(y_expr, max_size=H, min_size=0))
+
+        return x, y
 
     a = position.lower().strip()
 
-    # helper: centers that make the layer touch the canvas borders (robust for odd sizes)
-    half_w = lw / 2.0
-    half_h = lh / 2.0
+    anchor_x, anchor_y = anchor_xy
 
-    left_cx = int(round(half_w))
-    right_cx = int(round(W - half_w))
+    left_x = float(anchor_x)
+    right_x = float(W) - (float(lw) - float(anchor_x))
+    top_y = float(anchor_y)
+    bottom_y = float(H) - (float(lh) - float(anchor_y))
 
-    top_cy = int(round(half_h))
-    bottom_cy = int(round(H - half_h))
-
-    mid_cx = W // 2
-    mid_cy = H // 2
+    mid_x = float(W) / 2.0
+    mid_y = float(H) / 2.0
 
     if a == 'center':
-        return mid_cx, mid_cy
+        return mid_x, mid_y
 
     if a in ('top', 'center-top', 'top-center'):
-        return mid_cx, top_cy
+        return mid_x, top_y
     if a in ('bottom', 'center-bottom', 'bottom-center'):
-        return mid_cx, bottom_cy
+        return mid_x, bottom_y
     if a in ('left', 'center-left', 'left-center'):
-        return left_cx, mid_cy
+        return left_x, mid_y
     if a in ('right', 'center-right', 'right-center'):
-        return right_cx, mid_cy
+        return right_x, mid_y
 
     if a in ('top-left', 'left-top'):
-        return left_cx, top_cy
+        return left_x, top_y
     if a in ('top-right', 'right-top'):
-        return right_cx, top_cy
+        return right_x, top_y
     if a in ('bottom-left', 'left-bottom'):
-        return left_cx, bottom_cy
+        return left_x, bottom_y
     if a in ('bottom-right', 'right-bottom'):
-        return right_cx, bottom_cy
+        return right_x, bottom_y
 
     raise ValueError(f'Unknown position anchor: {position!r}')
 
 
-def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: int) -> None:
+def _place_on_canvas_by_anchor(
+    canvas: Image.Image,
+    layer_rgba: Image.Image,
+    *,
+    placement_xy: Point,
+    anchor_xy: Point,
+) -> None:
     """
-    Alpha-composite layer_rgba onto canvas, placing its *center* at (cx, cy).
-    Handles out-of-bounds by cropping.
+    Alpha-composite a layer by matching its local anchor to a canvas point.
+
+    Parameters
+    ----------
+    canvas : PIL.Image.Image
+        Destination canvas in ``RGBA`` mode.
+    layer_rgba : PIL.Image.Image
+        Layer image in ``RGBA`` mode.
+    placement_xy : tuple[float, float]
+        Canvas coordinates where the layer anchor must be placed.
+    anchor_xy : tuple[float, float]
+        Anchor position in the transformed layer local coordinates.
+
+    Notes
+    -----
+    The layer top-left corner is computed as ``placement_xy - anchor_xy``.
+    Out-of-bounds placement is handled by cropping the visible intersection.
     """
     W, H = canvas.size
     lw, lh = layer_rgba.size
 
-    # top-left placement so that center aligns
-    x0 = int(round(cx - lw / 2))
-    y0 = int(round(cy - lh / 2))
+    placement_x, placement_y = placement_xy
+    anchor_x, anchor_y = anchor_xy
+
+    x0 = int(round(placement_x - anchor_x))
+    y0 = int(round(placement_y - anchor_y))
     x1 = x0 + lw
     y1 = y0 + lh
 
-    # intersection with canvas
     ix0 = max(0, x0)
     iy0 = max(0, y0)
     ix1 = min(W, x1)
     iy1 = min(H, y1)
 
     if ix1 <= ix0 or iy1 <= iy0:
-        return  # fully outside
+        return
 
-    # crop corresponding region from layer
     lx0 = ix0 - x0
     ly0 = iy0 - y0
     lx1 = lx0 + (ix1 - ix0)
@@ -362,7 +444,6 @@ def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: 
 
     layer_crop = layer_rgba.crop((lx0, ly0, lx1, ly1))
 
-    # alpha composite requires same size, so make a temp patch
     patch = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     patch.alpha_composite(layer_crop, (ix0, iy0))
     canvas.alpha_composite(patch)
@@ -371,34 +452,33 @@ def _place_on_canvas(canvas: Image.Image, layer_rgba: Image.Image, cx: int, cy: 
 def _apply_corner_offsets(
     img: Image.Image,
     corner_offsets: Optional[CornerOffsets],
-) -> Image.Image:
+    anchor_xy: Point,
+) -> tuple[Image.Image, Point]:
     """
-    Apply a local perspective warp by moving layer corners.
+    Apply a local perspective warp and propagate the layer anchor.
 
     The transformation is applied in the layer local coordinate space, before
-    rotation, resizing, feathering, and placement.
-
-    Corner offsets are resolved against the current layer size:
-
-    - horizontal deltas use layer width as percentage reference;
-    - vertical deltas use layer height as percentage reference.
-
-    The output canvas is expanded to preserve the full warped content.
+    rotation, resizing, feathering, and placement. The same perspective matrix is
+    applied to ``anchor_xy`` so that anchor-based placement remains consistent
+    after the warp.
 
     Parameters
     ----------
     img : PIL.Image.Image
         Input layer image. It is expected to be in ``RGBA`` mode.
     corner_offsets : CornerOffsets or None
-        Optional per-corner displacement. ``None`` leaves the image unchanged.
+        Optional per-corner displacement. ``None`` leaves the image and anchor
+        unchanged.
+    anchor_xy : tuple[float, float]
+        Anchor position in the input layer local coordinates.
 
     Returns
     -------
-    PIL.Image.Image
-        Perspective-warped layer image in ``RGBA`` mode.
+    tuple[PIL.Image.Image, tuple[float, float]]
+        Warped layer image and transformed anchor coordinates.
     """
     if corner_offsets is None:
-        return img
+        return img, anchor_xy
 
     import cv2
     import numpy as np
@@ -407,7 +487,7 @@ def _apply_corner_offsets(
 
     offsets = corner_offsets.resolved(width=w, height=h)
     if all(dx == 0 and dy == 0 for dx, dy in offsets):
-        return img
+        return img, anchor_xy
 
     # Source rectangle in local layer coordinates.
     src_pts = np.asarray(
@@ -459,77 +539,200 @@ def _apply_corner_offsets(
         borderValue=(0, 0, 0, 0),
     )
 
-    return Image.fromarray(warped, mode='RGBA')
+    out = Image.fromarray(warped, mode='RGBA')
+
+    anchor = np.asarray(
+        [[float(anchor_xy[0]), float(anchor_xy[1])]],
+        dtype=np.float32,
+    )
+    transformed = cv2.perspectiveTransform(anchor[None, :, :], matrix)[0, 0]
+
+    return out, (float(transformed[0]), float(transformed[1]))
 
 
-def _apply_rotation(img: Image.Image, rotation: float) -> Image.Image:
+def _apply_rotation_around_anchor(
+    img: Image.Image,
+    rotation: float,
+    anchor_xy: Point,
+) -> tuple[Image.Image, Point]:
     """
-    Rotate an RGBA layer around its center.
+    Rotate an RGBA layer around an arbitrary local anchor point.
 
     Parameters
     ----------
     img : PIL.Image.Image
-        Input layer image. It is expected to be in ``RGBA`` mode.
+        Input layer image in RGBA mode.
     rotation : float
-        Counter-clockwise rotation angle in degrees. Values equivalent to
-        ``0`` modulo ``360`` leave the image unchanged.
+        Counter-clockwise rotation angle in degrees.
+    anchor_xy : tuple[float, float]
+        Anchor position in local image coordinates.
 
     Returns
     -------
-    PIL.Image.Image
-        Rotated image. The output canvas is expanded to preserve the full rotated
-        content, and newly exposed pixels are transparent.
+    tuple[PIL.Image.Image, tuple[float, float]]
+        Rotated image and transformed anchor position in the rotated image.
     """
     angle = float(rotation) % 360.0
     if abs(angle) < 1e-9 or abs(angle - 360.0) < 1e-9:
-        return img
+        return img, anchor_xy
 
-    return img.rotate(
-        angle,
+    import numpy as np
+
+    w, h = img.size
+    ax, ay = float(anchor_xy[0]), float(anchor_xy[1])
+
+    theta = math.radians(angle)
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+
+    corners = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(w), 0.0],
+            [float(w), float(h)],
+            [0.0, float(h)],
+        ],
+        dtype=np.float64,
+    )
+
+    rel = corners - np.asarray([ax, ay], dtype=np.float64)
+
+    rotated = np.empty_like(rel)
+    rotated[:, 0] = rel[:, 0] * cos_t - rel[:, 1] * sin_t + ax
+    rotated[:, 1] = rel[:, 0] * sin_t + rel[:, 1] * cos_t + ay
+
+    min_x = float(math.floor(rotated[:, 0].min()))
+    min_y = float(math.floor(rotated[:, 1].min()))
+    max_x = float(math.ceil(rotated[:, 0].max()))
+    max_y = float(math.ceil(rotated[:, 1].max()))
+
+    out_w = max(1, int(max_x - min_x))
+    out_h = max(1, int(max_y - min_y))
+
+    new_anchor = (
+        ax - min_x,
+        ay - min_y,
+    )
+
+    inv_cos = cos_t
+    inv_sin = -sin_t
+
+    def source_from_output(x: float, y: float) -> tuple[float, float]:
+        qx = x + min_x - ax
+        qy = y + min_y - ay
+        sx = qx * inv_cos - qy * inv_sin + ax
+        sy = qx * inv_sin + qy * inv_cos + ay
+        return sx, sy
+
+    c = source_from_output(0.0, 0.0)
+    x_unit = source_from_output(1.0, 0.0)
+    y_unit = source_from_output(0.0, 1.0)
+
+    matrix = (
+        x_unit[0] - c[0],
+        y_unit[0] - c[0],
+        c[0],
+        x_unit[1] - c[1],
+        y_unit[1] - c[1],
+        c[1],
+    )
+
+    rotated_img = img.transform(
+        (out_w, out_h),
+        Image.Transform.AFFINE,
+        matrix,
         resample=Image.Resampling.BICUBIC,
-        expand=True,
         fillcolor=(0, 0, 0, 0),
     )
 
+    return rotated_img, new_anchor
 
-def _apply_resize(img: Image.Image, resize: ResizeMode, canvas_w: int, canvas_h: int) -> Image.Image:
+
+def _apply_resize(
+    img: Image.Image,
+    resize: ResizeMode,
+    canvas_w: int,
+    canvas_h: int,
+    anchor_xy: Point,
+) -> tuple[Image.Image, Point]:
+    """
+    Resize a layer and propagate its local anchor consistently.
+
+    Parameters
+    ----------
+    img : PIL.Image.Image
+        Input layer image.
+    resize : ResizeMode
+        Resize specification. If ``None``, the image is returned unchanged.
+    canvas_w : int
+        Canvas width used to resolve percentage-based width expressions.
+    canvas_h : int
+        Canvas height used to resolve percentage-based height expressions.
+    anchor_xy : tuple[float, float]
+        Anchor position in local image coordinates before resizing.
+
+    Returns
+    -------
+    tuple[PIL.Image.Image, tuple[float, float]]
+        Resized image and anchor position in the resized image local
+        coordinates.
+
+    Notes
+    -----
+    The anchor is scaled by the same horizontal and vertical resize factors
+    applied to the image. This keeps anchor-based placement stable after
+    resizing.
+    """
     if resize is None:
-        return img
+        return img, anchor_xy
 
-    w, h = img.size
+    old_w, old_h = img.size
 
     if isinstance(resize, str):
         if resize == 'fit':
-            s = min(canvas_w / w, canvas_h / h)
+            scale = min(canvas_w / old_w, canvas_h / old_h)
         elif resize == 'cover':
-            s = max(canvas_w / w, canvas_h / h)
+            scale = max(canvas_w / old_w, canvas_h / old_h)
         else:
             raise ValueError(f'invalid resize mode: {resize!r}')
 
-        nw = max(1, int(round(w * s)))
-        nh = max(1, int(round(h * s)))
-        return img.resize((nw, nh), resample=Image.LANCZOS)
+        new_w = max(1, int(round(old_w * scale)))
+        new_h = max(1, int(round(old_h * scale)))
 
-    # tuple mode
-    tw, th = resize
-    if tw is None and th is None:
-        raise ValueError('resize cannot be (None, None)')
-
-    if tw is not None and th is not None:
-        nw = resolve_size_expr(tw, max_size=canvas_w)
-        nh = resolve_size_expr(th, max_size=canvas_h)
-    elif tw is not None:
-        nw = resolve_size_expr(tw, max_size=canvas_w)
-        s = float(nw) / float(w)
-        nh = max(1, int(round(h * s)))
     else:
-        nh = resolve_size_expr(th, max_size=canvas_h)
-        s = float(nh) / float(h)
-        nw = max(1, int(round(w * s)))
+        target_w, target_h = resize
+        if target_w is None and target_h is None:
+            raise ValueError('resize cannot be (None, None)')
 
-    nw = max(1, nw)
-    nh = max(1, nh)
-    return img.resize((nw, nh), resample=Image.LANCZOS)
+        if target_w is not None and target_h is not None:
+            new_w = resolve_size_expr(target_w, max_size=canvas_w)
+            new_h = resolve_size_expr(target_h, max_size=canvas_h)
+
+        elif target_w is not None:
+            new_w = resolve_size_expr(target_w, max_size=canvas_w)
+            scale = float(new_w) / float(old_w)
+            new_h = max(1, int(round(old_h * scale)))
+
+        else:
+            new_h = resolve_size_expr(target_h, max_size=canvas_h)
+            scale = float(new_h) / float(old_h)
+            new_w = max(1, int(round(old_w * scale)))
+
+    new_w = max(1, int(new_w))
+    new_h = max(1, int(new_h))
+
+    if (new_w, new_h) == (old_w, old_h):
+        return img, anchor_xy
+
+    resized = img.resize((new_w, new_h), resample=Image.LANCZOS)
+
+    scale_x = float(new_w) / float(old_w)
+    scale_y = float(new_h) / float(old_h)
+
+    return resized, (
+        float(anchor_xy[0]) * scale_x,
+        float(anchor_xy[1]) * scale_y,
+    )
 
 
 def _perturbed_alpha_ramp(
@@ -782,59 +985,128 @@ class ImageLayerAttachmentSink(AttachmentSink):
 
     def transform(self) -> AttachmentSink:
         """
-        Declare a transform input for this layer driven by a crop-producing node.
+        Declare a spatial transform input for this layer.
 
         This method creates an additional wiring endpoint associated with the
-        current layer (identified by ``idx``). When a compatible upstream node
-        (e.g. ``SubjectCrop``) is connected to this sink, the layer geometry
-        (position and size) is automatically derived from the crop metadata.
+        current layer, identified by ``idx``. The endpoint is intended for
+        upstream nodes that provide spatial metadata describing how the layer
+        should be anchored, placed, and optionally resized on the stack canvas.
+
+        The transform input accepts either ``crop`` or ``placement`` metadata.
+        Both use the same contract:
+
+        - ``crop`` is intended for nodes that physically extract or refine a
+          region from an image.
+        - ``placement`` is intended for nodes that only describe how an image
+          should be positioned.
 
         Expected upstream metadata
         --------------------------
-        The upstream node must provide a ``'crop'`` entry in its output dictionary
-        with the following structure:
+        The upstream node must provide exactly one of the following keys in its
+        output dictionary:
 
         ``crop`` : dict
-            ``anchor_xy`` : (int, int)
-                Absolute center coordinates of the crop bounding box in the
-                original image reference frame.
-            ``bbox_size`` : (int, int)
-                Width and height of the crop bounding box in pixels.
+            Crop-derived spatial metadata.
+
+        ``placement`` : dict
+            Generic spatial placement metadata.
+
+        Both dictionaries support the same fields:
+
+        ``anchor_xy`` : list[float] or tuple[float, float]
+            Required. Anchor coordinates in the local coordinate frame of the
+            image attached to this layer.
+
+            The anchor is the logical pivot used to place the layer. For crop
+            nodes, it is usually relative to the emitted crop image. For
+            placement nodes, it is relative to the full attached image.
+
+        ``position`` : str or list/tuple of two int | str | None values, optional
+            Target canvas position where ``anchor_xy`` must be placed.
+
+            If omitted, the layer ``position`` declared via :meth:`image` is
+            used. If provided, it overrides that layer position.
+
+            String values use the same edge/corner placement names accepted by
+            :meth:`image`, such as ``'center'``, ``'top-left'``, or
+            ``'bottom-right'``.
+
+            Tuple/list values define explicit canvas coordinates for the
+            anchor. Components may be integers, pixel strings, percentage
+            strings, or ``None``. A ``None`` component resolves to the center of
+            the corresponding canvas axis.
+
+        ``bbox_size`` : list or tuple of two int | str | None values, optional
+            Target size for the layer.
+
+            If omitted, the layer ``resize`` declared via :meth:`image` is used.
+            If provided, it overrides that layer resize setting.
+
+            The value follows the same tuple resize conventions as
+            :meth:`image`: ``(W, H)``, ``(W, None)``, or ``(None, H)``.
 
         Runtime behavior
         ----------------
-        If a transform input is present for this layer:
+        If no transform input is connected, the layer uses the geometry declared
+        via :meth:`image`:
 
-        - ``position`` is overridden using ``crop.anchor_xy``.
-          The layer center on the canvas is set to these coordinates.
-        - ``resize`` is overridden using ``crop.bbox_size``.
-          The layer is resized to match the crop bounding box dimensions.
+        - the default anchor is the geometric center of the input layer;
+        - ``position`` comes from :meth:`image`;
+        - ``resize`` comes from :meth:`image`.
 
-        Other layer-local transformations remain unchanged. In particular,
-        ``corner_offsets`` and ``rotation`` are still taken from the layer declaration
-        and are applied before the transform-derived resize and placement.
+        If a transform input is connected:
 
-        If no transform input is connected, the layer uses the geometry
-        specified explicitly via :meth:`image`.
+        - ``anchor_xy`` is read from ``crop`` or ``placement`` and becomes the
+          layer local anchor;
+        - ``position`` is overridden only if present in the transform metadata;
+        - ``resize`` is overridden only if ``bbox_size`` is present.
+
+        Geometry compatibility
+        ----------------------
+        Transform metadata is interpreted in the local coordinate system of the
+        image attached to this layer. ``ImageStack`` does not know whether that
+        image is still geometrically equivalent to the upstream crop or placement
+        source.
+
+        This matters when a crop is sent through a refinement or generation step
+        that changes its pixel size, for example producing a 1024x1024 image
+        from a much smaller face crop. In that case, ``crop.anchor_xy`` still
+        refers to the original crop coordinate frame, while the layer image now
+        has a different coordinate frame. The resulting placement may therefore
+        look wrong even if ``position`` and ``bbox_size`` are correct.
+
+        For crop reconstruction workflows, the recommended pattern is to resize
+        the refined/generated layer back to the transform ``bbox_size`` before
+        feeding it to ``ImageStack``. ``ResizeImage.transform()`` can consume the
+        same ``crop`` or ``placement`` metadata and use its ``bbox_size`` for
+        this alignment step.
+
+        The layer is then transformed while preserving anchor consistency:
+
+        1. ``corner_offsets`` are applied and the anchor is transformed with the
+           warped layer;
+        2. ``rotation`` is applied around the current local anchor;
+        3. ``resize`` is applied and the anchor is scaled accordingly;
+        4. ``position`` is resolved into a canvas placement point;
+        5. the layer is composited so that its local anchor coincides with that
+           placement point.
 
         Returns
         -------
         AttachmentSink
             A sink bound to this node with ``input_id=f"transform:{idx}"``.
-            It must be wired from a node producing compatible ``crop`` metadata.
+            It must be wired from a node producing compatible ``crop`` or
+            ``placement`` metadata.
 
         Notes
         -----
-        - This mechanism enables declarative geometric reconstruction workflows,
-          such as:
-            1. Crop a region from an image.
-            2. Refine it independently (e.g. via ``Img2Img``).
-            3. Reinsert it into a stack using the original position and size.
-        - The transform input overrides only spatial reconstruction parameters
-          (``position`` and ``resize``). It does not override local image
-          transformations such as ``corner_offsets`` or ``rotation``.
-        - The transform mechanism assumes that the stack canvas shares the same
-          coordinate reference as the image from which the crop was generated.
+        - The transform input affects only spatial placement metadata:
+          ``anchor_xy``, ``position``, and ``bbox_size``.
+        - Visual layer operations such as ``corner_offsets``, ``rotation``,
+          ``brightness``, ``feather``, ``corner_radius``, and ``alpha`` remain
+          controlled by the layer declaration.
+        - ``crop`` and ``placement`` are mutually exclusive. Supplying both is
+          considered ambiguous.
         """
 
         return AttachmentSink(
@@ -872,22 +1144,30 @@ class ImageStack(NodeRef):
     For each layer, the following pipeline is executed:
 
     1. Load the upstream image and convert it to ``RGBA``.
-    2. Apply optional local perspective corner offsets (``corner_offsets``).
-    3. Apply optional rotation (``rotation``) around the layer center.
-    4. Apply optional resizing (``resize``) to the transformed layer.
-    5. Optionally soften the layer edges (``feather``).
-    6. Apply global layer opacity (``alpha``).
-    7. Resolve layer placement (``position``) on the canvas.
-    8. Alpha-composite the transformed layer onto the canvas.
+    2. Resolve optional ``crop`` / ``placement`` transform metadata.
+    3. Initialize the layer local anchor.
+    4. Apply optional local perspective corner offsets and propagate the anchor.
+    5. Apply optional rotation around the current anchor.
+    6. Apply optional resizing and scale the anchor accordingly.
+    7. Adjust layer luminosity.
+    8. Optionally soften the layer edges.
+    9. Apply global layer opacity.
+    10. Resolve layer placement on the canvas.
+    11. Alpha-composite the transformed layer by matching anchor to placement.
 
     This execution order is important:
 
-    - ``corner_offsets`` is applied first, in the original local layer coordinate
-      space;
-    - ``rotation`` is applied after the local corner warp;
-    - ``resize`` is applied after both local corner warp and rotation;
-    - therefore ``resize`` refers to the final transformed layer bounding box,
-      not to the original unwarped image size.
+    - ``anchor_xy`` is initialized before local geometric transforms;
+    - ``corner_offsets`` is applied first, in the current local layer coordinate
+      space, and propagates the anchor through the perspective warp;
+    - ``rotation`` is applied after the local corner warp, around the current
+      propagated anchor;
+    - ``resize`` is applied after both local corner warp and rotation, and
+      scales the propagated anchor accordingly;
+    - therefore ``resize`` refers to the transformed layer bounding box, not to
+      the original unwarped image size;
+    - final placement is computed by matching the transformed local anchor to a
+      resolved canvas placement point.
 
     Canvas
     ------
@@ -959,21 +1239,30 @@ class ImageStack(NodeRef):
 
     Rotation
     --------
-    Each layer may optionally be rotated after local corner-offset warping and before
-    resizing and placement using ``rotation``.
+    Each layer may optionally be rotated after local corner-offset warping and
+    before resizing and placement using ``rotation``.
 
     - ``0.0``:
         No rotation.
     - ``float``:
         Counter-clockwise rotation angle in degrees.
 
-    Rotation is applied around the center of the current layer, after any
-    ``corner_offsets`` transformation. The rotated canvas is expanded so that the
-    full rotated content is preserved, and newly exposed pixels are filled with
-    transparency.
+    Rotation is applied around the current layer anchor.
 
-    Since rotation is applied before resizing, any subsequent ``resize`` operation
-    acts on the rotated layer as a whole.
+    Without transform metadata, the anchor is initialized to the geometric
+    center of the input layer, so rotation behaves like ordinary center-based
+    rotation.
+
+    With ``crop`` or ``placement`` transform metadata, the anchor may be any
+    local point declared by the upstream node. In that case, rotation preserves
+    that logical pivot instead of rotating around the transformed bounding-box
+    center.
+
+    The rotated canvas is expanded so that the full rotated content is
+    preserved, and newly exposed pixels are filled with transparency.
+
+    Since rotation is applied before resizing, any subsequent ``resize``
+    operation acts on the rotated layer as a whole.
 
     Resizing
     --------
@@ -1017,8 +1306,11 @@ class ImageStack(NodeRef):
     -----------
     The ``position`` parameter controls layer placement on the canvas.
 
-    - If a tuple ``(x, y)`` is provided, it represents the *center* of the
-      layer in canvas pixel coordinates.
+    - If a tuple ``(x, y)`` is provided, it represents the canvas position where the
+      current layer anchor must be placed. Without transform metadata, the default
+      anchor is the geometric center of the input layer, so this behaves like
+      center-based placement. With transform metadata, the anchor may be any local
+      point declared by the upstream node.
     - If a string anchor is provided, the layer is attached to the
       corresponding edge or corner such that its bounding box touches the
       canvas border(s), not such that its center lies on the border.
@@ -1030,45 +1322,45 @@ class ImageStack(NodeRef):
     - ``'top-left'``, ``'top-right'``, ``'bottom-left'``, ``'bottom-right'``
     - ``'center-top'``, ``'center-bottom'``, ``'center-left'``, ``'center-right'``
 
-    Anchor resolution depends on both canvas dimensions and the current layer
-    dimensions after rotation and resizing. This logic is implemented by
-    ``_resolve_center_xy``.
+    Placement resolution depends on the canvas dimensions, the transformed layer
+    dimensions, and the current propagated local anchor. This logic is
+    implemented by ``_resolve_position_xy``.
 
-    Transform input (crop-driven reconstruction)
-    --------------------------------------------
+    Transform input (crop / placement driven geometry)
+    --------------------------------------------------
     A layer may optionally declare an additional transform input via
     :meth:`ImageLayerAttachmentSink.transform`.
 
-    If a compatible upstream node (for example ``SubjectCrop``) is wired into
-    ``transform:{idx}``, the layer geometry is automatically overridden:
+    If a compatible upstream node is wired into ``transform:{idx}``, ``ImageStack``
+    looks for either ``crop`` or ``placement`` metadata.
 
-    - ``position`` is derived from ``crop.anchor_xy``,
-    - ``resize`` is derived from ``crop.bbox_size``.
+    The metadata must provide:
 
-    This enables declarative reconstruction workflows:
+    - ``anchor_xy``:
+      local layer anchor coordinates.
 
-    1. Crop a region from an image.
-    2. Refine or upsample the cropped region independently.
-    3. Reinsert it into a stack at the original spatial location.
+    It may also provide:
 
-    The transform input overrides only *geometric reconstruction* parameters:
+    - ``position``:
+      canvas placement specification overriding ``image(position=...)``;
+    - ``bbox_size``:
+      target layer size overriding ``image(resize=...)``.
 
-    - ``position``
-    - ``resize``
+    This enables both crop reconstruction workflows and generic semantic placement
+    workflows.
 
-    It does **not** override:
+    Geometry compatibility
+    ----------------------
+    ``crop`` and ``placement`` metadata describe coordinates in the local geometry
+    of the image that produced that metadata. The image wired as the actual layer
+    should therefore be geometrically compatible with that metadata.
 
-    - ``corner_offsets``
-    - ``rotation``
-    - ``feather``
-    - ``corner_radius``
-
-    ``corner_offsets`` and ``rotation`` remain explicit properties of the declared
-    layer and affect only the attached image content before it is resized and
-    reinserted.
-
-    If no transform input is provided, the layer uses the geometry declared
-    explicitly via :meth:`image`.
+    If a crop is refined or regenerated at a different resolution before being
+    reinserted, resize it back to the transform ``bbox_size`` first. Otherwise
+    ``anchor_xy`` may refer to the old crop coordinates while the attached layer
+    uses a new coordinate frame. ``ResizeImage.transform()`` is designed for this
+    case: wire the same crop/placement metadata into the resize node so it can
+    use ``bbox_size`` as the target size before the layer reaches ``ImageStack``.
 
     Feathering
     ----------
@@ -1100,6 +1392,22 @@ class ImageStack(NodeRef):
       layer width and height.
 
     A value of ``0`` disables feathering.
+
+    Brightness
+    ----------
+    ``brightness`` adjusts the luminosity of each layer independently before
+    compositing, without changing its alpha channel:
+
+    - ``0.0`` preserves the original layer colors;
+    - negative values darken the layer;
+    - ``-1.0`` makes the layer RGB channels black;
+    - positive values brighten the layer;
+    - ``1.0`` applies the maximum supported brightening.
+
+    This is useful when an overlay has insufficient contrast against its target,
+    for example darkening white lettering before placing it on a white T-shirt.
+    The adjustment is explicit and does not inspect or modify the canvas below
+    the layer.
 
     Configuration
     -------------
@@ -1141,10 +1449,11 @@ class ImageStack(NodeRef):
     -------
     image(
         idx: int,
-        position='center',
+        position: tuple[int | str | None, int | str | None] | str = 'center',
         resize=None,
         rotation=0.0,
         corner_offsets=None,
+        brightness=0.0,
         feather=0,
         corner_radius=None,
         alpha=1.0,
@@ -1169,8 +1478,8 @@ class ImageStack(NodeRef):
             Path to the composited output image.
         ``params.layers`` : list[dict]
             Per-layer configuration, including ``idx``, ``position``, ``resize``,
-            ``rotation``, ``corner_offsets``, ``feather``, ``corner_radius``,
-            and ``alpha``.
+            ``rotation``, ``corner_offsets``, ``brightness``, ``feather``,
+            ``corner_radius``, and ``alpha``.
         ``metadata`` : str
             Path to the JSON sidecar.
 
@@ -1199,6 +1508,7 @@ class ImageStack(NodeRef):
         resize: ResizeMode = None,
         rotation: float = 0.0,
         corner_offsets: Optional[CornerOffsets] = None,
+        brightness: float = 0.0,
         feather: int | str = 0,
         corner_radius: Optional[int | str] = None,
         alpha: float = 1.0,
@@ -1219,25 +1529,39 @@ class ImageStack(NodeRef):
             Unique layer index. Must not be reused.
             Layers are composited in increasing order (bottom → top).
 
-        position : tuple[int, int] or str, optional
+        position : tuple[int | str | None, int | str | None] or str, optional
             Placement of the layer on the canvas.
 
-            - If a tuple ``(x, y)`` is provided, it represents the **center**
-            of the layer in canvas pixel coordinates.
-            - If a string is provided, it is interpreted as an *edge/corner anchor*.
-            The layer is positioned so that its bounding box touches the
-            corresponding canvas border(s), not so that its center lies on the border.
+            If a tuple ``(x, y)`` is provided, it represents the canvas position
+            where the current layer anchor must be placed.
+
+            Tuple components may be:
+
+            - ``int``:
+              Absolute canvas coordinate in pixels.
+            - ``"<number>px"``:
+              Explicit pixel coordinate.
+            - ``"<number>%"``:
+              Percentage of the corresponding canvas dimension.
+            - ``None``:
+              Use the center of the corresponding canvas axis.
+
+            If a string is provided, it is interpreted as an edge/corner
+            placement. The layer is positioned so that its transformed bounding
+            box touches the requested canvas edge or corner.
+
+            Without transform metadata, the layer anchor defaults to the
+            geometric center of the input layer. With transform metadata, the
+            upstream ``crop`` or ``placement`` metadata may define a different
+            local anchor.
 
             Supported anchors include:
 
             ``"center"``,
             ``"top"``, ``"bottom"``, ``"left"``, ``"right"``,
-            ``"top-left"``, ``"top-right"``, ``"bottom-left"``, ``"bottom-right"``,
-            ``"center-top"``, ``"center-bottom"``,
+            ``"top-left"``, ``"top-right"``, ``"bottom-left"``,
+            ``"bottom-right"``, ``"center-top"``, ``"center-bottom"``,
             ``"center-left"``, ``"center-right"``.
-
-            Anchor resolution depends on both canvas dimensions and the
-            current layer size (after resizing).
 
             Default: ``"center"``.
 
@@ -1277,17 +1601,26 @@ class ImageStack(NodeRef):
             - ``(None, "30%")`` → height = 30% of canvas, width scaled proportionally
 
         rotation : float, optional
-            Counter-clockwise rotation angle in degrees applied to the layer before
-            resizing, feathering, and placement.
+            Counter-clockwise rotation angle in degrees applied to the layer
+            before resizing, feathering, and placement.
 
-            The layer is rotated around its center. The rotated canvas is expanded to
-            preserve the full rotated content, and newly exposed pixels are transparent.
+            Rotation is applied around the current layer anchor.
 
-            Since resizing is applied after rotation, ``resize`` refers to the final
-            rotated layer bounding box, not to the original unrotated image size.
+            Without transform metadata, the anchor defaults to the geometric
+            center of the input layer. With transform metadata, the upstream
+            ``crop`` or ``placement`` metadata may define a different local
+            anchor.
 
-            Since placement is resolved after rotation and resizing, tuple positions and
-            anchor strings refer to the center / bounding box of the transformed layer.
+            The rotated canvas is expanded to preserve the full rotated
+            content, and newly exposed pixels are transparent.
+
+            Since resizing is applied after rotation, ``resize`` refers to the
+            final rotated layer bounding box, not to the original unrotated
+            image size.
+
+            Since placement is resolved after rotation and resizing, tuple
+            positions and anchor strings refer to the propagated anchor and the
+            transformed layer bounding box.
 
             Default: ``0.0``.
 
@@ -1326,6 +1659,21 @@ class ImageStack(NodeRef):
             ``CornerOffsets(top_left=("-4%", "2%"), top_right=("6%", "-3%"))``
 
             Default: ``None``.
+
+        brightness : float, optional
+            Layer luminosity adjustment applied after geometric transforms and
+            resizing, but before feathering and compositing.
+
+            - ``-1.0`` produces black RGB while preserving alpha.
+            - Values in ``(-1.0, 0.0)`` darken the layer.
+            - ``0.0`` keeps the original RGB values.
+            - Values in ``(0.0, 1.0]`` brighten the layer.
+
+            Internally, the adjustment is converted to the PIL brightness
+            factor ``1 + brightness``. The value must be finite and in
+            ``[-1.0, 1.0]``. The alpha channel is preserved exactly.
+
+            Default: ``0.0``.
 
         feather : int or str, optional
             Feathering applied to the layer edges before compositing.
@@ -1406,8 +1754,9 @@ class ImageStack(NodeRef):
 
         Notes
         -----
-        - The layer transformation is purely geometric and includes local corner-offset
-          warping, rotation, resizing, and placement.
+        - The layer transformation is purely geometric and includes anchor-aware
+          local corner-offset warping, anchor-centered rotation, resizing, and
+          final placement.
         - No automatic color matching, lighting harmonization, or shadow
           synthesis is performed.
         - ``idx`` must be unique; attempting to reuse an index raises an error.
@@ -1497,12 +1846,20 @@ class ImageStack(NodeRef):
                 f'{self.id}: alpha must be a finite float in [0, 1], got {alpha!r}'
             )
 
+        brightness = float(brightness)
+        if not math.isfinite(brightness) or not (-1.0 <= brightness <= 1.0):
+            raise ValueError(
+                f'{self.id}: brightness must be a finite float in [-1, 1], '
+                f'got {brightness!r}'
+            )
+
         self._layers[idx] = LayerSpec(
             idx=idx,
             position=position,
             resize=resize,
             rotation=rotation,
             corner_offsets=corner_offsets,
+            brightness=brightness,
             feather=feather,
             corner_radius=corner_radius,
             alpha=alpha,
@@ -1521,7 +1878,7 @@ class ImageStack(NodeRef):
 
         input = input or {}
 
-        # build canvas
+        # Build canvas.
         if cfg.background is None:
             canvas = Image.new('RGBA', (cfg.width, cfg.height), (0, 0, 0, 0))
         elif isinstance(cfg.background, str):
@@ -1533,7 +1890,7 @@ class ImageStack(NodeRef):
             raise ValueError(
                 f'{self.id}: no layers declared. Use src >> node.image(idx=...)')
 
-        # composite in idx order
+        # Composite layers in ascending idx order.
         for idx in sorted(self._layers.keys()):
             layer_spec = self._layers[idx]
             up = input.get(f'image:{idx}')
@@ -1552,47 +1909,140 @@ class ImageStack(NodeRef):
             with Image.open(path) as im:
                 layer = im.convert('RGBA')
 
-            # --- optional transform input ---
+            # --- optional crop / placement transform metadata ---
             tr = input.get(f'transform:{idx}')
-            if tr is not None:
-                # crop node output overrides anchor position and size information
-                crop_meta = tr.get('crop')
-                if crop_meta is None:
-                    raise ValueError(
-                        f'{self.id}: missing crop metadata on transform:{idx} '
-                        "(expected upstream SubjectCrop to output key 'crop')"
-                    )
 
-                anchor_xy = crop_meta.get('anchor_xy')
-                if anchor_xy is None:
-                    raise ValueError(
-                        f'{self.id}: missing crop.anchor_xy metadata on transform:{idx} '
-                        "(expected upstream SubjectCrop to output key 'crop')"
-                    )
-                ax, ay = anchor_xy
-                position = (int(ax), int(ay))
+            position = layer_spec.position
+            resize = layer_spec.resize
 
-                bbox_size = crop_meta.get('bbox_size')
-                if bbox_size is None:
-                    raise ValueError(
-                        f'{self.id}: missing crop.bbox_size metadata on transform:{idx} '
-                        "(expected upstream SubjectCrop to output key 'crop')"
-                    )
-                bw, bh = bbox_size
-                resize = (int(bw), int(bh))
-            else:
-                position = layer_spec.position
-                resize = layer_spec.resize
-
-            layer = _apply_corner_offsets(layer, layer_spec.corner_offsets)
-            layer = _apply_rotation(layer, layer_spec.rotation)
-            layer = _apply_resize(
-                layer, resize, cfg.width, cfg.height
+            anchor_xy: Point = (
+                float(layer.width) / 2.0,
+                float(layer.height) / 2.0,
             )
+
+            if tr is not None:
+                transform_items = [
+                    (name, tr[name])
+                    for name in ('crop', 'placement')
+                    if name in tr
+                ]
+
+                if not transform_items:
+                    raise ValueError(
+                        f'{self.id}: missing transform metadata on transform:{idx}; '
+                        "expected key 'crop' or 'placement'."
+                    )
+
+                if len(transform_items) > 1:
+                    raise ValueError(
+                        f'{self.id}: transform:{idx} contains both crop and placement '
+                        'metadata; expected only one.'
+                    )
+
+                transform_name, transform_prop = transform_items[0]
+
+                if not isinstance(transform_prop, dict):
+                    raise TypeError(
+                        f'{self.id}: transform:{idx}.{transform_name} must be a dict, '
+                        f'got {type(transform_prop).__name__}.'
+                    )
+
+                raw_anchor_xy = transform_prop.get('anchor_xy')
+                if raw_anchor_xy is None:
+                    raise ValueError(
+                        f'{self.id}: missing {transform_name}.anchor_xy metadata on '
+                        f'transform:{idx}.'
+                    )
+
+                if not isinstance(raw_anchor_xy, (list, tuple)) or len(raw_anchor_xy) != 2:
+                    raise ValueError(
+                        f'{self.id}: {transform_name}.anchor_xy on transform:{idx} must '
+                        f'be a 2-item list or tuple, got {raw_anchor_xy!r}.'
+                    )
+
+                anchor_xy = (
+                    float(raw_anchor_xy[0]),
+                    float(raw_anchor_xy[1]),
+                )
+
+                if 'position' in transform_prop:
+                    raw_position = transform_prop.get('position')
+                    if raw_position is None:
+                        raise ValueError(
+                            f'{self.id}: {transform_name}.position on transform:{idx} '
+                            'cannot be None. Omit the key to keep image(position=...).'
+                        )
+
+                    if isinstance(raw_position, str):
+                        position = raw_position
+
+                    elif isinstance(raw_position, (list, tuple)) and len(raw_position) == 2:
+                        position = (
+                            raw_position[0],
+                            raw_position[1],
+                        )
+
+                    else:
+                        raise ValueError(
+                            f'{self.id}: {transform_name}.position on transform:{idx} '
+                            'must be a string anchor or a 2-item list/tuple, got '
+                            f'{raw_position!r}.'
+                        )
+
+                bbox_size = transform_prop.get('bbox_size')
+                if bbox_size is not None:
+                    if not isinstance(bbox_size, (list, tuple)) or len(bbox_size) != 2:
+                        raise ValueError(
+                            f'{self.id}: {transform_name}.bbox_size on transform:{idx} '
+                            f'must be a 2-item list or tuple, got {bbox_size!r}.'
+                        )
+
+                    bw, bh = bbox_size
+                    if bw is None and bh is None:
+                        raise ValueError(
+                            f'{self.id}: {transform_name}.bbox_size on transform:{idx} '
+                            'cannot be [None, None].'
+                        )
+
+                    if bw is not None:
+                        validate_size_expr(bw)
+                    if bh is not None:
+                        validate_size_expr(bh)
+
+                    resize = (bw, bh)
+
+            layer, anchor_xy = _apply_corner_offsets(
+                layer,
+                layer_spec.corner_offsets,
+                anchor_xy,
+            )
+
+            layer, anchor_xy = _apply_rotation_around_anchor(
+                layer,
+                layer_spec.rotation,
+                anchor_xy,
+            )
+
+            layer, anchor_xy = _apply_resize(
+                layer,
+                resize,
+                cfg.width,
+                cfg.height,
+                anchor_xy,
+            )
+
+            if layer_spec.brightness != 0.0:
+                r, g, b, a = layer.split()
+                rgb = Image.merge('RGB', (r, g, b))
+                rgb = ImageEnhance.Brightness(rgb).enhance(
+                    1.0 + layer_spec.brightness
+                )
+                r, g, b = rgb.split()
+                layer = Image.merge('RGBA', (r, g, b, a))
 
             lw, lh = layer.size
 
-            # feather (alpha handling)
+            # Apply feathering through alpha-channel handling.
             if feather_is_nonzero(layer_spec.feather):
                 r, g, b, a = layer.split()
 
@@ -1652,12 +2102,13 @@ class ImageStack(NodeRef):
                         a = ImageChops.darker(a_soft, a)
                         layer = Image.merge('RGBA', (r, g, b, a))
 
-            cx, cy = _resolve_center_xy(
+            placement_xy = _resolve_position_xy(
                 position,
                 cfg.width,
                 cfg.height,
                 layer.width,
                 layer.height,
+                anchor_xy,
             )
 
             if layer_spec.alpha < 1.0:
@@ -1665,7 +2116,12 @@ class ImageStack(NodeRef):
                 a = a.point(lambda v: int(round(v * layer_spec.alpha)))
                 layer = Image.merge('RGBA', (r, g, b, a))
 
-            _place_on_canvas(canvas, layer, cx=cx, cy=cy)
+            _place_on_canvas_by_anchor(
+                canvas,
+                layer,
+                placement_xy=placement_xy,
+                anchor_xy=anchor_xy,
+            )
 
         out_dir = Path(output_dir)
 
@@ -1698,6 +2154,7 @@ class ImageStack(NodeRef):
                             'bottom_right': ls.corner_offsets.bottom_right,
                             'bottom_left': ls.corner_offsets.bottom_left,
                         },
+                        'brightness': ls.brightness,
                         'feather': ls.feather,
                         'corner_radius': ls.corner_radius,
                         'alpha': ls.alpha,

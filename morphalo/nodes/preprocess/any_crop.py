@@ -491,8 +491,8 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
 
     The output metadata is intentionally compatible with geometry-driven
     compositing workflows. In particular, the ``crop`` block exposes
-    ``anchor_xy``, ``bbox_size`` and ``bbox_xyxy`` so that refined crops can be
-    reinserted through nodes such as ``ImageStack``.
+    ``anchor_xy``, ``position``, ``bbox_size`` and ``bbox_xyxy`` so that refined
+    crops can be reinserted through nodes such as ``ImageStack``.
 
     Prompt semantics
     ----------------
@@ -806,8 +806,11 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
             Crop metadata useful for reinsertion/compositing:
 
             ``anchor_xy`` : list[int]
-                Center of the effective output crop box in absolute source-image
-                coordinates.
+                Local anchor inside the output crop image.
+
+            ``position`` : list[int]
+                Source-image position where ``anchor_xy`` should be placed when
+                reconstructing the original geometry.
 
             ``bbox_size`` : list[int]
                 Width and height of the effective output crop box.
@@ -1154,7 +1157,11 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 for i, (selected, sam_bbox) in enumerate(zip(selected_boxes, sam_bboxes))
             ],
             'crop': {
-                'anchor_xy': [anchor_x, anchor_y],
+                'anchor_xy': [
+                    int(anchor_x - out_x1),
+                    int(anchor_y - out_y1),
+                ],
+                'position': [anchor_x, anchor_y],
                 'bbox_size': [bbox_w, bbox_h],
                 'bbox_xyxy': [int(out_x1), int(out_y1), int(out_x2), int(out_y2)],
             },
