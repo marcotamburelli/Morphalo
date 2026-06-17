@@ -15,9 +15,9 @@ from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.mask_geometry import (
     estimate_mask_centerline_alignment_angle,
     estimate_mask_quad_alignment_angle)
-from morphalo.nodes.preprocess.utils import (resolve_size_expr,
-                                             validate_size_expr,
-                                             validate_percentage_size_expr)
+from morphalo.nodes.preprocess.utils import (SizeExpr, resolve_size_expr,
+                                             validate_percentage_size_expr,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 Anchor = Literal[
@@ -31,8 +31,7 @@ Anchor = Literal[
     'bottom-left',
     'bottom-right',
 ]
-SizeExpr = Union[int, str]
-ResizeMode = Literal['fit', 'cover', 'stretch']
+OverlayResizeMode = Literal['fit', 'cover', 'stretch']
 NormalizedBoxBlend = Tuple[float, float, float, float]
 
 ALLOWED_ANCHORS = {
@@ -78,7 +77,7 @@ class LayerSpec:
     """
 
     position: Anchor = 'center'
-    resize: ResizeMode = 'fit'
+    resize: OverlayResizeMode = 'fit'
     rotation_deg: float = 0.0
 
 
@@ -1425,7 +1424,7 @@ def _resize_overlay_to_box(
     inset_right: SizeExpr,
     inset_top: SizeExpr,
     inset_bottom: SizeExpr,
-    resize: ResizeMode,
+    resize: OverlayResizeMode,
 ) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
     """
     Resize an overlay image against a local rectangle content box.
@@ -1968,7 +1967,7 @@ class MaskInsertLayer(NodeRef):
         self,
         *,
         position: Anchor = 'center',
-        resize: ResizeMode = 'fit',
+        resize: OverlayResizeMode = 'fit',
         rotation_deg: float = 0.0,
     ) -> AttachmentSink:
         """

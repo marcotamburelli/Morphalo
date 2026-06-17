@@ -1,13 +1,50 @@
-import cv2
 import math
 import re
-import numpy as np
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
+
+import cv2
+import numpy as np
 
 SizeExpr = int | str
+SizeSpec = tuple[Optional[SizeExpr], Optional[SizeExpr]]
+PositionCoord = Optional[SizeExpr]
+PositionSpec = Union[str, tuple[PositionCoord, PositionCoord]]
+ResizeMode = SizeSpec | Literal['fit', 'cover'] | None
+Point = tuple[float, float]
 
 CropModeName = Literal['bbox', 'trim', 'full_frame']
+SpatialTransformKind = Literal['crop', 'placement']
+
+
+@dataclass(frozen=True)
+class SpatialTransform:
+    """
+    Parsed crop or placement spatial transform metadata.
+
+    The object represents the common spatial metadata contract shared by
+    preprocessing nodes that consume ``crop`` or ``placement`` dictionaries. It
+    only performs structural normalization; each consumer remains responsible
+    for deciding which fields are required for its own operation.
+
+    Parameters
+    ----------
+    kind : {'crop', 'placement'} or None, optional
+        Metadata block that provided the values. ``None`` is useful for local
+        defaults assembled by a consuming node.
+    anchor_xy : tuple[float, float] or None, optional
+        Local anchor point in the attached image/layer coordinate frame.
+    position : str or tuple[Any, Any] or None, optional
+        Canvas placement specification. Consumers resolve the concrete meaning.
+    bbox_size : tuple[int | str | None, int | str | None] or None, optional
+        Target size specification. Components follow the standard preprocessing
+        size-expression convention and may be resolved by the consumer.
+    """
+    kind: Optional[SpatialTransformKind] = None
+    anchor_xy: Optional[tuple[float, float]] = None
+    position: Optional[PositionSpec] = None
+    bbox_size: Optional[SizeSpec] = None
+
 
 @dataclass(frozen=True)
 class CropModeSpec:
@@ -231,6 +268,193 @@ def validate_size_expr(
             f'invalid size expression value "{size_expr}". '
             'Expected formats: int, "<number>px", "<number>%".'
         )
+
+
+def read_spatial_transform(
+    transform: Optional[dict[str, Any]],
+    *,
+    node_id: str,
+    input_name: str = 'transform',
+) -> Optional[SpatialTransform]:
+    """
+    Read crop or placement spatial transform metadata.
+
+    Parameters
+    ----------
+    transform : dict or None
+        Upstream transform metadata. The dictionary must contain at most one of
+        ``'crop'`` or ``'placement'``.
+    node_id : str
+        Node identifier used in error messages.
+    input_name : str, optional
+        Input name used in error messages.
+
+    Returns
+    -------
+    SpatialTransform or None
+        Parsed spatial transform metadata, or ``None`` if no crop/placement
+        metadata is available.
+
+    Notes
+    -----
+    This function validates and normalizes the common metadata structure, but it
+    does not enforce consumer-specific requirements. For example, ``ImageStack``
+    can use ``anchor_xy`` when present, while ``ResizeImage`` only cares about
+    ``bbox_size``.
+    """
+    if transform is None:
+        return None
+
+    if not isinstance(transform, dict):
+        raise TypeError(
+            f'{node_id}: {input_name} must be a dict, '
+            f'got {type(transform).__name__}.'
+        )
+
+    transform_items = [
+        (kind, transform[kind])
+        for kind in ('crop', 'placement')
+        if kind in transform
+    ]
+
+    if not transform_items:
+        return None
+
+    if len(transform_items) > 1:
+        raise ValueError(
+            f'{node_id}: {input_name} contains both crop and placement '
+            'metadata; expected only one.'
+        )
+
+    kind, transform_prop = transform_items[0]
+
+    if not isinstance(transform_prop, dict):
+        raise TypeError(
+            f'{node_id}: {input_name}.{kind} must be a dict, '
+            f'got {type(transform_prop).__name__}.'
+        )
+
+    anchor_xy = None
+    if 'anchor_xy' in transform_prop:
+        raw_anchor_xy = transform_prop.get('anchor_xy')
+        if raw_anchor_xy is None:
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.anchor_xy cannot be None. '
+                'Omit the key if no anchor is provided.'
+            )
+
+        if (
+            not isinstance(raw_anchor_xy, (list, tuple))
+            or len(raw_anchor_xy) != 2
+        ):
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.anchor_xy must be '
+                f'a 2-item list or tuple, got {raw_anchor_xy!r}.'
+            )
+
+        anchor_xy = (
+            float(raw_anchor_xy[0]),
+            float(raw_anchor_xy[1]),
+        )
+
+    position = None
+    if 'position' in transform_prop:
+        raw_position = transform_prop.get('position')
+        if raw_position is None:
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.position cannot be None. '
+                'Omit the key to keep the node default position.'
+            )
+
+        if isinstance(raw_position, str):
+            position = raw_position
+
+        elif isinstance(raw_position, (list, tuple)) and len(raw_position) == 2:
+            position = (
+                raw_position[0],
+                raw_position[1],
+            )
+
+        else:
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.position must be '
+                f'a string anchor or a 2-item list/tuple, got {raw_position!r}.'
+            )
+
+    bbox_size = None
+    if 'bbox_size' in transform_prop:
+        raw_bbox_size = transform_prop.get('bbox_size')
+        if raw_bbox_size is None:
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.bbox_size cannot be None. '
+                'Omit the key to keep the node default size.'
+            )
+
+        if (
+            not isinstance(raw_bbox_size, (list, tuple))
+            or len(raw_bbox_size) != 2
+        ):
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.bbox_size must be '
+                f'a 2-item list or tuple, got {raw_bbox_size!r}.'
+            )
+
+        bw, bh = raw_bbox_size
+        if bw is None and bh is None:
+            raise ValueError(
+                f'{node_id}: {input_name}.{kind}.bbox_size cannot be '
+                '[None, None].'
+            )
+
+        if bw is not None:
+            validate_size_expr(bw)
+        if bh is not None:
+            validate_size_expr(bh)
+
+        bbox_size = (bw, bh)
+
+    return SpatialTransform(
+        kind=kind,
+        anchor_xy=anchor_xy,
+        position=position,
+        bbox_size=bbox_size,
+    )
+
+
+def merge_spatial_transform(
+    base: Optional[SpatialTransform],
+    override: Optional[SpatialTransform],
+) -> Optional[SpatialTransform]:
+    """
+    Merge two spatial transform objects using non-``None`` override values.
+
+    ``base`` usually represents node-local defaults, while ``override`` usually
+    comes from :func:`read_spatial_transform`. The returned object keeps every
+    base value unless the override explicitly provides that field.
+    """
+    if base is None:
+        return override
+    if override is None:
+        return base
+
+    return SpatialTransform(
+        kind=override.kind if override.kind is not None else base.kind,
+        anchor_xy=(
+            override.anchor_xy
+            if override.anchor_xy is not None
+            else base.anchor_xy
+        ),
+        position=(
+            override.position
+            if override.position is not None
+            else base.position
+        ),
+        bbox_size=(
+            override.bbox_size
+            if override.bbox_size is not None
+            else base.bbox_size
+        ),
+    )
 
 
 def resolve_size_expr(

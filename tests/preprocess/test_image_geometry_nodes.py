@@ -15,6 +15,7 @@ from morphalo.nodes.preprocess.mask_insert_layer import (
     _place_overlay_on_local_canvas,
     _resize_overlay_to_box,
 )
+from morphalo.nodes.preprocess.utils import read_spatial_transform
 
 
 def _save_grid(path):
@@ -422,6 +423,43 @@ def test_image_stack_transform_accepts_placement_metadata(tmp_path):
     assert result.getpixel((8, 9)) == (255, 0, 0, 255)
 
 
+def test_image_stack_transform_defaults_missing_anchor_to_layer_center(tmp_path):
+    src = tmp_path / 'layer.png'
+    Image.new('RGBA', (4, 4), color=(255, 0, 0, 255)).save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        stack = ImageStack(
+            name='stack',
+            spec={
+                'params': {
+                    'width': 16,
+                    'height': 16,
+                    'background': None,
+                    'out_mode': 'RGBA',
+                }
+            },
+        )
+        stack.image(idx=0, position='bottom-right')
+
+    out = stack.run(
+        tmp_path,
+        input={
+            'image:0': {'image': str(src)},
+            'transform:0': {
+                'placement': {
+                    'position': [8, 8],
+                }
+            },
+        },
+    )
+    result = Image.open(out['image']).convert('RGBA')
+
+    assert result.getpixel((5, 6)) == (0, 0, 0, 0)
+    assert result.getpixel((6, 6)) == (255, 0, 0, 255)
+    assert result.getpixel((9, 9)) == (255, 0, 0, 255)
+    assert result.getpixel((10, 10)) == (0, 0, 0, 0)
+
+
 def test_image_stack_transform_rejects_crop_and_placement_together(tmp_path):
     src = tmp_path / 'layer.png'
     Image.new('RGBA', (4, 4), color=(255, 0, 0, 255)).save(src)
@@ -437,6 +475,14 @@ def test_image_stack_transform_rejects_crop_and_placement_together(tmp_path):
                     'out_mode': 'RGBA',
                 }
             },
+        )
+
+
+def test_read_spatial_transform_rejects_none_anchor():
+    with pytest.raises(ValueError, match='anchor_xy cannot be None'):
+        read_spatial_transform(
+            {'crop': {'anchor_xy': None}},
+            node_id='node',
         )
 
 

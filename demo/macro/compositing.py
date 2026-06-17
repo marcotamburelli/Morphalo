@@ -6,7 +6,7 @@ from morphalo.dag import NodeGroup
 from morphalo.nodes import Img2Img, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import ImageStack, ImgAuxMap, SubjectCrop
-from morphalo.nodes.preprocess.image_stack import ResizeMode
+from morphalo.nodes.preprocess.utils import ResizeMode
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
 

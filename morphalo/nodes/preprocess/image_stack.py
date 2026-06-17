@@ -9,17 +9,14 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import (resolve_size_expr,
+from morphalo.nodes.preprocess.utils import (Point, PositionSpec, ResizeMode,
+                                             SizeExpr, SpatialTransform,
+                                             merge_spatial_transform,
+                                             read_spatial_transform,
+                                             resolve_size_expr,
                                              validate_size_expr)
 
-SizeExpr = int | str
-PositionCoord = int | str | None
-Pos = Union[Tuple[PositionCoord, PositionCoord], str]
-ResizeMode = Tuple[Optional[int | str], Optional[int | str]] \
-    | Literal['fit', 'cover'] \
-    | None
 CornerDelta = tuple[SizeExpr, SizeExpr] | None
-Point = tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -83,7 +80,7 @@ class CornerOffsets:
 @dataclass(frozen=True)
 class LayerSpec:
     idx: int
-    position: Pos = 'center'
+    position: PositionSpec = 'center'
     resize: ResizeMode = None
     rotation: float = 0.0
     corner_offsets: Optional[CornerOffsets] = None
@@ -285,7 +282,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
 
 def _resolve_position_xy(
-    position: Pos,
+    position: PositionSpec,
     W: int,
     H: int,
     lw: int,
@@ -300,7 +297,7 @@ def _resolve_position_xy(
 
     Parameters
     ----------
-    position : Pos
+    position : PositionSpec
         Placement specification.
 
         If a tuple is provided, it is interpreted as the target canvas
@@ -1504,7 +1501,7 @@ class ImageStack(NodeRef):
         self,
         idx: int,
         *,
-        position: Pos = 'center',
+        position: PositionSpec = 'center',
         resize: ResizeMode = None,
         rotation: float = 0.0,
         corner_offsets: Optional[CornerOffsets] = None,
@@ -1921,95 +1918,48 @@ class ImageStack(NodeRef):
             )
 
             if tr is not None:
-                transform_items = [
-                    (name, tr[name])
-                    for name in ('crop', 'placement')
-                    if name in tr
-                ]
-
-                if not transform_items:
+                default_spatial = SpatialTransform(
+                    anchor_xy=anchor_xy,
+                    position=position,
+                )
+                transform_spatial = read_spatial_transform(
+                    tr,
+                    node_id=self.id,
+                    input_name=f'transform:{idx}',
+                )
+                if transform_spatial is None:
                     raise ValueError(
                         f'{self.id}: missing transform metadata on transform:{idx}; '
                         "expected key 'crop' or 'placement'."
                     )
 
-                if len(transform_items) > 1:
-                    raise ValueError(
-                        f'{self.id}: transform:{idx} contains both crop and placement '
-                        'metadata; expected only one.'
-                    )
-
-                transform_name, transform_prop = transform_items[0]
-
-                if not isinstance(transform_prop, dict):
-                    raise TypeError(
-                        f'{self.id}: transform:{idx}.{transform_name} must be a dict, '
-                        f'got {type(transform_prop).__name__}.'
-                    )
-
-                raw_anchor_xy = transform_prop.get('anchor_xy')
-                if raw_anchor_xy is None:
-                    raise ValueError(
-                        f'{self.id}: missing {transform_name}.anchor_xy metadata on '
-                        f'transform:{idx}.'
-                    )
-
-                if not isinstance(raw_anchor_xy, (list, tuple)) or len(raw_anchor_xy) != 2:
-                    raise ValueError(
-                        f'{self.id}: {transform_name}.anchor_xy on transform:{idx} must '
-                        f'be a 2-item list or tuple, got {raw_anchor_xy!r}.'
-                    )
-
-                anchor_xy = (
-                    float(raw_anchor_xy[0]),
-                    float(raw_anchor_xy[1]),
+                spatial = merge_spatial_transform(
+                    default_spatial,
+                    transform_spatial,
                 )
 
-                if 'position' in transform_prop:
-                    raw_position = transform_prop.get('position')
-                    if raw_position is None:
-                        raise ValueError(
-                            f'{self.id}: {transform_name}.position on transform:{idx} '
-                            'cannot be None. Omit the key to keep image(position=...).'
-                        )
+                if spatial is None:
+                    raise ValueError(
+                        f'{self.id}: failed to resolve spatial transform for layer idx={idx}.'
+                    )
 
-                    if isinstance(raw_position, str):
-                        position = raw_position
+                if spatial.anchor_xy is None:
+                    raise ValueError(
+                        f'{self.id}: missing resolved anchor_xy for transform:{idx}. '
+                        'The layer default anchor or transform metadata must provide it.'
+                    )
 
-                    elif isinstance(raw_position, (list, tuple)) and len(raw_position) == 2:
-                        position = (
-                            raw_position[0],
-                            raw_position[1],
-                        )
+                if spatial.position is None:
+                    raise ValueError(
+                        f'{self.id}: missing resolved position for transform:{idx}. '
+                        'The layer default position or transform metadata must provide it.'
+                    )
 
-                    else:
-                        raise ValueError(
-                            f'{self.id}: {transform_name}.position on transform:{idx} '
-                            'must be a string anchor or a 2-item list/tuple, got '
-                            f'{raw_position!r}.'
-                        )
+                anchor_xy = spatial.anchor_xy
+                position = spatial.position
 
-                bbox_size = transform_prop.get('bbox_size')
-                if bbox_size is not None:
-                    if not isinstance(bbox_size, (list, tuple)) or len(bbox_size) != 2:
-                        raise ValueError(
-                            f'{self.id}: {transform_name}.bbox_size on transform:{idx} '
-                            f'must be a 2-item list or tuple, got {bbox_size!r}.'
-                        )
-
-                    bw, bh = bbox_size
-                    if bw is None and bh is None:
-                        raise ValueError(
-                            f'{self.id}: {transform_name}.bbox_size on transform:{idx} '
-                            'cannot be [None, None].'
-                        )
-
-                    if bw is not None:
-                        validate_size_expr(bw)
-                    if bh is not None:
-                        validate_size_expr(bh)
-
-                    resize = (bw, bh)
+                if spatial.bbox_size is not None:
+                    resize = spatial.bbox_size
 
             layer, anchor_xy = _apply_corner_offsets(
                 layer,

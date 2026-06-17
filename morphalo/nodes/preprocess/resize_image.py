@@ -8,16 +8,17 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
+from morphalo.nodes.preprocess.utils import (SizeSpec, SpatialTransform,
+                                             merge_spatial_transform,
+                                             read_spatial_transform,
+                                             resolve_size_expr,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
-
-
-ResizeSize = tuple[Optional[SizeExpr], Optional[SizeExpr]]
 
 
 @dataclass
 class Config:
-    size: Optional[ResizeSize]
+    size: Optional[SizeSpec]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -30,7 +31,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     return Config(size=_read_size_value(size_value, node_id=node_id, name='params.size'))
 
 
-def _read_size_value(value: Any, *, node_id: str, name: str) -> ResizeSize:
+def _read_size_value(value: Any, *, node_id: str, name: str) -> SizeSpec:
     """
     Validate a two-axis resize size expression.
 
@@ -54,59 +55,16 @@ def _read_size_value(value: Any, *, node_id: str, name: str) -> ResizeSize:
     if width_expr is None and height_expr is None:
         raise ValueError(f"'{node_id}': {name} cannot be [None, None]")
 
+    if width_expr is not None:
+        validate_size_expr(width_expr)
+    if height_expr is not None:
+        validate_size_expr(height_expr)
+
     return (width_expr, height_expr)
 
 
-def _size_from_transform(
-    transform: Optional[Dict[str, Any]],
-    *,
-    node_id: str,
-) -> Optional[ResizeSize]:
-    """
-    Extract an optional resize size from crop or placement transform metadata.
-
-    The accepted metadata contract mirrors ``ImageStack.transform()``: the
-    upstream node may provide exactly one of ``crop`` or ``placement``. If the
-    chosen block contains ``bbox_size``, that value overrides ``params.size``.
-    If no transform or no ``bbox_size`` is provided, the caller falls back to
-    the configured size.
-    """
-    if not transform:
-        return None
-
-    present = [
-        name for name in ('crop', 'placement')
-        if transform.get(name) is not None
-    ]
-    if len(present) > 1:
-        raise ValueError(
-            f"{node_id}: transform contains both crop and placement metadata; "
-            'expected only one.'
-        )
-    if not present:
-        return None
-
-    transform_name = present[0]
-    transform_prop = transform[transform_name]
-    if not isinstance(transform_prop, dict):
-        raise TypeError(
-            f'{node_id}: transform.{transform_name} must be a dict, '
-            f'got {type(transform_prop).__name__}.'
-        )
-
-    bbox_size = transform_prop.get('bbox_size')
-    if bbox_size is None:
-        return None
-
-    return _read_size_value(
-        bbox_size,
-        node_id=node_id,
-        name=f'transform.{transform_name}.bbox_size',
-    )
-
-
 def _resolve_resize_size(
-    size: ResizeSize,
+    size: SizeSpec,
     *,
     input_width: int,
     input_height: int,
@@ -134,7 +92,7 @@ def _resolve_resize_size(
     raise ValueError('resize size cannot be [None, None]')
 
 
-def _json_size(size: ResizeSize) -> list[Optional[Union[int, str]]]:
+def _json_size(size: SizeSpec) -> list[Optional[Union[int, str]]]:
     return [size[0], size[1]]
 
 
@@ -262,12 +220,20 @@ class ResizeImage(NodeRef):
 
         node_id = self.id
         cfg = _read_cfg(spec, node_id=node_id)
-        transform_size = _size_from_transform(
+        default_spatial = SpatialTransform(bbox_size=cfg.size)
+        transform_spatial = read_spatial_transform(
             None if input is None else input.get('transform'),
             node_id=node_id,
         )
-        size = transform_size or cfg.size
-        size_source = 'transform' if transform_size is not None else 'params'
+        spatial = merge_spatial_transform(default_spatial, transform_spatial)
+
+        size = None if spatial is None else spatial.bbox_size
+        size_source = (
+            'transform'
+            if transform_spatial is not None
+            and transform_spatial.bbox_size is not None
+            else 'params'
+        )
         if size is None:
             raise ValueError(
                 f"'{node_id}': missing params.size and no transform bbox_size "

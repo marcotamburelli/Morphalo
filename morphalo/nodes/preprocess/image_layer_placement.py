@@ -5,13 +5,13 @@ from typing import Any, Dict, Literal, Optional, Union
 import numpy as np
 from PIL import Image
 
-from morphalo.core.paths import make_node_output_path
 from morphalo.cache.models import get_mediapipe_pose_landmarker
+from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.image_stack import Pos, ResizeMode
-from morphalo.nodes.preprocess.utils import validate_size_expr
+from morphalo.nodes.preprocess.utils import (PositionSpec, ResizeMode,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.human import mp_pose_landmarks_xy
 
@@ -59,7 +59,7 @@ class Config:
 
     device: str
     anchor: str
-    position: Optional[Pos]
+    position: Optional[PositionSpec]
     bbox_size: ResizeMode
     pose_landmarker_task: Optional[str]
 
@@ -150,7 +150,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     )
 
 
-def _read_position(value: Any, *, node_id: str) -> Pos:
+def _read_position(value: Any, *, node_id: str) -> PositionSpec:
     """
     Validate a placement target accepted by ``ImageStack``.
 
@@ -192,7 +192,9 @@ def _read_bbox_size(value: Any, *, node_id: str) -> ResizeMode:
 
     width, height = value
     if width is None and height is None:
-        raise ValueError(f"'{node_id}': params.bbox_size cannot be [None, None]")
+        raise ValueError(
+            f"'{node_id}': params.bbox_size cannot be [None, None]"
+        )
 
     if width is not None:
         validate_size_expr(width)
@@ -446,7 +448,9 @@ def _resolve_anchor(
     return _geometry_anchor(anchor, width=image.width, height=image.height)
 
 
-def _json_position(position: Optional[Pos]) -> Optional[Union[str, list[Any]]]:
+def _json_position(
+    position: Optional[PositionSpec],
+) -> Optional[Union[str, list[Any]]]:
     """
     Convert an internal position value to a JSON-serializable representation.
     """
