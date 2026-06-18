@@ -886,6 +886,11 @@ def refine_sliding_tiles_group(
                 spec=refine_spec,
             )
 
+            resize_tile = ResizeImage(
+                name=f'resize_{idx:02d}',
+                spec={},
+            )
+
             texture_sink = refine_tile.ip_adapter.add(
                 'h94/IP-Adapter',
                 subfolder='sdxl_models',
@@ -927,7 +932,13 @@ def refine_sliding_tiles_group(
             tap_style_texture >> texture_sink
             tap_style_struct >> struct_sink
 
-            # 4) Composite the refined tile back using crop metadata.
+            # 4) Restore the refined tile to the original crop size before
+            #    compositing. Img2Img may emit a different resolution, while
+            #    BoxCrop anchor metadata is expressed in crop-local pixels.
+            refine_tile >> resize_tile
+            crop_tile >> resize_tile.transform()
+
+            # 5) Composite the resized refined tile back using crop metadata.
             layer = stack.image(
                 1,
                 position='center',
@@ -935,7 +946,7 @@ def refine_sliding_tiles_group(
                 corner_radius=layer_corner_radius,
             )
 
-            refine_tile >> layer
+            resize_tile >> layer
             crop_tile >> layer.transform()
 
             previous_image = stack
@@ -1142,6 +1153,11 @@ def refine_sliding_tiles_with_controlnet_group(
                 spec=refine_spec,
             )
 
+            resize_tile = ResizeImage(
+                name=f'resize_{idx:02d}',
+                spec={},
+            )
+
             texture_sink = refine_tile.ip_adapter.add(
                 'h94/IP-Adapter',
                 subfolder='sdxl_models',
@@ -1196,7 +1212,13 @@ def refine_sliding_tiles_with_controlnet_group(
             tap_style_struct >> struct_sink
             aux_map >> controlnet_sink
 
-            # 5) Composite the refined tile back using crop metadata.
+            # 5) Restore the refined tile to the original crop size before
+            #    compositing. Img2Img may emit a different resolution, while
+            #    BoxCrop anchor metadata is expressed in crop-local pixels.
+            refine_tile >> resize_tile
+            crop_tile >> resize_tile.transform()
+
+            # 6) Composite the resized refined tile back using crop metadata.
             layer = stack.image(
                 1,
                 position='center',
@@ -1204,7 +1226,7 @@ def refine_sliding_tiles_with_controlnet_group(
                 corner_radius=layer_corner_radius,
             )
 
-            refine_tile >> layer
+            resize_tile >> layer
             crop_tile >> layer.transform()
 
             previous_image = stack

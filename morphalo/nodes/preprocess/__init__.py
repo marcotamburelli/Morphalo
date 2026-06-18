@@ -1,6 +1,6 @@
 from .any_crop import AnyCrop
 from .box_crop import BoxCrop
-from .dominant_color_transparency import DominantColorTransparency
+from .color_driven_crop import ColorDrivenCrop
 from .face_crop import FaceCrop
 from .flip_image import FlipImage
 from .image_stack import ImageStack
@@ -14,7 +14,7 @@ from .transpose_image import TransposeImage
 __all__ = [
     'AnyCrop',
     'BoxCrop',
-    'DominantColorTransparency',
+    'ColorDrivenCrop',
     'FaceCrop',
     'FlipImage',
     'ImageStack',
