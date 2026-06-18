@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union, cast
 
 import numpy as np
 from PIL import Image
@@ -10,7 +10,7 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import (PositionSpec, ResizeMode,
+from morphalo.nodes.preprocess.utils import (PositionSpec, SizeSpec,
                                              validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.human import mp_pose_landmarks_xy
@@ -58,9 +58,9 @@ class Config:
     """
 
     device: str
-    anchor: str
+    anchor: AnchorName
     position: Optional[PositionSpec]
-    bbox_size: ResizeMode
+    bbox_size: Optional[SizeSpec]
     pose_landmarker_task: Optional[str]
 
 
@@ -87,28 +87,16 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     device = str(model.get('device', 'cuda'))
 
     anchor = str(params.get('anchor', 'center')).lower().strip()
-    valid = {
+    valid: set[AnchorName] = {
         'top-left',
-        'left-top',
         'top-center',
-        'center-top',
-        'top',
         'top-right',
-        'right-top',
         'center-left',
-        'left-center',
-        'left',
         'center',
         'center-right',
-        'right-center',
-        'right',
         'bottom-left',
-        'left-bottom',
         'bottom-center',
-        'center-bottom',
-        'bottom',
         'bottom-right',
-        'right-bottom',
         'alpha-center',
         'alpha-bbox-center',
         'alpha-top-center',
@@ -119,10 +107,14 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         'hips-center',
         'head-center',
     }
+
     if anchor not in valid:
         raise ValueError(
-            f"'{node_id}': invalid anchor={anchor!r}"
+            f"'{node_id}': invalid anchor={anchor!r}; expected one of "
+            f'{sorted(valid)!r}'
         )
+
+    anchor = cast(AnchorName, anchor)
 
     position = params.get('position')
     if position is not None:
@@ -176,7 +168,7 @@ def _read_position(value: Any, *, node_id: str) -> PositionSpec:
     return (x, y)
 
 
-def _read_bbox_size(value: Any, *, node_id: str) -> ResizeMode:
+def _read_bbox_size(value: Any, *, node_id: str) -> SizeSpec:
     """
     Validate an optional target layer size.
 
@@ -204,33 +196,12 @@ def _read_bbox_size(value: Any, *, node_id: str) -> ResizeMode:
     return (width, height)
 
 
-def _normalize_anchor_name(anchor: str) -> str:
-    """
-    Normalize supported geometric anchor aliases to canonical names.
-
-    Examples
-    --------
-    ``'top'`` and ``'center-top'`` become ``'top-center'``.
-    ``'left'`` and ``'left-center'`` become ``'center-left'``.
-    """
-    aliases = {
-        'left-top': 'top-left',
-        'top': 'top-center',
-        'center-top': 'top-center',
-        'right-top': 'top-right',
-        'left': 'center-left',
-        'left-center': 'center-left',
-        'right': 'center-right',
-        'right-center': 'center-right',
-        'left-bottom': 'bottom-left',
-        'bottom': 'bottom-center',
-        'center-bottom': 'bottom-center',
-        'right-bottom': 'bottom-right',
-    }
-    return aliases.get(anchor, anchor)
-
-
-def _geometry_anchor(anchor: str, *, width: int, height: int) -> tuple[float, float]:
+def _geometry_anchor(
+    anchor: AnchorName,
+    *,
+    width: int,
+    height: int,
+) -> tuple[float, float]:
     """
     Resolve a named geometric anchor inside an image rectangle.
 
@@ -239,7 +210,6 @@ def _geometry_anchor(anchor: str, *, width: int, height: int) -> tuple[float, fl
     outer corner. This convention matches ImageStack placement, where an anchor
     can sit on the outside edge of a layer.
     """
-    anchor = _normalize_anchor_name(anchor)
     if anchor == 'center':
         return float(width) / 2.0, float(height) / 2.0
 
@@ -272,7 +242,7 @@ def _alpha_bbox(image: Image.Image) -> tuple[int, int, int, int]:
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
-def _alpha_anchor(anchor: str, image: Image.Image) -> tuple[float, float]:
+def _alpha_anchor(anchor: AnchorName, image: Image.Image) -> tuple[float, float]:
     """
     Resolve an alpha-derived local anchor.
 
@@ -371,7 +341,7 @@ def _head_center_from_pose(pose_xy: np.ndarray) -> np.ndarray:
     return np.mean(np.stack(head_pts, axis=0), axis=0)
 
 
-def _human_anchor(anchor: str, pose_xy: np.ndarray) -> tuple[float, float]:
+def _human_anchor(anchor: AnchorName, pose_xy: np.ndarray) -> tuple[float, float]:
     """
     Resolve a semantic human anchor from MediaPipe pose landmarks.
 
@@ -418,7 +388,7 @@ def _human_anchor(anchor: str, pose_xy: np.ndarray) -> tuple[float, float]:
 
 
 def _resolve_anchor(
-    anchor: str,
+    anchor: AnchorName,
     image: Image.Image,
     *,
     device: str = 'cuda',
@@ -427,7 +397,6 @@ def _resolve_anchor(
     """
     Resolve a geometric, alpha-derived or human-landmark anchor for ``image``.
     """
-    anchor = _normalize_anchor_name(anchor)
     if anchor.startswith('alpha-'):
         return _alpha_anchor(anchor, image)
     if anchor in HUMAN_ANCHORS:
@@ -459,13 +428,13 @@ def _json_position(
     return [position[0], position[1]]
 
 
-def _json_resize(resize: ResizeMode) -> Optional[Union[str, list[Any]]]:
+def _json_size(size: Optional[SizeSpec]) -> Optional[list[Any]]:
     """
-    Convert an internal resize value to a JSON-serializable representation.
+    Convert an internal size value to a JSON-serializable representation.
     """
-    if resize is None or isinstance(resize, str):
-        return resize
-    return [resize[0], resize[1]]
+    if size is None:
+        return None
+    return [size[0], size[1]]
 
 
 @dataclass
@@ -508,8 +477,9 @@ class ImageLayerPlacement(NodeRef):
     - ``'center-left'``, ``'center'``, ``'center-right'``
     - ``'bottom-left'``, ``'bottom-center'``, ``'bottom-right'``
 
-    Short aliases such as ``'top'``, ``'left'`` and ``'bottom'`` are accepted and
-    normalized to their center-edge forms.
+    Only the documented canonical anchor names are accepted. Short aliases such as
+    ``'top'`` or ``'left'`` are intentionally not supported, so configuration files
+    remain explicit and predictable.
 
     Alpha anchors
     -------------
@@ -577,7 +547,8 @@ class ImageLayerPlacement(NodeRef):
 
         ``params`` : dict
             ``anchor`` : str, optional
-                Local anchor to compute. Default: ``'center'``.
+                Local anchor to compute. Must be one of the documented canonical
+                anchor names. Default: ``'center'``.
 
             ``position`` : str or list[int | str | None, int | str | None], optional
                 Canvas placement target to forward to ImageStack. If omitted,
@@ -645,7 +616,7 @@ class ImageLayerPlacement(NodeRef):
         if cfg.position is not None:
             placement['position'] = _json_position(cfg.position)
         if cfg.bbox_size is not None:
-            placement['bbox_size'] = _json_resize(cfg.bbox_size)
+            placement['bbox_size'] = _json_size(cfg.bbox_size)
 
         out = {
             'ok': True,
@@ -657,7 +628,7 @@ class ImageLayerPlacement(NodeRef):
             'params': {
                 'anchor': cfg.anchor,
                 'position': _json_position(cfg.position),
-                'bbox_size': _json_resize(cfg.bbox_size),
+                'bbox_size': _json_size(cfg.bbox_size),
                 **({} if cfg.pose_landmarker_task is None else {
                     'device': cfg.device,
                     'pose_landmarker_task': cfg.pose_landmarker_task,

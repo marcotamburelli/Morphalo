@@ -12,12 +12,152 @@ from morphalo.dag import NodeRef
 
 Output = Dict[str, Any]
 
+# Internal CUDA shutdown heuristics. These values are intentionally not exposed
+# as public node parameters: they define executor-level safety behavior, not DAG
+# semantics.
+_CUDA_IDLE_MAX_WAIT = 60.0
+_CUDA_STARTUP_IDLE_MAX_WAIT = 20.0
+_CUDA_IDLE_POLL_INTERVAL = 2.0
+_CUDA_IDLE_POWER_MARGIN_WATTS = 25.0
+_CUDA_IDLE_TEMPERATURE_MARGIN_CELSIUS = 12.0
+_CUDA_IDLE_MIN_POWER_WATTS = 30.0
+_CUDA_IDLE_MIN_TEMPERATURE_CELSIUS = 40.0
+_CUDA_IDLE_SHUTDOWN_MIN_PSTATE = 5
+_CUDA_IDLE_STARTUP_MIN_PSTATE = 5
+_CUDA_IDLE_FALLBACK_POWER_WATTS = 80.0
+_CUDA_IDLE_FALLBACK_TEMPERATURE_CELSIUS = 45.0
+_CUDA_IDLE_BASELINE_MAX_TEMPERATURE_CELSIUS = 45.0
+
 
 @dataclass
 class NodeJob:
     node: NodeRef
     out_dir: str
     input_map: Dict[str, Output]
+
+
+@dataclass
+class WorkerShutdown:
+    """Request graceful worker shutdown with optional CUDA quiesce.
+
+    Parameters
+    ----------
+    wait_for_cuda_idle : bool, default=True
+        Whether the worker should try to synchronize CUDA work and wait for the
+        GPU to appear idle before exiting.
+
+    min_wait : float, default=5.0
+        Minimum number of seconds to wait after CUDA synchronization and cache
+        cleanup before polling GPU state.
+
+    max_wait : float, default=60.0
+        Maximum total number of seconds spent in the shutdown idle wait.
+
+    poll_interval : float, default=2.0
+        Delay between consecutive NVML probes.
+
+    max_power_watts : float, default=80.0
+        Maximum GPU power draw considered quiet enough. In normal execution this
+        value is computed by the parent from the first valid worker baseline plus a
+        margin. The default is a fallback used when no valid baseline is available.
+
+    max_temperature_celsius : float, default=45.0
+        Maximum GPU temperature considered quiet enough. In normal execution this
+        value is computed by the parent from the first valid worker baseline plus a
+        margin. The default is a conservative fallback used when no valid baseline
+        is available.
+
+    min_pstate : int, default=5
+        Minimum accepted NVML performance state. Lower values are higher
+        performance states, so ``5`` accepts ``P5`` and colder / more idle
+        states, while rejecting ``P0`` through ``P4``.
+
+    Notes
+    -----
+    This command is consumed only by the worker process. The parent uses it to
+    request an orderly shutdown, but does not import PyTorch, NVML, or any
+    CUDA-related monitoring library itself.
+    """
+
+    wait_for_cuda_idle: bool = True
+    min_wait: float = 5.0
+    max_wait: float = _CUDA_IDLE_MAX_WAIT
+    poll_interval: float = _CUDA_IDLE_POLL_INTERVAL
+    max_power_watts: float = _CUDA_IDLE_FALLBACK_POWER_WATTS
+    max_temperature_celsius: float = _CUDA_IDLE_FALLBACK_TEMPERATURE_CELSIUS
+    min_pstate: int = _CUDA_IDLE_SHUTDOWN_MIN_PSTATE
+
+
+@dataclass
+class WorkerWaitForCudaIdle:
+    """Request a best-effort CUDA idle wait before the first CUDA job.
+
+    This command is sent by the parent only when the next job is CUDA and the
+    current worker has not yet performed a startup idle wait. The worker remains
+    alive after handling it and replies with :class:`WorkerCudaIdleReady`.
+    """
+
+    max_wait: float = _CUDA_STARTUP_IDLE_MAX_WAIT
+    poll_interval: float = _CUDA_IDLE_POLL_INTERVAL
+    max_power_watts: float = _CUDA_IDLE_FALLBACK_POWER_WATTS
+    max_temperature_celsius: float = _CUDA_IDLE_FALLBACK_TEMPERATURE_CELSIUS
+    min_pstate: int = _CUDA_IDLE_STARTUP_MIN_PSTATE
+
+
+@dataclass
+class WorkerCudaIdleReady:
+    """Report completion of the pre-CUDA idle wait command."""
+
+    idle_reached: bool = False
+    baseline: Optional['NvidiaIdleBaseline'] = None
+    error_message: Optional[str] = None
+
+
+@dataclass
+class NvidiaIdleBaseline:
+    """Idle-like NVIDIA GPU state measured by a worker process.
+
+    Parameters
+    ----------
+    temperature_celsius : float
+        Current GPU temperature in Celsius.
+
+    power_watts : float
+        Current GPU power draw in watts.
+
+    pstate : int
+        NVML performance state. Lower values mean higher performance states:
+        ``0`` is ``P0``, while larger values are progressively more idle.
+
+    gpu_utilization_percent : int
+        Current GPU utilization percentage.
+
+    memory_used_mib : int
+        Currently allocated GPU memory in MiB.
+    """
+    temperature_celsius: float
+    power_watts: float
+    pstate: int
+    gpu_utilization_percent: int
+    memory_used_mib: int
+
+
+@dataclass
+class WorkerStarted:
+    """Report worker startup status to the parent process.
+
+    Parameters
+    ----------
+    baseline : NvidiaIdleBaseline or None
+        Baseline GPU state measured by the worker before running any node.
+        ``None`` means the baseline could not be measured.
+
+    error_message : str or None
+        Optional non-fatal error message explaining why the baseline could not
+        be measured.
+    """
+    baseline: Optional[NvidiaIdleBaseline] = None
+    error_message: Optional[str] = None
 
 
 @dataclass
@@ -33,6 +173,261 @@ class ProcessNodeExecutionError(RuntimeError):
     """Raised when a node cannot be executed by the worker process."""
 
 
+def _wait_for_nvidia_idle_in_worker(
+    *,
+    max_wait: float,
+    poll_interval: float,
+    max_power_watts: float,
+    max_temperature_celsius: float,
+    min_pstate: int,
+) -> WorkerCudaIdleReady:
+    """Wait for the GPU to look idle before CUDA work starts.
+
+    Returns
+    -------
+    WorkerCudaIdleReady
+        Command result containing the final measured baseline, or a non-fatal
+        error if NVML could not be used.
+
+    Notes
+    -----
+    This wait runs inside the worker, before the first CUDA node in that worker.
+    It does not import PyTorch or create a CUDA context; it uses NVML only as a
+    best-effort sensor so a CUDA job does not immediately start loading models
+    while the GPU still appears to be settling from the previous worker teardown.
+    """
+    try:
+        from pynvml import (NVML_TEMPERATURE_GPU, NVMLError,
+                            nvmlDeviceGetHandleByIndex,
+                            nvmlDeviceGetMemoryInfo,
+                            nvmlDeviceGetPerformanceState,
+                            nvmlDeviceGetPowerUsage, nvmlDeviceGetTemperature,
+                            nvmlDeviceGetUtilizationRates, nvmlInit,
+                            nvmlShutdown)
+    except BaseException as exc:
+        return WorkerCudaIdleReady(
+            error_message=f'NVML unavailable during pre-CUDA idle wait: {exc}',
+        )
+
+    deadline = time.monotonic() + max_wait
+    last_baseline: Optional[NvidiaIdleBaseline] = None
+
+    try:
+        nvmlInit()
+        try:
+            handle = nvmlDeviceGetHandleByIndex(0)
+
+            while True:
+                try:
+                    memory = nvmlDeviceGetMemoryInfo(handle)
+                    utilization = nvmlDeviceGetUtilizationRates(handle)
+                    temperature = nvmlDeviceGetTemperature(
+                        handle,
+                        NVML_TEMPERATURE_GPU,
+                    )
+                    power_watts = nvmlDeviceGetPowerUsage(handle) / 1000.0
+                    pstate = nvmlDeviceGetPerformanceState(handle)
+
+                    last_baseline = NvidiaIdleBaseline(
+                        temperature_celsius=float(temperature),
+                        power_watts=float(power_watts),
+                        pstate=int(pstate),
+                        gpu_utilization_percent=int(utilization.gpu),
+                        memory_used_mib=int(memory.used // (1024 * 1024)),
+                    )
+
+                    print(
+                        f'[ProcessNodeExecutor] worker pre-CUDA idle probe: '
+                        f'temp={temperature}C, '
+                        f'power={power_watts:.1f}W, '
+                        f'pstate=P{pstate}, '
+                        f'util={utilization.gpu}%, '
+                        f'mem={last_baseline.memory_used_mib}MiB',
+                        flush=True,
+                    )
+
+                    if (
+                        utilization.gpu == 0
+                        and power_watts <= max_power_watts
+                        and temperature <= max_temperature_celsius
+                        and pstate >= min_pstate
+                    ):
+                        return WorkerCudaIdleReady(
+                            idle_reached=True,
+                            baseline=last_baseline,
+                        )
+
+                except NVMLError as exc:
+                    return WorkerCudaIdleReady(
+                        error_message=f'NVML pre-CUDA idle probe failed: {exc}',
+                    )
+
+                if time.monotonic() >= deadline:
+                    if last_baseline is not None:
+                        print(
+                            '[ProcessNodeExecutor] pre-CUDA idle wait timed out; '
+                            'continuing with last measured GPU state',
+                            flush=True,
+                        )
+                        return WorkerCudaIdleReady(
+                            idle_reached=False,
+                            baseline=last_baseline,
+                            error_message='NVML pre-CUDA idle wait timed out',
+                        )
+
+                    return WorkerCudaIdleReady(
+                        error_message='NVML pre-CUDA idle wait timed out before first reading',
+                    )
+
+                time.sleep(poll_interval)
+        finally:
+            nvmlShutdown()
+
+    except BaseException as exc:
+        return WorkerCudaIdleReady(
+            error_message=f'NVML pre-CUDA idle wait failed: {exc}',
+        )
+
+
+def _wait_for_cuda_idle_in_worker(
+    *,
+    min_wait: float,
+    max_wait: float,
+    poll_interval: float,
+    max_power_watts: float,
+    max_temperature_celsius: float,
+    min_pstate: int,
+) -> None:
+    """Quiesce CUDA work and wait for the GPU to appear idle.
+
+    Parameters
+    ----------
+    min_wait : float
+        Minimum number of seconds to wait after CUDA synchronization and cache
+        cleanup before polling GPU state.
+
+    max_wait : float
+        Maximum total number of seconds spent in the idle wait. If the GPU does
+        not satisfy the idle heuristic within this window, the function returns
+        and allows worker shutdown to continue.
+
+    poll_interval : float
+        Delay between consecutive NVML probes.
+
+    max_power_watts : float
+        Maximum power draw considered quiet enough.
+
+    max_temperature_celsius : float
+        Maximum GPU temperature considered quiet enough.
+
+    Notes
+    -----
+    This function runs inside the worker process, never in the parent process.
+    It may import CUDA-related libraries because the worker already owns the
+    CUDA context and NVIDIA device handles.
+
+    The function first synchronizes pending CUDA work, triggers Python garbage
+    collection, and asks PyTorch to release unused cached CUDA allocations. This
+    does not destroy the CUDA context; the real context boundary is still the
+    worker process exit.
+
+    NVML is used only as a best-effort sensor. It helps avoid exiting the worker
+    immediately after a CUDA-heavy chunk while the GPU still appears hot or busy.
+    It does not clean up PyTorch, Diffusers, CUDA, UVM, or NVIDIA driver state.
+
+    Failure to import or query NVML is not fatal. In that case, the worker still
+    performs CUDA synchronization and the minimum wait, then continues with
+    normal shutdown.
+    """
+    import gc
+
+    try:
+        import torch
+
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+    except BaseException as exc:
+        print(
+            f'[ProcessNodeExecutor] CUDA quiesce skipped: {exc}',
+            flush=True,
+        )
+
+    if min_wait > 0:
+        time.sleep(min_wait)
+
+    try:
+        from pynvml import (NVML_TEMPERATURE_GPU, NVMLError,
+                            nvmlDeviceGetHandleByIndex,
+                            nvmlDeviceGetMemoryInfo,
+                            nvmlDeviceGetPerformanceState,
+                            nvmlDeviceGetPowerUsage, nvmlDeviceGetTemperature,
+                            nvmlDeviceGetUtilizationRates, nvmlInit,
+                            nvmlShutdown)
+
+    except BaseException as exc:
+        print(
+            f'[ProcessNodeExecutor] NVML unavailable; idle polling skipped: {exc}',
+            flush=True,
+        )
+        return
+
+    deadline = time.monotonic() + max(0.0, max_wait - min_wait)
+
+    try:
+        nvmlInit()
+        try:
+            handle = nvmlDeviceGetHandleByIndex(0)
+
+            while time.monotonic() < deadline:
+                try:
+                    memory = nvmlDeviceGetMemoryInfo(handle)
+                    utilization = nvmlDeviceGetUtilizationRates(handle)
+                    temperature = nvmlDeviceGetTemperature(
+                        handle,
+                        NVML_TEMPERATURE_GPU,
+                    )
+                    power_watts = nvmlDeviceGetPowerUsage(handle) / 1000.0
+                    memory_used_mib = memory.used // (1024 * 1024)
+                    pstate = nvmlDeviceGetPerformanceState(handle)
+
+                    print(
+                        f'[ProcessNodeExecutor] worker GPU idle probe: '
+                        f'temp={temperature}C, '
+                        f'power={power_watts:.1f}W, '
+                        f'pstate=P{pstate}, '
+                        f'util={utilization.gpu}%, '
+                        f'mem={memory_used_mib}MiB',
+                        flush=True,
+                    )
+
+                    if (
+                        utilization.gpu == 0
+                        and power_watts <= max_power_watts
+                        and temperature <= max_temperature_celsius
+                        and pstate >= min_pstate
+                    ):
+                        return
+
+                except NVMLError as exc:
+                    print(
+                        f'[ProcessNodeExecutor] NVML probe failed: {exc}',
+                        flush=True,
+                    )
+                    return
+
+                time.sleep(poll_interval)
+        finally:
+            nvmlShutdown()
+
+    except BaseException as exc:
+        print(
+            f'[ProcessNodeExecutor] NVML idle wait skipped: {exc}',
+            flush=True,
+        )
+
+
 def _node_worker_main(
     job_queue: mp.Queue,
     result_queue: mp.Queue,
@@ -42,8 +437,36 @@ def _node_worker_main(
     # teardown instead of being interrupted in the middle of CUDA work.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    result_queue.put(WorkerStarted())
+
     while True:
         job = job_queue.get()
+
+        if isinstance(job, WorkerWaitForCudaIdle):
+            result_queue.put(_wait_for_nvidia_idle_in_worker(
+                max_wait=job.max_wait,
+                poll_interval=job.poll_interval,
+                max_power_watts=job.max_power_watts,
+                max_temperature_celsius=job.max_temperature_celsius,
+                min_pstate=job.min_pstate,
+            ))
+            continue
+
+        if isinstance(job, WorkerShutdown):
+            # Shutdown is also part of the CUDA lifecycle. The worker performs
+            # CUDA quiesce before exiting so the parent can remain GPU-blind and
+            # only wait for process termination.
+            if job.wait_for_cuda_idle:
+                _wait_for_cuda_idle_in_worker(
+                    min_wait=job.min_wait,
+                    max_wait=job.max_wait,
+                    poll_interval=job.poll_interval,
+                    max_power_watts=job.max_power_watts,
+                    max_temperature_celsius=job.max_temperature_celsius,
+                    min_pstate=job.min_pstate,
+                )
+
+            break
 
         if job is None:
             break
@@ -115,22 +538,22 @@ class ProcessNodeExecutor:
         nodes may continue to use the current worker after the limit has been
         reached; the restart is delayed until another CUDA node is about to run.
 
-    cuda_cooldown_before_restart : float
-        Number of seconds to wait before stopping a worker that reached the CUDA
-        node limit.
+    cuda_shutdown_min_wait : float
+        Minimum number of seconds the worker waits during CUDA shutdown quiesce
+        before polling GPU state.
 
-        This delay gives the GPU, CUDA runtime, and driver a short settling
-        window after the last CUDA-heavy operation in the chunk. It is a
-        defensive mitigation for systems where immediate CUDA context teardown
-        after sustained inference load appears to increase driver instability.
+        When the CUDA-node limit is reached, the parent requests a graceful
+        worker shutdown. The worker then synchronizes CUDA work, releases unused
+        PyTorch CUDA cache, waits at least this many seconds, and optionally uses
+        NVML to wait until the GPU appears quiet enough to exit.
 
     cuda_cooldown_after_restart : float
-        Number of seconds to wait after the old worker has been stopped and
-        before the next worker is started.
+        Number of seconds the parent waits after the old worker has exited and
+        before the next worker may be started.
 
-        This delay separates CUDA context teardown from the next model load or
-        ``.to('cuda')`` operation. It is intended to reduce rapid teardown/reload
-        churn on fragile driver or firmware combinations.
+        This delay is intentionally short. It separates process teardown from
+        the next CUDA context creation, while the heavier pre-exit settling work
+        is performed inside the worker.
 
     Notes
     -----
@@ -155,10 +578,16 @@ class ProcessNodeExecutor:
     a fresh context. Grouping several CUDA nodes in one worker preserves useful
     model-cache reuse while limiting context lifetime.
 
-    The cooldown parameters are intentionally pragmatic. They do not fix CUDA,
-    PyTorch, Diffusers, the NVIDIA driver, or GPU firmware. They only make worker
-    recycling less abrupt, which may reduce the probability of triggering driver
-    failures on unstable systems.
+    Worker recycling is intentionally conservative. Before exiting, the worker
+    can synchronize CUDA work, release unused PyTorch CUDA cache, wait for a
+    minimum settling window, and use NVML as a best-effort sensor to check
+    whether the GPU appears idle enough. After the worker exits, the parent may
+    still wait briefly before spawning the next worker.
+
+    These waits do not fix CUDA, PyTorch, Diffusers, the NVIDIA driver, or GPU
+    firmware. They only make CUDA context teardown and recreation less abrupt,
+    which may reduce the probability of triggering driver failures on unstable
+    systems.
 
     ``SIGINT`` is owned by the parent process. The worker ignores it so a user
     interruption does not abruptly terminate an active CUDA call. On
@@ -178,7 +607,7 @@ class ProcessNodeExecutor:
         self,
         *,
         max_cuda_nodes: int = 8,
-        cuda_cooldown_before_restart: float = 5.0,
+        cuda_shutdown_min_wait: float = 5.0,
         cuda_cooldown_after_restart: float = 3.0,
     ) -> None:
         """Initialize a process-based node executor.
@@ -199,20 +628,21 @@ class ProcessNodeExecutor:
             ``8`` to ``24`` range are an experimental starting point rather than
             a general recommendation.
 
-        cuda_cooldown_before_restart : float, default=5.0
-            Seconds to wait before stopping a worker that reached
-            ``max_cuda_nodes``.
+        cuda_shutdown_min_wait : float, default=5.0
+            Minimum number of seconds used by the worker-side CUDA quiesce step
+            before polling GPU state during graceful shutdown.
 
-            This delay is applied only when the executor is recycling a worker
-            because the CUDA-node limit was reached. It is not applied to every
-            node execution.
+            This is not a parent-side sleep. The delay is applied inside the
+            worker after CUDA synchronization and cache cleanup, before the optional
+            NVML idle polling loop starts.
 
         cuda_cooldown_after_restart : float, default=3.0
-            Seconds to wait after stopping the old worker and before allowing the
-            next worker to be spawned.
+            Seconds to wait after the old worker has exited and before allowing
+            the next worker to be spawned.
 
-            This delay is also applied only during CUDA-limit recycling, not
-            during ordinary executor shutdown at the end of a run.
+            This is a small parent-side gap between process teardown and the next
+            CUDA context creation. The main shutdown settling logic happens
+            inside the worker.
 
         Raises
         ------
@@ -237,10 +667,10 @@ class ProcessNodeExecutor:
                 f'max_cuda_nodes must be > 0, got {max_cuda_nodes}'
             )
 
-        if cuda_cooldown_before_restart < 0:
+        if cuda_shutdown_min_wait < 0:
             raise ValueError(
-                'cuda_cooldown_before_restart must be >= 0, got '
-                f'{cuda_cooldown_before_restart}'
+                'cuda_shutdown_min_wait must be >= 0, got '
+                f'{cuda_shutdown_min_wait}'
             )
 
         if cuda_cooldown_after_restart < 0:
@@ -250,13 +680,21 @@ class ProcessNodeExecutor:
             )
 
         self.max_cuda_nodes = int(max_cuda_nodes)
-        self.cuda_cooldown_before_restart = float(cuda_cooldown_before_restart)
+        self.cuda_shutdown_min_wait = float(cuda_shutdown_min_wait)
         self.cuda_cooldown_after_restart = float(cuda_cooldown_after_restart)
         self._ctx = mp.get_context('spawn')
         self._job_queue: Optional[mp.Queue] = None
         self._result_queue: Optional[mp.Queue] = None
         self._process: Optional[mp.Process] = None
         self._cuda_count = 0
+        self._worker_used_cuda = False
+        self._worker_cuda_idle_wait_done = False
+        self._cuda_idle_baseline: Optional[NvidiaIdleBaseline] = None
+        self._cuda_idle_max_power_watts = _CUDA_IDLE_FALLBACK_POWER_WATTS
+        self._cuda_idle_max_temperature_celsius = (
+            _CUDA_IDLE_FALLBACK_TEMPERATURE_CELSIUS
+        )
+        self._cuda_idle_min_pstate = _CUDA_IDLE_SHUTDOWN_MIN_PSTATE
 
     def _ensure_started(self) -> None:
         if self._process is not None and self._process.is_alive():
@@ -272,6 +710,7 @@ class ProcessNodeExecutor:
 
         try:
             self._process.start()
+            self._read_worker_startup()
         except BaseException:
             job_queue = self._job_queue
             result_queue = self._result_queue
@@ -283,6 +722,8 @@ class ProcessNodeExecutor:
             raise
 
         self._cuda_count = 0
+        self._worker_used_cuda = False
+        self._worker_cuda_idle_wait_done = False
 
     def _close_queue(self, process_queue: Optional[mp.Queue]) -> None:
         if process_queue is None:
@@ -312,12 +753,28 @@ class ProcessNodeExecutor:
             completes only after the worker finishes its current node,
             ``post_run()``, and normal process teardown.
 
+            For workers that executed CUDA nodes, the effective join timeout may
+            be extended so worker-side idle waiting is not interrupted before its
+            configured maximum duration.
+
         terminate : bool, default=True
             Whether to fall back to ``terminate()`` and then ``kill()`` if graceful
             shutdown does not complete within ``graceful_timeout``.
 
             Set this to ``False`` when handling user interruption and preferring a
             safe CUDA teardown over immediate process termination.
+
+        Notes
+        -----
+        Graceful shutdown sends a :class:`WorkerShutdown` command instead of
+        abruptly killing the worker. The worker may perform CUDA synchronization,
+        cache cleanup, a minimum settling wait, and optional NVML polling before
+        exiting. The parent does not read an explicit shutdown ACK; successful
+        process termination is the acknowledgement.
+
+        If the worker has not executed CUDA nodes, shutdown skips CUDA quiesce
+        and returns immediately after the worker exits normally. CUDA idle
+        waiting is used only for workers that actually ran CUDA work.
         """
         if self._process is None:
             return
@@ -345,6 +802,13 @@ class ProcessNodeExecutor:
         process = self._process
         job_queue = self._job_queue
         result_queue = self._result_queue
+        join_timeout = graceful_timeout
+
+        if graceful_timeout is not None and self._worker_used_cuda:
+            join_timeout = max(
+                graceful_timeout,
+                _CUDA_IDLE_MAX_WAIT + 10.0,
+            )
 
         try:
             if process.is_alive() and job_queue is not None:
@@ -352,12 +816,20 @@ class ProcessNodeExecutor:
                     f'[ProcessNodeExecutor] requesting worker stop pid={process.pid}',
                     flush=True,
                 )
-                job_queue.put(None)
+                job_queue.put(WorkerShutdown(
+                    wait_for_cuda_idle=self._worker_used_cuda,
+                    min_wait=self.cuda_shutdown_min_wait,
+                    max_wait=_CUDA_IDLE_MAX_WAIT,
+                    poll_interval=_CUDA_IDLE_POLL_INTERVAL,
+                    max_power_watts=self._cuda_idle_max_power_watts,
+                    max_temperature_celsius=self._cuda_idle_max_temperature_celsius,
+                    min_pstate=self._cuda_idle_min_pstate,
+                ))
 
-                if graceful_timeout is None:
+                if join_timeout is None:
                     process.join()
                 else:
-                    process.join(timeout=graceful_timeout)
+                    process.join(timeout=join_timeout)
 
             if process.is_alive() and terminate:
                 print(
@@ -390,6 +862,8 @@ class ProcessNodeExecutor:
             self._job_queue = None
             self._result_queue = None
             self._cuda_count = 0
+            self._worker_used_cuda = False
+            self._worker_cuda_idle_wait_done = False
 
             self._close_queue(job_queue)
             self._close_queue(result_queue)
@@ -406,13 +880,10 @@ class ProcessNodeExecutor:
             print(
                 f'[ProcessNodeExecutor] restarting worker before node {node.id!r}: '
                 f'cuda_count={self._cuda_count}/{self.max_cuda_nodes}, '
-                f'cooldown_before={self.cuda_cooldown_before_restart}, '
+                f'shutdown_min_wait={self.cuda_shutdown_min_wait}, '
                 f'cooldown_after={self.cuda_cooldown_after_restart}',
                 flush=True,
             )
-
-            if self.cuda_cooldown_before_restart > 0:
-                time.sleep(self.cuda_cooldown_before_restart)
 
             self.close()
 
@@ -437,6 +908,184 @@ class ProcessNodeExecutor:
                         f'Worker exited with code {self._process.exitcode} '
                         f'while running node {node.id!r}'
                     ) from None
+
+    def _read_worker_startup(self) -> None:
+        """Read the worker startup message."""
+        assert self._result_queue is not None
+        assert self._process is not None
+
+        while True:
+            try:
+                message = self._result_queue.get(timeout=0.1)
+                break
+            except queue.Empty:
+                if self._process.is_alive():
+                    continue
+
+                raise ProcessNodeExecutionError(
+                    f'Worker exited with code {self._process.exitcode} '
+                    'before reporting startup status'
+                ) from None
+
+        if not isinstance(message, WorkerStarted):
+            raise ProcessNodeExecutionError(
+                f'Worker returned unexpected startup message: '
+                f'{type(message).__name__}'
+            )
+
+        if message.baseline is not None:
+            self._configure_cuda_idle_thresholds(message.baseline)
+            return
+
+        if message.error_message:
+            print(
+                f'[ProcessNodeExecutor] {message.error_message}; '
+                'using fallback CUDA idle thresholds',
+                flush=True,
+            )
+
+    def _wait_for_worker_cuda_idle_before_first_cuda_node(self) -> None:
+        """Ask the worker to wait for GPU idle before its first CUDA job."""
+        assert self._job_queue is not None
+        assert self._result_queue is not None
+        assert self._process is not None
+
+        if self._worker_cuda_idle_wait_done:
+            return
+
+        self._job_queue.put(WorkerWaitForCudaIdle(
+            max_wait=_CUDA_STARTUP_IDLE_MAX_WAIT,
+            poll_interval=_CUDA_IDLE_POLL_INTERVAL,
+            max_power_watts=self._cuda_idle_max_power_watts,
+            max_temperature_celsius=self._cuda_idle_max_temperature_celsius,
+            min_pstate=_CUDA_IDLE_STARTUP_MIN_PSTATE,
+        ))
+
+        while True:
+            try:
+                message = self._result_queue.get(timeout=0.1)
+                break
+            except queue.Empty:
+                if self._process.is_alive():
+                    continue
+
+                raise ProcessNodeExecutionError(
+                    f'Worker exited with code {self._process.exitcode} '
+                    'while waiting for pre-CUDA idle acknowledgement'
+                ) from None
+
+        if not isinstance(message, WorkerCudaIdleReady):
+            raise ProcessNodeExecutionError(
+                f'Worker returned unexpected pre-CUDA idle message: '
+                f'{type(message).__name__}'
+            )
+
+        self._worker_cuda_idle_wait_done = True
+
+        if message.idle_reached and message.baseline is not None:
+            self._configure_cuda_idle_thresholds(message.baseline)
+            return
+
+        if message.error_message:
+            print(
+                f'[ProcessNodeExecutor] {message.error_message}; '
+                'continuing with fallback CUDA idle thresholds',
+                flush=True,
+            )
+
+    def _is_valid_cuda_idle_baseline(
+        self,
+        baseline: NvidiaIdleBaseline,
+    ) -> bool:
+        """Return whether a worker pre-CUDA probe looks idle enough for baseline use.
+
+        Parameters
+        ----------
+        baseline : NvidiaIdleBaseline
+            GPU state measured by a worker before running CUDA jobs.
+
+        Returns
+        -------
+        bool
+            ``True`` when the reading looks idle enough to be used as the reference
+            state for later CUDA shutdown waits.
+
+        Notes
+        -----
+        A pre-CUDA probe is useful only if it was collected while the GPU was already
+        reasonably quiet. If the first worker starts while the GPU is still busy,
+        hot, or in a high-performance state, using that reading as a baseline would
+        relax all later shutdown thresholds.
+        """
+        return (
+            baseline.gpu_utilization_percent == 0
+            and baseline.pstate >= _CUDA_IDLE_STARTUP_MIN_PSTATE
+            and baseline.temperature_celsius <= (
+                _CUDA_IDLE_BASELINE_MAX_TEMPERATURE_CELSIUS
+            )
+        )
+
+    def _configure_cuda_idle_thresholds(
+        self,
+        baseline: NvidiaIdleBaseline,
+    ) -> None:
+        """Configure CUDA idle thresholds from the first worker baseline.
+
+        Parameters
+        ----------
+        baseline : NvidiaIdleBaseline
+            Initial GPU state measured by a worker before running CUDA jobs.
+
+        Notes
+        -----
+        The parent receives only numeric telemetry from the worker. It does not
+        import NVML, PyTorch, or any CUDA-related monitoring library.
+
+        The first valid baseline is kept for the whole executor lifetime. Later
+        workers may start while the GPU is still warm, so their startup readings are
+        intentionally not used to relax the thresholds.
+        """
+        if self._cuda_idle_baseline is not None:
+            return
+
+        if not self._is_valid_cuda_idle_baseline(baseline):
+            print(
+                f'[ProcessNodeExecutor] ignoring non-idle CUDA baseline: '
+                f'temp={baseline.temperature_celsius:.1f}C, '
+                f'power={baseline.power_watts:.1f}W, '
+                f'pstate=P{baseline.pstate}, '
+                f'util={baseline.gpu_utilization_percent}%, '
+                f'mem={baseline.memory_used_mib}MiB; '
+                'GPU does not look idle enough for baseline use; '
+                'using fallback CUDA idle thresholds',
+                flush=True,
+            )
+            return
+
+        self._cuda_idle_baseline = baseline
+        self._cuda_idle_max_power_watts = max(
+            _CUDA_IDLE_MIN_POWER_WATTS,
+            baseline.power_watts + _CUDA_IDLE_POWER_MARGIN_WATTS,
+        )
+        self._cuda_idle_max_temperature_celsius = max(
+            _CUDA_IDLE_MIN_TEMPERATURE_CELSIUS,
+            baseline.temperature_celsius + _CUDA_IDLE_TEMPERATURE_MARGIN_CELSIUS,
+        )
+        self._cuda_idle_min_pstate = _CUDA_IDLE_SHUTDOWN_MIN_PSTATE
+
+        print(
+            f'[ProcessNodeExecutor] CUDA idle baseline: '
+            f'temp={baseline.temperature_celsius:.1f}C, '
+            f'power={baseline.power_watts:.1f}W, '
+            f'pstate=P{baseline.pstate}, '
+            f'util={baseline.gpu_utilization_percent}%, '
+            f'mem={baseline.memory_used_mib}MiB; '
+            f'thresholds: '
+            f'temp<={self._cuda_idle_max_temperature_celsius:.1f}C, '
+            f'power<={self._cuda_idle_max_power_watts:.1f}W, '
+            f'pstate>=P{self._cuda_idle_min_pstate}',
+            flush=True,
+        )
 
     def run(
         self,
@@ -466,6 +1115,10 @@ class ProcessNodeExecutor:
         assert self._job_queue is not None
         assert self._result_queue is not None
         assert self._process is not None
+
+        if node.uses_cuda:
+            self._wait_for_worker_cuda_idle_before_first_cuda_node()
+            self._worker_used_cuda = True
 
         self._job_queue.put(job)
 
