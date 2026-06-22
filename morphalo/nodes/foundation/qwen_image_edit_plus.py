@@ -21,13 +21,14 @@ from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
                                                  resolve_qwen_model_config,
                                                  resolve_qwen_seed)
 from morphalo.nodes.foundation.wiring import ImageSequenceMixin
+from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class QwenImageEditPlus(ImageSequenceMixin, PromptMixin, NodeRef):
+class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeRef):
     """
     Image editing node based on Qwen-Image-Edit-2509.
 

@@ -17,13 +17,14 @@ from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
                                                  resolve_qwen_image_params,
                                                  resolve_qwen_model_config,
                                                  resolve_qwen_seed)
+from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class QwenImage(PromptMixin, NodeRef):
+class QwenImage(ImageOutputMixin, PromptMixin, NodeRef):
     """
     Qwen-Image text-to-image generation node.
 

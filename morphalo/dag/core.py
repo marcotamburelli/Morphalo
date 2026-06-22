@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Self, Tuple, Union
+from typing import Any, Dict, List, Optional, Self, Tuple, Union
 
 from morphalo.core.ids import validate_dotted_identifier
 
@@ -142,6 +142,10 @@ class GraphScope:
     ----------
     node_groups : dict[str, NodeGroup]
         Injected child groups keyed by their scope-qualified identifiers.
+    cache : dict[str, Any]
+        Declaration-time scratch cache for DSL helpers that need to intern
+        graph-local helper objects. The cache is scoped to this graph only and
+        is not used by the runner.
     """
 
     def __init__(self, name: str):
@@ -150,6 +154,7 @@ class GraphScope:
         self.nodes: List['NodeRef'] = []
         self.edges: List['Edge'] = []
         self.node_groups: Dict[str, 'NodeGroup'] = {}
+        self.cache: Dict[str, Any] = {}
         self._id_counter = 0
 
     def next_id(self, prefix: str) -> str:
@@ -658,6 +663,53 @@ class _DagContext:
         """
         parts = cls.path(include_root=include_root)
         return sep.join(parts) + '.' if parts else ''
+
+
+_MISSING = object()
+
+
+def get_from_scope_cache(
+    namespace: str,
+    key: Any,
+    default: Any = None,
+) -> Any:
+    """
+    Return a value from the active graph scope cache.
+
+    The cache is scoped to the currently active DAG or node group. It is meant
+    for declaration-time DSL helpers that need graph-local interning without
+    exposing the graph scope itself.
+    """
+    scope = _DagContext.current()
+    scoped_cache = scope.cache.get(namespace)
+    if scoped_cache is None:
+        return default
+    return scoped_cache.get(key, default)
+
+
+def add_to_scope_cache(
+    namespace: str,
+    key: Any,
+    value: Any,
+    *,
+    replace: bool = False,
+) -> Any:
+    """
+    Store a value in the active graph scope cache and return it.
+
+    By default, adding a duplicate key is an error. Pass ``replace=True`` when
+    overwriting is intentional.
+    """
+    scope = _DagContext.current()
+    scoped_cache = scope.cache.setdefault(namespace, {})
+    existing = scoped_cache.get(key, _MISSING)
+    if existing is not _MISSING and not replace:
+        raise KeyError(
+            f'Scope cache entry already exists for namespace={namespace!r}, '
+            f'key={key!r}'
+        )
+    scoped_cache[key] = value
+    return value
 
 
 @dataclass(kw_only=True)

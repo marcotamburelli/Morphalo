@@ -15,6 +15,7 @@ from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.img import resolve_long_side_size
+from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from morphalo.nodes.sdxl_resolve import resolve_common
@@ -24,7 +25,13 @@ from morphalo.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class Img2Img(CudaPostRunMixin, ControlNetMixin, PromptMixin, NodeRef):
+class Img2Img(
+    ImageOutputMixin,
+    CudaPostRunMixin,
+    ControlNetMixin,
+    PromptMixin,
+    NodeRef,
+):
     """
     SDXL image-to-image generation node with optional ControlNet and IP-Adapter/FaceID conditioning.
 

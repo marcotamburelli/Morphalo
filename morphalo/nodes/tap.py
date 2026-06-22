@@ -5,12 +5,13 @@ from typing import Any, Dict, Optional
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.io import write_json
+from morphalo.nodes.image_output import ImageOutputMixin
 
 Output = Dict[str, Any]
 
 
 @dataclass
-class Tap(NodeRef):
+class Tap(ImageOutputMixin, NodeRef):
     """
     Minimal pass-through checkpoint node.
 

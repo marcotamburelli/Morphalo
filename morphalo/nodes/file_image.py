@@ -5,10 +5,11 @@ from typing import Any, Dict, List, Optional, Union
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.image_output import ImageOutputMixin
 
 
 @dataclass
-class FileImage(NodeRef):
+class FileImage(ImageOutputMixin, NodeRef):
     """
     Source node that exposes one or more existing image files from the filesystem.
 

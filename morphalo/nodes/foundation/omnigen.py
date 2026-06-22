@@ -18,6 +18,7 @@ from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.wiring import (OmniGenImageBundle,
                                               OmniGenImageRegistry)
+from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
@@ -38,7 +39,7 @@ class OmniGenImageMixin:
 
 
 @dataclass
-class OmniGen(OmniGenImageMixin, PromptMixin, NodeRef):
+class OmniGen(ImageOutputMixin, OmniGenImageMixin, PromptMixin, NodeRef):
     """
     OmniGen text-to-image / image-edit node with multimodal image inputs.
 
