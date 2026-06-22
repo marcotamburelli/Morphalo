@@ -37,6 +37,7 @@ def test_tiling_distinguishes_same_gray_as_text_and_local_surface():
         Image.fromarray(data, mode='RGB'),
         analysis_clusters=2,
         num_dominant_colors=1,
+        color_scope='local',
         tolerance=4.0,
         feather=2.0,
     )
@@ -46,6 +47,23 @@ def test_tiling_distinguishes_same_gray_as_text_and_local_surface():
     assert alpha[20, 720] < 10
     assert alpha[150, 108] > 240
     assert alpha[150, 660] > 240
+
+
+def test_global_scope_does_not_treat_local_dominant_foreground_as_background():
+    data = np.full((300, 768, 3), 235, dtype=np.uint8)
+    data[40:260, 420:730] = 105
+
+    result = color_driven_alpha(
+        Image.fromarray(data, mode='RGB'),
+        analysis_clusters=2,
+        num_dominant_colors=1,
+        tolerance=4.0,
+        feather=0.0,
+    )
+    alpha = np.asarray(result)[:, :, 3]
+
+    assert alpha[20, 40] == 0
+    assert alpha[150, 560] == 255
 
 
 def test_color_driven_alpha_never_increases_existing_alpha():
@@ -62,13 +80,13 @@ def test_color_driven_alpha_never_increases_existing_alpha():
     assert np.all(np.asarray(result)[:, :, 3] == 40)
 
 
-def test_color_driven_alpha_uses_manual_excluded_colors():
+def test_color_driven_alpha_uses_manual_colors():
     data = np.full((32, 32, 3), 255, dtype=np.uint8)
     data[10:22, 12:20] = 0
 
     result = color_driven_alpha(
         Image.fromarray(data, mode='RGB'),
-        excluded_colors=('white', '#ffffff', [255, 255, 255]),
+        colors=('white', '#ffffff', [255, 255, 255]),
         tolerance=1.0,
         feather=0.0,
     )
@@ -92,6 +110,7 @@ def test_node_writes_rgba_png_and_metadata(tmp_path):
                 'params': {
                     'analysis_clusters': 1,
                     'num_dominant_colors': 1,
+                    'box_margin': 0.0,
                 }
             },
         )
@@ -125,7 +144,7 @@ def test_node_rejects_more_dominant_than_analysis_clusters(tmp_path):
         node.run(tmp_path)
 
 
-def test_node_ignores_num_dominant_colors_with_manual_exclusions(tmp_path):
+def test_node_rejects_num_dominant_colors_with_manual_colors(tmp_path):
     src = tmp_path / 'page.png'
     Image.new('RGB', (8, 8), color='white').save(src)
 
@@ -135,20 +154,18 @@ def test_node_ignores_num_dominant_colors_with_manual_exclusions(tmp_path):
             path=src,
             spec={
                 'params': {
-                    'excluded_colors': 'white',
+                    'colors': 'white',
                     'num_dominant_colors': 0,
                     'crop_mode': 'full_frame',
                 }
             },
         )
 
-    out = node.run(tmp_path)
-
-    assert out['params']['excluded_colors'] == [[255, 255, 255]]
-    assert out['params']['num_dominant_colors'] == 1
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        node.run(tmp_path)
 
 
-def test_node_reports_manual_excluded_color_count(tmp_path):
+def test_node_reports_manual_color_count(tmp_path):
     src = tmp_path / 'page.png'
     Image.new('RGB', (8, 8), color='white').save(src)
 
@@ -158,7 +175,7 @@ def test_node_reports_manual_excluded_color_count(tmp_path):
             path=src,
             spec={
                 'params': {
-                    'excluded_colors': ['white', 'blue', 'green'],
+                    'colors': ['white', 'blue', 'green'],
                     'crop_mode': 'full_frame',
                 }
             },
@@ -167,6 +184,52 @@ def test_node_reports_manual_excluded_color_count(tmp_path):
     out = node.run(tmp_path)
 
     assert out['params']['num_dominant_colors'] == 3
+
+
+def test_color_policy_include_preserves_matching_colors():
+    data = np.full((24, 24, 3), 255, dtype=np.uint8)
+    data[8:16, 9:15] = (255, 0, 0)
+
+    result = color_driven_alpha(
+        Image.fromarray(data, mode='RGB'),
+        colors='red',
+        color_policy='include',
+        tolerance=1.0,
+        feather=0.0,
+    )
+    alpha = np.asarray(result)[:, :, 3]
+
+    assert alpha[2, 2] == 0
+    assert alpha[12, 12] == 255
+
+
+def test_color_policy_include_mask_selects_matching_colors(tmp_path):
+    src = tmp_path / 'page.png'
+    data = np.full((20, 20, 3), 255, dtype=np.uint8)
+    data[5:15, 6:14] = (255, 0, 0)
+    Image.fromarray(data, mode='RGB').save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = ColorDrivenCrop(
+            name='extract',
+            path=src,
+            spec={
+                'params': {
+                    'mode': 'mask',
+                    'colors': 'red',
+                    'color_policy': 'include',
+                    'tolerance': 1.0,
+                    'feather': 0.0,
+                }
+            },
+        )
+
+    out = node.run(tmp_path)
+    mask = np.asarray(Image.open(out['image']))
+
+    assert out['params']['color_policy'] == 'include'
+    assert mask[1, 1] == 0
+    assert mask[10, 10] == 255
 
 
 def test_default_bbox_keeps_color_driven_alpha(tmp_path):
@@ -181,8 +244,9 @@ def test_default_bbox_keeps_color_driven_alpha(tmp_path):
             path=src,
             spec={
                 'params': {
-                    'excluded_colors': 'white',
+                    'colors': 'white',
                     'crop_mode': 'bbox[1:1]',
+                    'box_margin': 0.0,
                     'tolerance': 1.0,
                     'feather': 0.0,
                 }
@@ -213,7 +277,7 @@ def test_mask_ignores_strength(tmp_path):
                 'params': {
                     'mode': 'mask',
                     'strength': 0.0,
-                    'excluded_colors': 'white',
+                    'colors': 'white',
                     'tolerance': 1.0,
                     'feather': 0.0,
                 }
@@ -243,7 +307,8 @@ def test_min_component_area_removes_small_selected_islands(tmp_path):
             path=src,
             spec={
                 'params': {
-                    'excluded_colors': 'white',
+                    'colors': 'white',
+                    'box_margin': 0.0,
                     'min_component_area': 4,
                     'tolerance': 1.0,
                     'feather': 0.0,
@@ -254,6 +319,31 @@ def test_min_component_area_removes_small_selected_islands(tmp_path):
     out = node.run(tmp_path)
 
     assert out['crop']['bbox_xyxy'] == [10, 10, 20, 20]
+
+
+def test_default_box_margin_expands_color_bbox(tmp_path):
+    src = tmp_path / 'page.png'
+    data = np.full((40, 40, 3), 255, dtype=np.uint8)
+    data[10:30, 10:30] = 0
+    Image.fromarray(data, mode='RGB').save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = ColorDrivenCrop(
+            name='extract',
+            path=src,
+            spec={
+                'params': {
+                    'colors': 'white',
+                    'tolerance': 1.0,
+                    'feather': 0.0,
+                }
+            },
+        )
+
+    out = node.run(tmp_path)
+
+    assert out['params']['box_margin'] == 0.08
+    assert out['crop']['bbox_xyxy'] == [8, 8, 32, 32]
 
 
 def test_min_component_area_removes_small_islands_from_rgba_alpha(tmp_path):
@@ -269,7 +359,7 @@ def test_min_component_area_removes_small_islands_from_rgba_alpha(tmp_path):
             path=src,
             spec={
                 'params': {
-                    'excluded_colors': 'white',
+                    'colors': 'white',
                     'crop_mode': 'full_frame',
                     'min_component_area': 4,
                     'tolerance': 1.0,

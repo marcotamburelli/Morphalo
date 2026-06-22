@@ -12,6 +12,7 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (CropModeSpec,
                                              expand_bbox_toward_ratio,
+                                             expand_clip_bbox,
                                              parse_crop_mode,
                                              postprocess_mask,
                                              tight_alpha_bbox)
@@ -25,17 +26,20 @@ class Config:
 
     All color-distance values are expressed in the CIE Lab space produced by
     :func:`skimage.color.rgb2lab`. ``strength`` is an exclusion strength, where
-    ``1`` removes matching colors and ``0`` leaves alpha unchanged.
+    ``1`` removes non-preserved pixels and ``0`` leaves alpha unchanged.
     """
 
     analysis_clusters: int
     num_dominant_colors: int
     mode: str
     crop_mode: Optional[CropModeSpec]
+    color_policy: str
+    color_scope: str
     tolerance: float
     feather: float
     strength: float
-    excluded_colors: Optional[tuple[tuple[int, int, int], ...]]
+    colors: Optional[tuple[tuple[int, int, int], ...]]
+    box_margin: float
     min_component_area: Any
     dilate_radius: int
     close_radius: int
@@ -91,15 +95,32 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         else None
     )
 
-    excluded_colors = _parse_excluded_colors(
-        params.get('excluded_colors', None),
+    color_policy = str(params.get('color_policy', 'exclude'))
+    if color_policy not in ('exclude', 'include'):
+        raise ValueError(
+            f"'{node_id}': invalid color_policy={color_policy!r}"
+        )
+
+    color_scope = str(params.get('color_scope', 'global'))
+    if color_scope not in ('global', 'local'):
+        raise ValueError(
+            f"'{node_id}': invalid color_scope={color_scope!r}"
+        )
+
+    colors = _parse_colors(
+        params.get('colors', None),
         node_id=node_id,
     )
 
-    if excluded_colors is None:
+    if colors is not None and 'num_dominant_colors' in params:
+        raise ValueError(
+            f"'{node_id}': colors and num_dominant_colors are mutually exclusive"
+        )
+
+    if colors is None:
         num_dominant_colors = int(params.get('num_dominant_colors', 1))
     else:
-        num_dominant_colors = len(excluded_colors)
+        num_dominant_colors = len(colors)
 
     analysis_clusters_value = params.get('analysis_clusters', None)
     if analysis_clusters_value is None:
@@ -113,6 +134,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     tolerance = float(params.get('tolerance', 12.0))
     feather = float(params.get('feather', 6.0))
     strength = float(params.get('strength', 1.0))
+    box_margin = float(params.get('box_margin', 0.08))
     min_component_area = params.get('min_component_area', 0)
     dilate_radius = int(params.get('dilate_radius', 0))
     close_radius = int(params.get('close_radius', 0))
@@ -122,14 +144,14 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         raise ValueError(
             f"'{node_id}': analysis_clusters must be >= 1"
         )
-    if excluded_colors is None and num_dominant_colors < 1:
+    if colors is None and num_dominant_colors < 1:
         raise ValueError(
             f"'{node_id}': num_dominant_colors must be >= 1"
         )
-    if excluded_colors is None and num_dominant_colors > analysis_clusters:
+    if colors is None and num_dominant_colors > analysis_clusters:
         raise ValueError(
             f"'{node_id}': num_dominant_colors must be <= analysis_clusters "
-            'when excluded_colors is not provided'
+            'when colors is not provided'
         )
     if tolerance < 0.0:
         raise ValueError(
@@ -141,6 +163,8 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         raise ValueError(
             f"'{node_id}': strength must be in [0, 1]"
         )
+    if box_margin < 0.0:
+        raise ValueError(f"'{node_id}': box_margin must be >= 0")
     _validate_min_component_area(min_component_area, node_id=node_id)
     if dilate_radius < 0:
         raise ValueError(f"'{node_id}': dilate_radius must be >= 0")
@@ -154,10 +178,13 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         num_dominant_colors=num_dominant_colors,
         mode=mode,
         crop_mode=crop_mode,
+        color_policy=color_policy,
+        color_scope=color_scope,
         tolerance=tolerance,
         feather=feather,
         strength=strength,
-        excluded_colors=excluded_colors,
+        colors=colors,
+        box_margin=box_margin,
         min_component_area=min_component_area,
         dilate_radius=dilate_radius,
         close_radius=close_radius,
@@ -174,7 +201,7 @@ def _parse_color(value: Any, *, node_id: str) -> tuple[int, int, int]:
             rgb = ImageColor.getrgb(value)
         except ValueError as exc:
             raise ValueError(
-                f"'{node_id}': invalid excluded color {value!r}"
+                f"'{node_id}': invalid color {value!r}"
             ) from exc
 
         if len(rgb) == 4:
@@ -185,23 +212,23 @@ def _parse_color(value: Any, *, node_id: str) -> tuple[int, int, int]:
         rgb = tuple(int(channel) for channel in value)
         if any(channel < 0 or channel > 255 for channel in rgb):
             raise ValueError(
-                f"'{node_id}': excluded RGB values must be in [0, 255]"
+                f"'{node_id}': RGB values must be in [0, 255]"
             )
         return rgb
 
     raise ValueError(
-        f"'{node_id}': excluded_colors entries must be color names, hex "
+        f"'{node_id}': colors entries must be color names, hex "
         'strings, or RGB triplets'
     )
 
 
-def _parse_excluded_colors(
+def _parse_colors(
     value: Any,
     *,
     node_id: str,
 ) -> Optional[tuple[tuple[int, int, int], ...]]:
     """
-    Parse optional manual excluded colors.
+    Parse optional manual reference colors.
     """
     if value is None:
         return None
@@ -214,7 +241,7 @@ def _parse_excluded_colors(
 
     if not isinstance(value, (list, tuple)) or len(value) == 0:
         raise ValueError(
-            f"'{node_id}': excluded_colors must be a color or a non-empty "
+            f"'{node_id}': colors must be a color or a non-empty "
             'list of colors'
         )
 
@@ -507,7 +534,7 @@ def _alpha_factor(
     retained_alpha: float,
 ) -> np.ndarray:
     """
-    Convert distance from excluded colors into an alpha retention factor.
+    Convert distance from reference colors into an alpha retention factor.
 
     Pixels at or below ``tolerance`` receive ``retained_alpha``. Pixels beyond
     ``tolerance + feather`` retain their original alpha. Values in between are
@@ -520,16 +547,16 @@ def _alpha_factor(
         Lab tile with shape ``(height, width, 3)``.
 
     centers : np.ndarray
-        Excluded Lab centers with shape ``(cluster_count, 3)``.
+        Reference Lab centers with shape ``(cluster_count, 3)``.
 
     tolerance : float
-        Radius around each excluded center receiving maximum attenuation.
+        Radius around each reference center receiving maximum attenuation.
 
     feather : float
         Width of the soft transition outside ``tolerance``.
 
     retained_alpha : float
-        Alpha retention factor applied to pixels matching excluded colors.
+        Alpha retention factor applied at the low end of the score ramp.
 
     Returns
     -------
@@ -537,7 +564,7 @@ def _alpha_factor(
         Alpha retention factors in ``[retained_alpha, 1]``, shaped
         ``(height, width)``.
     """
-    # A pixel is compared with every excluded center and classified by the
+    # A pixel is compared with every reference center and classified by the
     # nearest one. Euclidean Lab distance approximates perceptual distance.
     distance = np.sqrt(
         np.min(
@@ -567,13 +594,24 @@ def _color_driven_arrays(
     tolerance: float = 12.0,
     feather: float = 6.0,
     strength: float = 1.0,
-    excluded_colors: Any = None,
+    colors: Any = None,
+    color_policy: str = 'exclude',
+    color_scope: str = 'global',
     num_dominant_colors: int = 1,
     analysis_clusters: int = _DEFAULT_ANALYSIS_CLUSTERS,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Return full-frame RGBA data and a color-selected positive mask.
     """
+    if color_policy not in ('exclude', 'include'):
+        raise ValueError(
+            f"invalid color_policy={color_policy!r}"
+        )
+    if color_scope not in ('global', 'local'):
+        raise ValueError(
+            f"invalid color_scope={color_scope!r}"
+        )
+
     rgba = np.asarray(image.convert('RGBA'), dtype=np.uint8)
     rgb = rgba[:, :, :3].astype(np.float32) / 255.0
     lab = rgb2lab(rgb).astype(np.float32)
@@ -581,20 +619,31 @@ def _color_driven_arrays(
     height, width = original_alpha.shape
     retained_alpha = 1.0 - strength
     manual_centers = None
-    if excluded_colors is not None:
-        excluded_colors = _parse_excluded_colors(
-            excluded_colors,
+    global_centers = None
+    if colors is not None:
+        colors = _parse_colors(
+            colors,
             node_id='color_driven_alpha',
         )
-        excluded_rgb = (
-            np.asarray(excluded_colors, dtype=np.float32).reshape(-1, 3)
+        color_rgb = (
+            np.asarray(colors, dtype=np.float32).reshape(-1, 3)
             / 255.0
         )
-        manual_centers = rgb2lab(excluded_rgb.reshape(1, -1, 3)).reshape(-1, 3)
+        manual_centers = rgb2lab(color_rgb.reshape(1, -1, 3)).reshape(-1, 3)
         manual_centers = manual_centers.astype(np.float32)
+    elif color_scope == 'global':
+        sampled_lab = lab[::_SAMPLE_STRIDE, ::_SAMPLE_STRIDE]
+        sampled_alpha = original_alpha[::_SAMPLE_STRIDE, ::_SAMPLE_STRIDE]
+        samples = sampled_lab[sampled_alpha > 0.0].reshape(-1, 3)
+        if len(samples) > 0:
+            global_centers = _dominant_centers(
+                samples,
+                analysis_clusters=analysis_clusters,
+                num_dominant_colors=num_dominant_colors,
+                iterations=_KMEANS_ITERATIONS,
+            )
 
-    factor_sum = np.zeros((height, width), dtype=np.float32)
-    selected_score_sum = np.zeros((height, width), dtype=np.float32)
+    preserve_score_sum = np.zeros((height, width), dtype=np.float32)
     weight_sum = np.zeros((height, width), dtype=np.float32)
     tile_height = min(height, _TILE_SIZE)
     tile_width = min(width, _TILE_SIZE)
@@ -608,7 +657,11 @@ def _color_driven_arrays(
             tile_lab = lab[top:bottom, left:right]
             tile_alpha = original_alpha[top:bottom, left:right]
 
-            if manual_centers is None:
+            if manual_centers is not None:
+                centers = manual_centers
+            elif global_centers is not None:
+                centers = global_centers
+            elif color_scope == 'local':
                 sampled_lab = tile_lab[::_SAMPLE_STRIDE, ::_SAMPLE_STRIDE]
                 sampled_alpha = tile_alpha[::_SAMPLE_STRIDE, ::_SAMPLE_STRIDE]
                 # Existing transparent pixels carry no reliable visible color
@@ -624,42 +677,36 @@ def _color_driven_arrays(
                     iterations=_KMEANS_ITERATIONS,
                 )
             else:
-                centers = manual_centers
+                continue
 
-            factor = _alpha_factor(
-                tile_lab,
-                centers,
-                tolerance=tolerance,
-                feather=feather,
-                retained_alpha=retained_alpha,
-            )
-            selected_score = _alpha_factor(
+            distance_score = _alpha_factor(
                 tile_lab,
                 centers,
                 tolerance=tolerance,
                 feather=feather,
                 retained_alpha=0.0,
             )
+            if color_policy == 'exclude':
+                preserve_score = distance_score
+            else:
+                preserve_score = 1.0 - distance_score
+
             weights = _tile_weights(tile_height, tile_width)
-            factor_sum[top:bottom, left:right] += factor * weights
-            selected_score_sum[top:bottom, left:right] += selected_score * weights
+            preserve_score_sum[top:bottom, left:right] += (
+                preserve_score * weights
+            )
             weight_sum[top:bottom, left:right] += weights
 
     # Tiles containing no visible samples contribute nothing. In uncovered
     # locations the neutral factor 1 preserves the original alpha.
-    factor = np.divide(
-        factor_sum,
+    preserve_score = np.divide(
+        preserve_score_sum,
         weight_sum,
-        out=np.ones_like(factor_sum),
+        out=np.ones_like(preserve_score_sum),
         where=weight_sum > 0.0,
     )
-    selected_score = np.divide(
-        selected_score_sum,
-        weight_sum,
-        out=np.ones_like(selected_score_sum),
-        where=weight_sum > 0.0,
-    )
-    selected_mask = (original_alpha > 0.0) & (selected_score >= 0.999)
+    factor = retained_alpha + (1.0 - retained_alpha) * preserve_score
+    selected_mask = (original_alpha > 0.0) & (preserve_score >= 0.999)
 
     output = rgba.copy()
     output[:, :, 3] = np.round(
@@ -674,7 +721,9 @@ def color_driven_alpha(
     tolerance: float = 12.0,
     feather: float = 6.0,
     strength: float = 1.0,
-    excluded_colors: Any = None,
+    colors: Any = None,
+    color_policy: str = 'exclude',
+    color_scope: str = 'global',
     num_dominant_colors: int = 1,
     analysis_clusters: int = _DEFAULT_ANALYSIS_CLUSTERS,
 ) -> Image.Image:
@@ -682,14 +731,16 @@ def color_driven_alpha(
     Apply color-driven alpha attenuation and return an RGBA image.
 
     RGB values are preserved exactly. Only alpha is reduced according to the
-    selected excluded colors or automatically estimated dominant colors.
+    selected reference colors or automatically estimated dominant colors.
     """
     output, _ = _color_driven_arrays(
         image,
         tolerance=tolerance,
         feather=feather,
         strength=strength,
-        excluded_colors=excluded_colors,
+        colors=colors,
+        color_policy=color_policy,
+        color_scope=color_scope,
         num_dominant_colors=num_dominant_colors,
         analysis_clusters=analysis_clusters,
     )
@@ -711,18 +762,24 @@ class ColorDrivenCrop(NodeRef):
 
     Selection modes
     ---------------
-    If ``excluded_colors`` is provided, the node runs in manual deterministic
-    mode. Those RGB colors are converted to Lab and used directly as the color
-    families to remove. ``excluded_colors`` accepts PIL/CSS-like color names
+    If ``colors`` is provided, the node runs in manual deterministic mode.
+    Those RGB colors are converted to Lab and used directly as the reference
+    color families. ``colors`` accepts PIL/CSS-like color names
     such as ``'white'`` or ``'blue'``, hex strings such as ``'#ffffff'``, and RGB
     triplets such as ``[255, 255, 255]``. When this mode is active,
-    ``num_dominant_colors`` is ignored.
+    ``num_dominant_colors`` is reported as the number of manual colors.
 
-    If ``excluded_colors`` is absent, the node runs in automatic mode. It
-    divides the image into overlapping local tiles, fits deterministic K-means
-    clusters in Lab color space, and excludes the ``num_dominant_colors`` most
-    populated color families per tile. ``analysis_clusters`` controls the
-    maximum number of clusters considered and is an advanced tuning parameter.
+    If ``colors`` is absent, the node runs in automatic mode. It estimates
+    dominant reference colors from the visible image. By default this estimate is
+    global, which is usually the most intuitive behavior for cropping a larger
+    object from a comparatively simple background. Advanced workflows can switch
+    to local tile analysis with ``color_scope='local'``.
+
+    ``color_policy`` controls how reference colors are interpreted. With
+    ``'exclude'`` they are treated as background/noise to attenuate, and pixels
+    far from them are selected. With ``'include'`` they are treated as foreground
+    to preserve, and pixels near them are selected. The same policy applies to
+    manual colors and automatically estimated dominant colors.
 
     Output modes
     ------------
@@ -740,16 +797,16 @@ class ColorDrivenCrop(NodeRef):
     Alpha behavior
     --------------
     ``strength`` applies only when ``mode='default'`` and controls how much
-    matching excluded colors are attenuated:
+    non-preserved pixels are attenuated:
 
-    - ``1.0``: matching pixels become fully transparent;
-    - ``0.5``: matching pixels retain half of their existing alpha;
+    - ``1.0``: non-preserved pixels become fully transparent;
+    - ``0.5``: non-preserved pixels retain half of their existing alpha;
     - ``0.0``: alpha remains unchanged.
 
     Mask outputs ignore ``strength`` and use only the color-driven selected
     region.
 
-    Pixels within ``tolerance`` of an excluded color receive the strongest
+    Pixels outside the policy-selected color region receive the strongest
     attenuation. The following ``feather`` Lab-distance units transition
     smoothly back to unchanged alpha.
 
@@ -776,10 +833,16 @@ class ColorDrivenCrop(NodeRef):
                 Applies only when ``mode='default'``. Controls RGBA output
                 geometry. Default: ``'trim'``.
 
+            ``color_policy`` : {'exclude', 'include'}, optional
+                Interpretation of reference colors. ``'exclude'`` treats them
+                as background/noise and selects pixels far from them.
+                ``'include'`` treats them as foreground and selects pixels near
+                them. Default: ``'exclude'``.
+
             ``tolerance`` : float, optional
-                Lab-distance radius around every excluded color. Pixels inside
-                this radius receive the strongest attenuation. Must be
-                non-negative. Default: ``12.0``.
+                Lab-distance radius around every reference color. Its meaning is
+                interpreted through ``color_policy``. Must be non-negative.
+                Default: ``12.0``.
 
             ``feather`` : float, optional
                 Width, in Lab-distance units, of the smooth transition between
@@ -787,30 +850,38 @@ class ColorDrivenCrop(NodeRef):
                 Must be non-negative. Default: ``6.0``.
 
             ``strength`` : float, optional
-                Exclusion strength in ``[0, 1]``. ``1`` removes matching colors,
-                ``0.5`` attenuates them partially, and ``0`` disables the
-                effect. Default: ``1.0``.
+                Attenuation strength in ``[0, 1]``. ``1`` fully removes
+                non-preserved pixels, ``0.5`` attenuates them partially, and
+                ``0`` disables alpha changes. Default: ``1.0``.
 
-            ``excluded_colors`` : str or list, optional
-                Manual colors to exclude. Accepted entries are PIL/CSS-like
+            ``box_margin`` : float, optional
+                Symmetric expansion ratio applied to the color-derived
+                selection bbox, expressed as a fraction of bbox size. Applies
+                only when ``mode='default'`` and ``crop_mode`` is ``'trim'``,
+                ``'bbox'`` or ``'bbox[w:h]'``. Ignored for
+                ``crop_mode='full_frame'`` and mask outputs. For
+                ``crop_mode='bbox[w:h]'``, the margin is applied before
+                aspect-ratio expansion. Typical range: 0.03-0.12. Default:
+                ``0.08``.
+
+            ``colors`` : str or list, optional
+                Manual reference colors. Accepted entries are PIL/CSS-like
                 names, hex strings, and RGB triplets. If omitted, dominant
-                colors are estimated automatically. Default: ``None``.
+                reference colors are estimated automatically. Mutually
+                exclusive with ``num_dominant_colors``. Default: ``None``.
 
             ``num_dominant_colors`` : int, optional
-                Number of dominant local color families to exclude in automatic
-                mode. Ignored when ``excluded_colors`` is present. Must be at
-                least ``1``. Default: ``1``.
-
-            ``analysis_clusters`` : int or None, optional
-                Advanced automatic-mode K-means cluster limit. If ``None``, an
-                internal default is used. Must be at least ``1`` when provided.
-                Default: ``None``.
+                Number of dominant reference color families to use in automatic
+                mode. The colors are estimated globally or locally depending on
+                ``color_scope``. In manual mode, metadata reports the number of
+                colors provided. Mutually exclusive with ``colors``. Must be at
+                least ``1`` in automatic mode. Default: ``1``.
 
             ``min_component_area`` : int, float, str or None, optional
                 Remove small selected connected components from the crop/mask
                 selection when their area is less than or equal to this
                 threshold. In default RGBA mode, removed selected components are
-                treated as excluded color noise and attenuated according to
+                treated as non-preserved color noise and attenuated according to
                 ``strength``. Pixel values are used directly. Percentage strings
                 such as ``'1%'`` are interpreted linearly on the image long side
                 and converted to area. Default: ``0``.
@@ -826,6 +897,23 @@ class ColorDrivenCrop(NodeRef):
             ``smoothing_radius`` : int, optional
                 Gaussian smoothing radius in pixels, used only for full-frame
                 mask outputs. Default: ``0``.
+
+            ``analysis_clusters`` : int or None, optional
+                Advanced automatic-mode K-means cluster limit. If ``None``, an
+                internal default is used. Must be at least ``1`` when provided.
+                Increase only when the reference surface contains several
+                important color families. Default: ``None``.
+
+            ``color_scope`` : {'global', 'local'}, optional
+                Advanced automatic-mode analysis scope. ``'global'`` estimates
+                dominant reference colors once from the full visible image and
+                reuses them everywhere. This is the default and is usually safer
+                for larger subjects, because a large object will not become
+                background merely by dominating one tile. ``'local'`` estimates
+                reference colors independently per tile and blends the results;
+                it is useful for text, logos, or markings on uneven surfaces
+                such as paper with shadows, fabric, walls, or curved panels.
+                Manual ``colors`` are always global. Default: ``'global'``.
 
     Outputs
     -------
@@ -870,7 +958,9 @@ class ColorDrivenCrop(NodeRef):
                 tolerance=cfg.tolerance,
                 feather=cfg.feather,
                 strength=cfg.strength,
-                excluded_colors=cfg.excluded_colors,
+                colors=cfg.colors,
+                color_policy=cfg.color_policy,
+                color_scope=cfg.color_scope,
                 num_dominant_colors=cfg.num_dominant_colors,
                 analysis_clusters=cfg.analysis_clusters,
             )
@@ -922,6 +1012,16 @@ class ColorDrivenCrop(NodeRef):
 
                 alpha = selected_mask.astype(np.uint8) * 255
                 x1, y1, x2, y2 = tight_alpha_bbox(alpha)
+                if cfg.box_margin > 0:
+                    x1, y1, x2, y2 = expand_clip_bbox(
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        w,
+                        h,
+                        cfg.box_margin,
+                    )
 
                 if cfg.crop_mode.mode == 'bbox':
                     if cfg.crop_mode.ratio is not None:
@@ -986,12 +1086,15 @@ class ColorDrivenCrop(NodeRef):
         params = {
             'mode': cfg.mode,
             'crop_mode': cfg.crop_mode.raw if cfg.crop_mode is not None else None,
+            'color_policy': cfg.color_policy,
+            'color_scope': cfg.color_scope,
             'tolerance': cfg.tolerance,
             'feather': cfg.feather,
             'strength': cfg.strength,
-            'excluded_colors': (
-                [list(color) for color in cfg.excluded_colors]
-                if cfg.excluded_colors is not None
+            'box_margin': cfg.box_margin,
+            'colors': (
+                [list(color) for color in cfg.colors]
+                if cfg.colors is not None
                 else None
             ),
             'num_dominant_colors': cfg.num_dominant_colors,
