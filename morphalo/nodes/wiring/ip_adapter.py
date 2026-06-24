@@ -13,9 +13,15 @@ from morphalo.nodes.wiring.utils import infer_image_encoder_subfolder
 if TYPE_CHECKING:
     from transformers import CLIPVisionModelWithProjection
 
+IpAdapterLayerScale = Union[float, List[float]]
+IpAdapterSectionScale = Union[
+    float,
+    List[float],
+    Dict[str, IpAdapterLayerScale],
+]
 IpAdapterScale = Union[
     float,
-    Dict[str, Dict[str, List[float]]]
+    Dict[str, IpAdapterSectionScale],
 ]
 
 
@@ -264,7 +270,7 @@ class IpAdapterRegistry:
 
                     scale = 0.7
 
-            - ``dict[str, dict[str, list[float]]]``
+            - ``dict[str, IpAdapterSectionScale]``
                 Per-block configuration for SDXL IP-Adapter processors that
                 support granular routing of the adapter contribution across
                 the UNet.
@@ -273,28 +279,41 @@ class IpAdapterRegistry:
 
                 - ``'down'``: lower-resolution blocks, typically affecting
                   structure, layout, and global composition.
-                - ``'mid'``: bottleneck block, potentially affecting more
-                  global semantic features.
+                - ``'mid'``: bottleneck block, represented by a single
+                  scalar value (or a single-item list), potentially affecting
+                  more global semantic features.
                 - ``'up'``: higher-resolution blocks, typically affecting
                   style, texture, and fine visual details.
 
-                Each section maps block names such as ``'block_0'`` or
-                ``'block_2'`` to a list of per-layer weights. The length of
-                each list must match the number of IP-Adapter-aware layers
-                in that block for the target pipeline architecture.
+                ``'down'`` and ``'up'`` may be either a scalar applied to all
+                IP-Adapter-aware blocks in that section, or a mapping from
+                block names such as ``'block_0'`` or ``'block_2'`` to scalar
+                or per-layer weights. The length of each per-layer list must
+                match the number of IP-Adapter-aware layers in that block for
+                the target pipeline architecture.
+
+                ``'mid'`` is not a block mapping. Diffusers maps it directly
+                to the middle attention layer (for SDXL,
+                ``'mid_block.attentions.0'``), so it accepts only a scalar or
+                a single-item list.
 
                 Example::
 
                     scale = {
+                        'mid': 0.4,
                         'up': {'block_0': [0.0, 0.7, 0.0]},
                         'down': {'block_2': [0.0, 1.0]},
                     }
 
                 In this example:
                 - ``down.block_2`` is used to strengthen layout/composition,
+                - ``mid`` contributes at the UNet bottleneck,
                 - ``up.block_0`` is used to transfer visual style/details,
                 - zero values disable the adapter contribution for the
                   corresponding internal layer.
+
+                When a dict configuration is used, omitted sections or blocks
+                are filled by Diffusers with a default scale of ``0.0``.
 
             Notes
             -----
