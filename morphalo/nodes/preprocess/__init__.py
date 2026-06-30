@@ -10,6 +10,7 @@ from .mask_insert_layer import MaskInsertLayer
 from .resize_image import ResizeImage
 from .subject_crop import SubjectCrop
 from .transpose_image import TransposeImage
+from .visual_reference_selector import VisualReferenceSelector
 
 __all__ = [
     'AnyCrop',
@@ -24,4 +25,5 @@ __all__ = [
     'ResizeImage',
     'SubjectCrop',
     'TransposeImage',
+    'VisualReferenceSelector',
 ]

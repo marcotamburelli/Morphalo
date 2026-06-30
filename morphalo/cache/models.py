@@ -720,6 +720,56 @@ def get_sam(
     return ModelCache.put(key, (processor, model))
 
 
+def get_dinov2_encoder(
+    model_id: str = 'facebook/dinov2-base',
+    *,
+    device: str = 'cuda',
+    dtype: torch.dtype = torch.float32,
+) -> tuple[Any, Any]:
+    """
+    Load and cache a DINOv2 image encoder.
+
+    The returned pair is ``(processor, model)`` and is intended for image
+    feature extraction / visual similarity. The model is loaded through
+    Transformers ``AutoImageProcessor`` and ``AutoModel``.
+
+    Parameters
+    ----------
+    model_id : str, default='facebook/dinov2-base'
+        Hugging Face model identifier for the DINOv2 checkpoint.
+    device : str, default='cuda'
+        Device where the model should run.
+    dtype : torch.dtype, default=torch.float32
+        Torch dtype used to load the model weights.
+
+    Returns
+    -------
+    tuple[Any, Any]
+        Cached ``(processor, model)`` pair.
+    """
+    from transformers import AutoImageProcessor, AutoModel
+
+    key = CacheKey(
+        kind='dinov2_encoder',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModel.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    ).to(device)
+    model.eval()
+
+    return ModelCache.put(key, (processor, model))
+
+
 def get_insightface(
     *,
     model_name: str,
@@ -960,6 +1010,17 @@ def get_grounding_dino(
 ):
     from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
+    key = CacheKey(
+        kind='grounding_dino',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
     processor = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForZeroShotObjectDetection.from_pretrained(
         model_id,
@@ -967,4 +1028,4 @@ def get_grounding_dino(
     ).to(device)
     model.eval()
 
-    return processor, model
+    return ModelCache.put(key, (processor, model))

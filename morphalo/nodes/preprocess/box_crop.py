@@ -5,7 +5,7 @@ from typing import Any, Dict, Literal, Optional, Union
 from PIL import Image
 
 from morphalo.core.paths import make_node_output_path
-from morphalo.dag import NodeRef
+from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
@@ -16,7 +16,7 @@ BBoxFormat = Literal['xyxy', 'xywh', 'xyl']
 @dataclass
 class Config:
     bbox_format: BBoxFormat
-    bbox: tuple[int, ...]
+    bbox: Optional[tuple[int, ...]]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -31,7 +31,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     bbox_value = params.get('bbox')
     if bbox_value is None:
-        raise ValueError(f"'{node_id}': missing params.bbox")
+        return Config(
+            bbox_format=bbox_format,  # type: ignore[arg-type]
+            bbox=None,
+        )
 
     if not isinstance(bbox_value, (list, tuple)):
         raise TypeError(
@@ -134,6 +137,49 @@ def _clamp_bbox_xyxy(
     return out_x1, out_y1, out_x2, out_y2
 
 
+def _read_transform_bbox_xyxy(
+    transform: Optional[dict[str, Any]],
+    *,
+    node_id: str,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Read ``crop.bbox_xyxy`` from an optional transform input.
+
+    ``BoxCrop`` consumes the concrete crop bounds rather than the higher-level
+    placement metadata used by nodes such as ``ResizeImage`` or ``ImageStack``.
+    """
+    if transform is None:
+        return None
+
+    if not isinstance(transform, dict):
+        raise TypeError(
+            f'{node_id}: transform must be a dict, '
+            f'got {type(transform).__name__}.'
+        )
+
+    crop = transform.get('crop')
+    if crop is None:
+        return None
+
+    if not isinstance(crop, dict):
+        raise TypeError(
+            f'{node_id}: transform.crop must be a dict, '
+            f'got {type(crop).__name__}.'
+        )
+
+    bbox = crop.get('bbox_xyxy')
+    if bbox is None:
+        return None
+
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        raise ValueError(
+            f'{node_id}: transform.crop.bbox_xyxy must be a 4-item list '
+            f'or tuple, got {bbox!r}.'
+        )
+
+    return tuple(int(v) for v in bbox)
+
+
 @dataclass
 class BoxCrop(NodeRef):
     """
@@ -141,8 +187,8 @@ class BoxCrop(NodeRef):
 
     ``BoxCrop`` is a purely geometric preprocessing node. It does not run object
     detection, segmentation, pose estimation, or any semantic image analysis.
-    The caller provides an explicit bounding box, and the node crops that region
-    from the source image.
+    The caller provides an explicit bounding box either through ``params.bbox``
+    or through the optional ``transform`` input.
 
     This node is intended for local refinement workflows where a small region of
     an already generated image must be processed at a larger resolution, for
@@ -187,8 +233,20 @@ class BoxCrop(NodeRef):
                   ``bbox = [x, y, side]``.
                   Square crop using top-left corner plus side length.
 
-            ``bbox`` : list[int] or tuple[int, ...]
-                Manual bounding box values in the selected format.
+            ``bbox`` : list[int] or tuple[int, ...], optional
+                Manual bounding box values in the selected format. This is
+                required unless a transform input provides ``crop.bbox_xyxy``.
+
+    Inputs
+    ------
+    default : dict, optional
+        Upstream image payload. Required only when ``path`` is omitted.
+
+    transform : dict, optional
+        Upstream spatial metadata. When present and containing
+        ``crop.bbox_xyxy``, those coordinates override ``params.bbox``. This is
+        useful for cropping one image with the geometry emitted by another node,
+        for example cropping a full-frame mask to match a ``SubjectCrop`` ROI.
 
     Outputs
     -------
@@ -217,6 +275,8 @@ class BoxCrop(NodeRef):
 
     Notes
     -----
+    - If both ``params.bbox`` and ``transform.crop.bbox_xyxy`` are provided, the
+      transform bbox wins.
     - All crop metadata is computed after clamping the bbox to the source image
       bounds. This guarantees that ``crop.anchor_xy``, ``crop.position`` and
       ``crop.bbox_size`` are coherent with the image actually written by the
@@ -228,6 +288,26 @@ class BoxCrop(NodeRef):
     path: Optional[Union[str, Path]] = None
     spec: SpecInput = field(default_factory=dict)
 
+    def transform(self) -> AttachmentSink:
+        """
+        Declare optional crop metadata used to resolve the crop rectangle.
+
+        The upstream node should produce a ``crop`` dictionary containing
+        ``bbox_xyxy``. When this input is wired, it overrides ``params.bbox`` and
+        lets ``BoxCrop`` crop one image using the geometry emitted by another
+        node, for example a full-frame mask using the bbox from ``SubjectCrop``.
+
+        Returns
+        -------
+        AttachmentSink
+            Sink bound to this node with ``input_id='transform'``.
+        """
+        return AttachmentSink(
+            name=f'box_crop_transform:{self.id}',
+            target=self,
+            input_id='transform',
+        )
+
     def run(
         self,
         output_dir: str | Path,
@@ -237,6 +317,10 @@ class BoxCrop(NodeRef):
 
         node_id = self.id
         cfg = _read_cfg(spec, node_id=node_id)
+        transform_bbox = _read_transform_bbox_xyxy(
+            None if input is None else input.get('transform'),
+            node_id=node_id,
+        )
 
         img_path = resolve_single_image_path(
             node_id=node_id,
@@ -247,10 +331,24 @@ class BoxCrop(NodeRef):
         img = Image.open(img_path)
         width, height = img.size
 
-        orig_x1, orig_y1, orig_x2, orig_y2 = _bbox_to_xyxy(
-            cfg.bbox,
-            bbox_format=cfg.bbox_format,
-        )
+        if transform_bbox is not None:
+            orig_x1, orig_y1, orig_x2, orig_y2 = transform_bbox
+            bbox_source = 'transform'
+            bbox_format = 'xyxy'
+            bbox_value = list(transform_bbox)
+        elif cfg.bbox is not None:
+            orig_x1, orig_y1, orig_x2, orig_y2 = _bbox_to_xyxy(
+                cfg.bbox,
+                bbox_format=cfg.bbox_format,
+            )
+            bbox_source = 'params'
+            bbox_format = cfg.bbox_format
+            bbox_value = list(cfg.bbox)
+        else:
+            raise ValueError(
+                f"'{node_id}': missing params.bbox and no transform "
+                'crop.bbox_xyxy was provided'
+            )
 
         out_x1, out_y1, out_x2, out_y2 = _clamp_bbox_xyxy(
             orig_x1,
@@ -286,8 +384,15 @@ class BoxCrop(NodeRef):
             'id': node_id,
             'input_image': str(img_path),
             'image': str(out_path),
-            'bbox_format': cfg.bbox_format,
-            'bbox': list(cfg.bbox),
+            'bbox_source': bbox_source,
+            'bbox_format': bbox_format,
+            'bbox': bbox_value,
+            'original_bbox_xyxy': [
+                int(orig_x1),
+                int(orig_y1),
+                int(orig_x2),
+                int(orig_y2),
+            ],
             'bbox_xyxy': [
                 int(out_x1),
                 int(out_y1),
@@ -307,7 +412,7 @@ class BoxCrop(NodeRef):
             },
             'params': {
                 'bbox_format': cfg.bbox_format,
-                'bbox': list(cfg.bbox),
+                'bbox': None if cfg.bbox is None else list(cfg.bbox),
             },
         }
 

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, Dict, List, Optional, Union
 
 from morphalo.core.paths import make_node_output_path
@@ -11,11 +12,12 @@ from morphalo.nodes.image_output import ImageOutputMixin
 @dataclass
 class FileImage(ImageOutputMixin, NodeRef):
     """
-    Source node that exposes one or more existing image files from the filesystem.
+    Source node that exposes one or more existing files from the filesystem.
 
     ``FileImage`` is a pure *source node*: it performs no computation and has no
-    dependencies on upstream nodes. Its only responsibility is to validate that
-    the referenced image files exist and to expose their absolute paths as a
+    dependencies on upstream nodes. Its responsibility is to validate that the
+    referenced filesystem sources exist, expand direct directory contents when
+    directories are provided, and expose the resulting absolute file paths as a
     JSON-serializable output.
 
     This node is typically used at the edges of a DAG to provide external images
@@ -23,12 +25,30 @@ class FileImage(ImageOutputMixin, NodeRef):
     or IP-Adapter inputs (including reference images and masks).
 
     A single instance may expose either:
-    - one image, or
-    - an ordered list of images.
+    - one file, or
+    - an ordered list of files.
 
-    When multiple images are provided, the order is preserved and can be relied
-    upon by downstream nodes (for example, when associating images with
-    per-index inputs such as IP-Adapter masks).
+    ``FileImage`` does not inspect file contents or validate image formats. If
+    a provided file is not an image or is corrupted, the downstream consumer
+    that opens it will fail. This keeps this node as a simple file-list source
+    and avoids duplicating validation logic.
+
+    Directory expansion
+    -------------------
+    ``path`` entries may be files or directories.
+
+    - File entries are added directly.
+    - Directory entries are expanded into files immediately contained in that
+      directory.
+    - Directory expansion is deliberately **non-recursive**. Subdirectories are
+      ignored and never traversed. This prevents accidental explosions when a
+      dataset directory contains nested collections.
+    - Empty directories are allowed and add no files.
+    - If all provided sources expand to zero files, execution fails.
+
+    When multiple files or directories are provided, explicit ``path`` order is
+    preserved. Files discovered inside each directory are sorted alphabetically
+    for deterministic output.
 
     Parameters
     ----------
@@ -38,9 +58,8 @@ class FileImage(ImageOutputMixin, NodeRef):
         enclosing DAG.
 
     path : str or Path or Sequence[str or Path]
-        Filesystem path or paths to the image file(s) to be exposed by this node.
-        Paths may be relative or absolute and may include user home expansion
-        (``~``).
+        Filesystem file path, directory path, or sequence mixing both. Paths may
+        be relative or absolute and may include user home expansion (``~``).
 
     Attributes
     ----------
@@ -53,8 +72,8 @@ class FileImage(ImageOutputMixin, NodeRef):
     dict
         Primary output dictionary.
 
-        The node may expose either a single image or multiple images,
-        depending on the number of provided paths.
+        The node may expose either a single file as ``image`` or multiple files
+        as ``images``, depending on the final expanded file count.
 
         **Single image output**
 
@@ -62,7 +81,9 @@ class FileImage(ImageOutputMixin, NodeRef):
         - ``node`` : str (e.g. ``"file_image"``)
         - ``id`` : str
         - ``image`` : str
-          Absolute path to the image file.
+          Absolute path to the file.
+        - ``sources`` : list[dict]
+          Source expansion metadata.
         - ``metadata`` : str
           Path to the JSON sidecar.
 
@@ -72,11 +93,14 @@ class FileImage(ImageOutputMixin, NodeRef):
         - ``node`` : str
         - ``id`` : str
         - ``images`` : list[str]
-          Absolute paths to the image files.
+          Absolute paths to the files.
+        - ``sources`` : list[dict]
+          Source expansion metadata.
         - ``metadata`` : str
           Path to the JSON sidecar.
 
-        The order of ``images`` is stable and corresponds to the input order.
+        The order of ``images`` is stable: explicit input order is preserved,
+        and files inside each directory are sorted alphabetically.
 
     Notes
     -----
@@ -85,28 +109,64 @@ class FileImage(ImageOutputMixin, NodeRef):
       any previously generated sidecar files must be removed manually in order
       to avoid reusing stale cached outputs.
 
-    - This node does not perform any transformation: it only validates and
-      exposes filesystem paths.
+    - This node does not perform any transformation and does not validate image
+      contents or file extensions.
 
-    - When multiple images are provided, downstream nodes may interpret them
+    - When multiple files are provided, downstream nodes may interpret them
       as ordered inputs (for example, per-slot conditioning in IP-Adapter or
       ControlNet pipelines).
     """
 
-    path: Union[str, Path, List[Union[str, Path]]]
+    path: Union[str, Path, Sequence[Union[str, Path]]]
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        if not isinstance(self.path, list):
-            paths = [self.path]
+        if isinstance(self.path, (str, Path)):
+            sources_in = [self.path]
         else:
-            paths = self.path
+            sources_in = list(self.path)
 
-        paths = [Path(str(p)).expanduser().resolve() for p in paths]
+        files: List[Path] = []
+        sources: List[Dict[str, Any]] = []
 
-        for p in paths:
-            if not p.exists():
+        for raw in sources_in:
+            source = Path(str(raw)).expanduser().resolve()
+
+            if not source.exists():
                 raise FileNotFoundError(
-                    f"FileImage node '{self.id}': file not found: {p}")
+                    f"FileImage node '{self.id}': source not found: {source}")
+
+            if source.is_file():
+                files.append(source)
+                sources.append({
+                    'source': str(source),
+                    'type': 'file',
+                    'files': [str(source)],
+                })
+                continue
+
+            if source.is_dir():
+                dir_files = sorted(
+                    (p.resolve() for p in source.iterdir() if p.is_file()),
+                    key=lambda p: str(p),
+                )
+                files.extend(dir_files)
+                sources.append({
+                    'source': str(source),
+                    'type': 'directory',
+                    'recursive': False,
+                    'files': [str(p) for p in dir_files],
+                })
+                continue
+
+            raise FileNotFoundError(
+                f"FileImage node '{self.id}': not a file or directory: {source}")
+
+        if not files:
+            raise ValueError(
+                f"FileImage node '{self.id}': no files found after expanding sources."
+            )
+
+        for p in files:
             if not p.is_file():
                 raise FileNotFoundError(
                     f"FileImage node '{self.id}': not a file: {p}")
@@ -115,13 +175,13 @@ class FileImage(ImageOutputMixin, NodeRef):
             'ok': True,
             'node': self.op,
             'id': self.id,
-            # 'image': [str(p) for p in paths] if len(paths) > 1 else str(paths[0])
+            'sources': sources,
         }
 
-        if len(paths) > 1:
-            out['images'] = [str(p) for p in paths]
+        if len(files) > 1:
+            out['images'] = [str(p) for p in files]
         else:
-            out['image'] = str(paths[0])
+            out['image'] = str(files[0])
 
         out_path = make_node_output_path(
             out_dir=Path(output_dir),

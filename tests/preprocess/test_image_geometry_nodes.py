@@ -332,6 +332,81 @@ def test_box_crop_emits_local_anchor_and_global_position(tmp_path):
     assert out['crop']['position'] == [9, 11]
     assert out['crop']['bbox_size'] == [10, 10]
     assert out['crop']['bbox_xyxy'] == [4, 6, 14, 16]
+    assert out['bbox_source'] == 'params'
+
+
+def test_box_crop_transform_bbox_overrides_params_bbox(tmp_path):
+    src = tmp_path / 'src.png'
+    img = Image.new('RGB', (6, 5), color=(0, 0, 0))
+    img.putpixel((3, 2), (255, 0, 0))
+    img.putpixel((4, 3), (0, 255, 0))
+    img.save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop',
+            path=src,
+            spec={
+                'params': {
+                    'bbox_format': 'xyxy',
+                    'bbox': [0, 0, 1, 1],
+                }
+            },
+        )
+
+    out = node.run(
+        tmp_path,
+        input={
+            'transform': {
+                'crop': {
+                    'bbox_xyxy': [3, 2, 5, 4],
+                },
+            },
+        },
+    )
+    result = Image.open(out['image']).convert('RGB')
+
+    assert result.size == (2, 2)
+    assert result.getpixel((0, 0)) == (255, 0, 0)
+    assert result.getpixel((1, 1)) == (0, 255, 0)
+    assert out['bbox_source'] == 'transform'
+    assert out['bbox'] == [3, 2, 5, 4]
+    assert out['original_bbox_xyxy'] == [3, 2, 5, 4]
+    assert out['crop']['bbox_xyxy'] == [3, 2, 5, 4]
+
+
+def test_box_crop_accepts_transform_bbox_without_params_bbox(tmp_path):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (8, 8), color=(255, 255, 255)).save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(name='crop', path=src)
+
+    out = node.run(
+        tmp_path,
+        input={
+            'transform': {
+                'crop': {
+                    'bbox_xyxy': [1, 2, 6, 7],
+                },
+            },
+        },
+    )
+
+    assert out['bbox_source'] == 'transform'
+    assert out['params']['bbox'] is None
+    assert out['crop']['bbox_size'] == [5, 5]
+
+
+def test_box_crop_requires_bbox_or_transform_bbox(tmp_path):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (8, 8), color=(255, 255, 255)).save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(name='crop', path=src)
+
+    with pytest.raises(ValueError, match='missing params.bbox'):
+        node.run(tmp_path)
 
 
 def test_image_stack_transform_uses_new_crop_contract(tmp_path):

@@ -18,6 +18,7 @@ from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.preprocess.crop_debug import write_crop_debug_overlay
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec,
                                              expand_bbox_toward_ratio,
@@ -31,6 +32,7 @@ from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.face_region import (face_bbox_xyxy_from_landmarks,
                                                mp_face_landmarks)
 from morphalo.nodes.vision.human import (crop_head_area_from_pose,
+                                         feet_bbox_xyxy_from_landmarks,
                                          hands_bbox_xyxy_from_landmarks,
                                          hands_mask_from_landmarks,
                                          mp_hand_landmarks_full,
@@ -110,11 +112,15 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         'hands',
         'left-hand',
         'right-hand',
+        'feet',
+        'left-foot',
+        'right-foot',
     ):
         raise ValueError(
             f"'{node_id}': invalid target={target!r} (expected 'person', "
-            "'head', 'hands', 'left-hand' or 'right-hand'; use FaceCrop for "
-            "face, eye, and eyebrow targets)"
+            "'head', 'hands', 'left-hand', 'right-hand', 'feet', "
+            "'left-foot' or 'right-foot'; use FaceCrop for face, eye, and "
+            "eyebrow targets)"
         )
 
     sam_model = str(model.get('sam_model', 'facebook/sam-vit-large'))
@@ -138,7 +144,16 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         )
     pose_landmarker_task = str(pose_landmarker_task)
 
-    if target in ('person', 'head', 'hands', 'left-hand', 'right-hand'):
+    if target in (
+        'person',
+        'head',
+        'hands',
+        'left-hand',
+        'right-hand',
+        'feet',
+        'left-foot',
+        'right-foot',
+    ):
         yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
 
     if target == 'head':
@@ -590,13 +605,16 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - ``head``: head-oriented crop/mask with hair-friendly framing;
     - ``hands``: one or more visible hand crops/masks;
     - ``left-hand``: hand appearing on the left side of the image;
-    - ``right-hand``: hand appearing on the right side of the image.
+    - ``right-hand``: hand appearing on the right side of the image;
+    - ``feet``: one or more visible foot crops/masks;
+    - ``left-foot``: foot appearing on the left side of the image;
+    - ``right-foot``: foot appearing on the right side of the image.
 
     Face-detail targets such as ``face``, ``eyes``, ``left-eye``,
     ``right-eye``, ``eyebrows``, ``left-eyebrow`` and ``right-eyebrow`` are
     handled by ``FaceCrop``. Keeping these concerns separate makes
     ``SubjectCrop`` responsible only for person selection, pose-guided geometry,
-    hand localization, and SAM-based subject segmentation.
+    hand/foot localization, and SAM-based subject segmentation.
 
     The node is intended to support workflows such as:
 
@@ -604,13 +622,16 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - producing full-frame inpaint masks for SDXL pipelines;
     - extracting head regions for FaceID / IP-Adapter refinement;
     - extracting hand regions for localized hand repair/refinement;
+    - extracting foot regions for localized foot repair/refinement;
     - refining a small region by cropping, processing it separately, and
       reinserting it at the original coordinates.
 
-    Side-specific hand targets use image/viewer perspective:
+    Side-specific hand and foot targets use image/viewer perspective:
 
     - ``left-hand`` refers to the hand on the left side of the image;
     - ``right-hand`` refers to the hand on the right side of the image.
+    - ``left-foot`` refers to the foot on the left side of the image;
+    - ``right-foot`` refers to the foot on the right side of the image.
 
     This is intentionally different from MediaPipe handedness labels, which follow
     anatomical subject perspective and are mapped internally when needed.
@@ -636,6 +657,9 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
 
     - For hand targets, MediaPipe Hand Landmarker runs on the full image and is
       used to derive hand-local bounding boxes and landmark-based hand masks.
+
+    - For foot targets, MediaPipe Pose foot landmarks (ankle, heel, foot_index)
+      are used to derive foot-local bounding boxes and approximate foot masks.
 
     - A SAM-compatible segmentation model, loaded through ``get_sam(...)``, is
       used for all supported targets. The default model is
@@ -733,22 +757,43 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - The final crop region isolates only the right hand in image/viewer
       perspective.
 
+    ``target='feet'``
+    - MediaPipe Pose landmarks are computed for the full image.
+    - YOLO proposes candidate person bounding boxes.
+    - The selected YOLO bbox is accepted only if it is consistent with pose
+      landmarks; otherwise, a pose-derived person bbox is used.
+    - Expanded foot bounding boxes are derived from MediaPipe ankle, heel, and
+      foot_index landmarks and merged into a shared crop box.
+    - A rectangular foot-local mask is built from the expanded foot crop box.
+    - SAM segmentation is guided by the resolved person bbox and positive
+      pose landmarks.
+    - The final mask is the intersection of the SAM subject mask and the
+      expanded foot-local bbox mask.
+    - The final crop region isolates one or more visible feet.
+
+    ``target='left-foot'`` / ``target='right-foot'``
+    - These follow the same foot pipeline, selecting the leftmost or rightmost
+      foot candidate in image/viewer perspective.
+
     Hand crop semantics
     -------------------
 
-    For hand targets, two regions are intentionally used:
+    For hand and foot targets, two regions are intentionally used:
 
     - a person-level bbox, resolved from YOLO + pose, is used as the SAM prompt
       region;
-    - a hand-level bbox, resolved from MediaPipe hand landmarks, defines the final
-      crop region.
+    - a target-level bbox, resolved from MediaPipe hand or foot landmarks,
+      defines the final crop region.
 
-    The final hand mask is obtained by intersecting the SAM subject mask with the
-    landmark-derived hand mask. This keeps the crop focused on the requested hand
-    region while still using SAM to reject background around the selected subject.
+    The final hand mask is obtained by intersecting the SAM subject mask with
+    the landmark-derived target mask. Foot masks instead intersect SAM with the
+    expanded foot bbox, because MediaPipe foot landmark hulls are often too
+    narrow and can cut away toes. This keeps the crop focused on the requested
+    region while still using SAM to reject background around the selected
+    subject.
 
     For this reason, ``box_margin`` expands the person-level SAM prompt bbox for
-    hand targets, not the final hand crop bbox.
+    hand and foot targets, not the final target crop bbox.
 
     ## Head crop geometry
 
@@ -800,7 +845,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             - ``'syscv-community/sam-hq-vit-huge'``.
 
             Required for all supported targets because ``SubjectCrop`` uses SAM
-            for ``person``, ``head`` and hand targets.
+            for ``person``, ``head``, hand and foot targets.
 
         ``yolo_model`` : str, optional
             YOLO weights used to propose person boxes. Default:
@@ -825,7 +870,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             ``target='right-hand'``.
 
     ``params`` : dict
-        ``target`` : {'person', 'head', 'hands', 'left-hand', 'right-hand'}, optional
+        ``target`` : {'person', 'head', 'hands', 'left-hand', 'right-hand', 'feet', 'left-foot', 'right-foot'}, optional
             Region to extract. Default: ``'person'``.
 
         ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -882,7 +927,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
 
             For ``target='person'``, this also affects the default crop region
             because the SAM prompt bbox is reused as the final crop box. For
-            ``target='head'`` and hand targets, the final crop region is
+            ``target='head'`` and hand/foot targets, the final crop region is
             target-local and remains independent from this margin.
 
             Typical range: 0.05-0.20. Default: 0.12.
@@ -894,6 +939,8 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
              controls the derived square head crop size;
             - for hand targets:
               expands the landmark-derived hand bbox / mask;
+            - for foot targets:
+              expands the landmark-derived foot bbox / mask;
             - for ``target='person'``:
               the main spatial padding is controlled by ``box_margin``.
 
@@ -1057,16 +1104,18 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
       directly from the selected mask after connected-component cleanup.
     - For ``target='head'``, SAM uses the resolved person bbox as segmentation
       prompt, while the final crop region is the derived head box.
-    - For hand targets, SAM uses the resolved person bbox and positive pose
-      landmarks as segmentation prompt, while the final crop region is derived from
-      hand landmarks.
-    - For hand targets, the final mask is obtained by intersecting the
-      landmark-derived hand mask with the SAM subject mask.
-    - For ``target='hands'``, multiple disconnected hand components may be
-      preserved inside the same crop.
-    - Side-specific hand targets use image/viewer perspective.
+    - For hand and foot targets, SAM uses the resolved person bbox and positive
+      pose landmarks as segmentation prompt, while the final crop region is
+      derived from target-local landmarks.
+    - For hand and foot targets, the final mask is obtained by intersecting the
+      landmark-derived target mask with the SAM subject mask.
+    - For ``target='hands'`` and ``target='feet'``, multiple disconnected
+      target components may be preserved inside the same crop.
+    - Side-specific hand and foot targets use image/viewer perspective.
     - MediaPipe handedness labels follow anatomical subject perspective and are
       mapped internally for hand targets to preserve the image/viewer convention.
+      Foot targets are selected by image-space horizontal position for the same
+      convention.
     - Heavy models (YOLO, SAM-compatible segmentation models, MediaPipe Tasks) are
       retrieved via the global model cache where available.
     - The segmentation backend is loaded through Hugging Face Transformers via
@@ -1126,6 +1175,10 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         hand_mask: Optional[np.ndarray] = None
+        foot_mask: Optional[np.ndarray] = None
+        debug_face_xy: Optional[np.ndarray] = None
+        debug_hands_res = None
+        debug_mask: Optional[np.ndarray] = None
 
         pose_landmarker = get_mediapipe_pose_landmarker(
             model_asset_path=cfg.pose_landmarker_task,
@@ -1186,6 +1239,10 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 img_rgb=head_area_rgb,
                 face_landmarker=landmarker,
             )
+            debug_face_xy = face_xy.copy()
+            debug_face_xy[:, 0] += a_x
+            debug_face_xy[:, 1] += a_y
+
             r_x1, r_y1, r_x2, r_y2 = face_bbox_xyxy_from_landmarks(
                 face_xy,
                 image_shape=head_area_rgb.shape
@@ -1238,6 +1295,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 img_rgb=img_rgb,
                 hand_landmarker=hand_landmarker,
             )
+            debug_hands_res = hands_res
 
             hand_which = {
                 'hands': 'both',
@@ -1259,12 +1317,50 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 expansion=max(1.0, float(cfg.expansion)),
             )
 
+        elif cfg.target in ('feet', 'left-foot', 'right-foot'):
+            # --------------------------------------------------
+            # Resolve the subject bbox first.
+            # This bbox is used only to guide SAM toward the correct person.
+            # --------------------------------------------------
+
+            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
+            res = yolo.predict(
+                img_rgb,
+                conf=float(cfg.conf),
+                verbose=False,
+                device=cfg.device,
+            )[0]
+
+            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
+                res,
+                node_id,
+                pose_xy=pose_xy,
+                image_shape=img_rgb.shape,
+            )
+
+            foot_which = {
+                'feet': 'both',
+                'left-foot': 'left',
+                'right-foot': 'right',
+            }[cfg.target]
+
+            fx1, fy1, fx2, fy2 = feet_bbox_xyxy_from_landmarks(
+                pose_xy,
+                img_rgb.shape,
+                which=foot_which,
+                expansion=max(1.0, float(cfg.expansion)),
+                person_bbox=(bx1, by1, bx2, by2),
+            )
+
+            foot_mask = np.zeros((h, w), dtype=bool)
+            foot_mask[fy1:fy2, fx1:fx2] = True
+
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
 
         # Expand the SAM prompt bbox when applicable.
-        # For hand targets this expands the person bbox used to guide SAM,
-        # not the final hand crop bbox.
+        # For hand/foot targets this expands the person bbox used to guide SAM,
+        # not the final target-local crop bbox.
         if cfg.box_margin > 0:
             bx1, by1, bx2, by2 = expand_clip_bbox(
                 bx1, by1, bx2, by2, w, h, cfg.box_margin
@@ -1310,10 +1406,17 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             point_coords = None
             point_labels = None
 
-            if cfg.target in ('hands', 'left-hand', 'right-hand'):
+            if cfg.target in (
+                'hands',
+                'left-hand',
+                'right-hand',
+                'feet',
+                'left-foot',
+                'right-foot',
+            ):
                 # Use body pose points intentionally: SAM is asked to segment the selected
-                # person inside the person bbox. The hand landmark mask is applied later to
-                # restrict the result to the requested hand region.
+                # person inside the person bbox. The target-local landmark mask is applied
+                # later to restrict the result to the requested hand/foot region.
                 point_coords, point_labels = positive_points_for_sam(
                     xy=pose_xy,
                     bbox=(bx1, by1, bx2, by2),
@@ -1398,6 +1501,18 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             # result to the selected hand region(s).
             mask = mask & hand_mask
 
+        if cfg.target in ('feet', 'left-foot', 'right-foot'):
+            if foot_mask is None:
+                raise RuntimeError(
+                    f"SubjectCrop node '{node_id}': foot_mask not computed."
+                )
+            # Keep only the foot-local part of the SAM subject mask.
+            # The expanded foot bbox is intentionally broad; SAM supplies the
+            # subject-vs-background boundary inside it.
+            mask = mask & foot_mask
+
+        debug_mask = mask.copy()
+
         # --------------------------------------------------
         # Select crop region depending on target
         # --------------------------------------------------
@@ -1408,6 +1523,9 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         elif cfg.target in ('hands', 'left-hand', 'right-hand'):
             # crop including one or both hands
             crop_x1, crop_y1, crop_x2, crop_y2 = hx1, hy1, hx2, hy2
+        elif cfg.target in ('feet', 'left-foot', 'right-foot'):
+            # crop including one or both feet
+            crop_x1, crop_y1, crop_x2, crop_y2 = fx1, fy1, fx2, fy2
         else:
             # Default crop region: use the target bbox already resolved above.
             crop_x1, crop_y1, crop_x2, crop_y2 = bx1, by1, bx2, by2
@@ -1440,6 +1558,9 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 'hands',
                 'left-hand',
                 'right-hand',
+                'feet',
+                'left-foot',
+                'right-foot',
             ):
                 # Keep all connected components inside already target-local crops.
                 #
@@ -1447,6 +1568,8 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 # - For 'left-hand' / 'right-hand', the crop is already constrained by the
                 #   selected hand bbox and by the landmark-derived hand mask, so keeping all
                 #   components is safer than selecting the component under the crop center.
+                # - Foot crops follow the same target-local geometry and may include several
+                #   disconnected toe/edge fragments after mask intersection.
                 #
                 # TODO:
                 # If single-hand crops start carrying too many small artifacts, replace this
@@ -1557,21 +1680,25 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         # Optional debug bbox overlay
         dbg_path = None
         if cfg.save_debug:
-            dbg = img_rgb.copy()
             dbg_x1, dbg_y1, dbg_x2, dbg_y2 = bx1, by1, bx2, by2
             if cfg.target == 'head':
                 dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
             elif cfg.target in ('hands', 'left-hand', 'right-hand'):
                 dbg_x1, dbg_y1, dbg_x2, dbg_y2 = hx1, hy1, hx2, hy2
-            cv2.rectangle(
-                dbg,
-                (dbg_x1, dbg_y1),
-                (dbg_x2, dbg_y2),
-                (255, 0, 0),
-                3,
+            elif cfg.target in ('feet', 'left-foot', 'right-foot'):
+                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
+
+            dbg_path = write_crop_debug_overlay(
+                img_rgb=img_rgb,
+                out_path=out_path,
+                target=cfg.target,
+                pose_xy=pose_xy,
+                person_bbox=(bx1, by1, bx2, by2),
+                target_bbox=(dbg_x1, dbg_y1, dbg_x2, dbg_y2),
+                hands_res=debug_hands_res,
+                face_xy=debug_face_xy,
+                mask=debug_mask,
             )
-            dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')
-            Image.fromarray(dbg).save(dbg_path)
 
         b_width = int(out_x2 - out_x1)
         b_height = int(out_y2 - out_y1)

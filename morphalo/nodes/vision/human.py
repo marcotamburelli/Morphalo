@@ -1501,3 +1501,752 @@ def hands_mask_from_landmarks(
         )
 
     return (mask > 0)
+
+
+_FOOT_LANDMARKS = {
+    'anatomical-left': {
+        'knee': 25,
+        'ankle': 27,
+        'heel': 29,
+        'foot_index': 31,
+    },
+    'anatomical-right': {
+        'knee': 26,
+        'ankle': 28,
+        'heel': 30,
+        'foot_index': 32,
+    },
+}
+_FOOT_LENGTH_FROM_FOREARM_WEIGHT = 0.45
+_FOOT_LENGTH_FROM_HIP_WEIGHT = 0.25
+_FOOT_LENGTH_FROM_SHOULDER_WEIGHT = 0.20
+_FOOT_LENGTH_FROM_HEAD_WEIGHT = 0.10
+_FOOT_LENGTH_SAFETY = 1.30
+_FOOT_LENGTH_MIN_PX = 18.0
+
+
+def _valid_pose_point(pose_xy: np.ndarray, idx: int) -> Optional[np.ndarray]:
+    """
+    Return a valid MediaPipe pose point as ``float32`` or ``None``.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        Pose landmarks in image coordinates, with shape ``(N, 2)``.
+        Missing or weak landmarks are expected to be encoded as ``(-1, -1)``.
+    idx : int
+        Landmark index to read.
+
+    Returns
+    -------
+    np.ndarray or None
+        The selected point as ``(x, y)`` with dtype ``float32`` when the
+        landmark exists and is non-negative; otherwise ``None``.
+    """
+    if idx >= pose_xy.shape[0]:
+        return None
+
+    p = pose_xy[idx]
+    if p[0] < 0 or p[1] < 0:
+        return None
+
+    return p.astype(np.float32, copy=False)
+
+
+def _foot_points_for_side(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+) -> np.ndarray:
+    """
+    Resolve the available landmark points for one anatomical foot side.
+
+    The preferred geometry uses MediaPipe ``ankle``, ``heel`` and
+    ``foot_index`` landmarks. If fewer than two of those points are available,
+    the function falls back to a coarse synthetic two-point foot estimate from
+    ``knee -> ankle``.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+        Missing landmarks are encoded as ``(-1, -1)``.
+    side : {'anatomical-left', 'anatomical-right'}
+        Anatomical foot side to resolve using MediaPipe landmark indices.
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape ``(P, 2)`` with ``P >= 2`` containing image-space foot
+        points suitable for bbox/mask construction.
+
+    Raises
+    ------
+    ValueError
+        If ``side`` is not a known anatomical foot side.
+    RuntimeError
+        If insufficient landmarks are available to infer the foot.
+    """
+    if side not in _FOOT_LANDMARKS:
+        raise ValueError(f'Unknown foot side {side!r}.')
+
+    ids = _FOOT_LANDMARKS[side]
+    pts: list[np.ndarray] = []
+
+    for name in ('ankle', 'heel', 'foot_index'):
+        p = _valid_pose_point(pose_xy, ids[name])
+        if p is not None:
+            pts.append(p)
+
+    if len(pts) >= 2:
+        return np.stack(pts, axis=0)
+
+    # Fallback for weak foot landmarks: if MediaPipe kept the ankle and knee,
+    # extrapolate a rough foot direction from the lower leg. This is intentionally
+    # coarse; downstream crop expansion should make the result forgiving.
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+    knee = _valid_pose_point(pose_xy, ids['knee'])
+
+    if ankle is not None and knee is not None:
+        leg_vec = ankle - knee
+        if float(np.linalg.norm(leg_vec)) >= 4.0:
+            synthetic_toe = ankle + 0.45 * leg_vec
+            return np.stack([ankle, synthetic_toe], axis=0)
+
+    raise RuntimeError(f'Could not derive {side} foot points from pose.')
+
+
+def _segment_len(
+    pose_xy: np.ndarray,
+    a: int,
+    b: int,
+) -> float:
+    """
+    Return a valid 2D segment length or ``0.0``.
+    """
+    pa = _valid_pose_point(pose_xy, a)
+    pb = _valid_pose_point(pose_xy, b)
+    if pa is None or pb is None:
+        return 0.0
+
+    length = float(np.linalg.norm(pb - pa))
+    if length < 4.0:
+        return 0.0
+
+    return length
+
+
+def _pose_head_height(pose_xy: np.ndarray) -> float:
+    """
+    Estimate projected head height from pose face anchors.
+
+    MediaPipe pose face anchors cover only the central face/ears and usually
+    underestimate the full head, so the observed anchor height is inflated.
+    """
+    face_pts = [_valid_pose_point(pose_xy, idx) for idx in (0, 2, 5, 7, 8)]
+    face_pts = [p for p in face_pts if p is not None]
+
+    if len(face_pts) < 2:
+        return 0.0
+
+    arr = np.stack(face_pts, axis=0)
+    face_h = float(np.max(arr[:, 1]) - np.min(arr[:, 1]))
+
+    if face_h < 4.0:
+        return 0.0
+
+    return 1.8 * face_h
+
+
+def _estimate_projected_foot_length(
+    pose_xy: np.ndarray,
+) -> float:
+    """
+    Estimate projected foot length from stable 2D body proportions.
+
+    The estimate is a weighted average of:
+
+    - max left/right forearm length, treated as 1:1 with foot length;
+    - hip width / 2;
+    - shoulder width / 3;
+    - head height.
+
+    Missing measurements are ignored and the remaining weights are normalized.
+    """
+    left_forearm = _segment_len(pose_xy, 13, 15)
+    right_forearm = _segment_len(pose_xy, 14, 16)
+    forearm = max(left_forearm, right_forearm)
+
+    hip_width = _segment_len(pose_xy, 23, 24)
+    shoulder_width = _segment_len(pose_xy, 11, 12)
+    head_height = _pose_head_height(pose_xy)
+
+    components = []
+
+    if forearm > 0.0:
+        components.append((_FOOT_LENGTH_FROM_FOREARM_WEIGHT, forearm))
+    if hip_width > 0.0:
+        components.append((_FOOT_LENGTH_FROM_HIP_WEIGHT, hip_width / 2.0))
+    if shoulder_width > 0.0:
+        components.append((
+            _FOOT_LENGTH_FROM_SHOULDER_WEIGHT,
+            shoulder_width / 3.0,
+        ))
+    if head_height > 0.0:
+        components.append((_FOOT_LENGTH_FROM_HEAD_WEIGHT, head_height))
+
+    if not components:
+        length = _FOOT_LENGTH_MIN_PX
+    else:
+        total_weight = sum(w for w, _ in components)
+        length = sum(w * v for w, v in components) / total_weight
+        length = max(length, _FOOT_LENGTH_MIN_PX)
+
+    return length
+
+
+def _expand_foot_box_toward_person_edge(
+    box: tuple[int, int, int, int],
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+    person_bbox: Optional[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int]:
+    """
+    Expand a foot bbox from ankle toward the coarse foot-index direction.
+
+    MediaPipe ``heel`` and ``foot_index`` can be noisy, but ``ankle`` is usually
+    more stable because it is anchored to the leg. This helper therefore treats
+    the ankle as the origin, uses ``ankle -> foot_index`` only as a coarse 2D
+    direction, and expands the box so that it contains:
+
+    ``ankle + normalize(ankle -> foot_index) * estimated_foot_length * safety``.
+
+    The estimated foot length is derived from more stable body-scale cues such
+    as forearm length, hip width, shoulder width, and head height. The final box
+    is clipped to the person bbox.
+
+    Parameters
+    ----------
+    box : tuple[int, int, int, int]
+        Landmark-derived foot bbox.
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    side : {'anatomical-left', 'anatomical-right'}
+        Anatomical foot side.
+    person_bbox : tuple[int, int, int, int] or None
+        YOLO/person bbox used as an upper spatial guard. If omitted, ``box`` is
+        returned unchanged.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Possibly expanded end-exclusive foot bbox, clipped to ``person_bbox``.
+    """
+    if person_bbox is None:
+        return box
+
+    x1, y1, x2, y2 = box
+    px1, py1, px2, py2 = person_bbox
+
+    if px2 <= px1 or py2 <= py1:
+        return box
+
+    clipped_x1 = max(px1, x1)
+    clipped_y1 = max(py1, y1)
+    clipped_x2 = min(px2, x2)
+    clipped_y2 = min(py2, y2)
+
+    if clipped_x2 <= clipped_x1 or clipped_y2 <= clipped_y1:
+        return box
+
+    x1, y1, x2, y2 = clipped_x1, clipped_y1, clipped_x2, clipped_y2
+
+    ids = _FOOT_LANDMARKS[side]
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+    tip = _valid_pose_point(pose_xy, ids['foot_index'])
+
+    if ankle is None or tip is None:
+        return int(x1), int(y1), int(x2), int(y2)
+
+    foot_vec = tip - ankle
+    foot_vec_len = float(np.linalg.norm(foot_vec))
+    if foot_vec_len < 4.0:
+        return int(x1), int(y1), int(x2), int(y2)
+
+    direction = foot_vec / foot_vec_len
+    raw_length = _estimate_projected_foot_length(pose_xy)
+    safe_length = raw_length * _FOOT_LENGTH_SAFETY
+    estimated_target = ankle + direction * safe_length
+    inward_components = {
+        'x': bool(
+            (direction[0] > 0.0 and ankle[0] < px2) or
+            (direction[0] < 0.0 and ankle[0] > px1)
+        ),
+        'y': bool(
+            (direction[1] > 0.0 and ankle[1] < py2) or
+            (direction[1] < 0.0 and ankle[1] > py1)
+        ),
+    }
+
+    left_gap = float(x1 - px1)
+    right_gap = float(px2 - x2)
+    top_gap = float(y1 - py1)
+    bottom_gap = float(py2 - y2)
+
+    estimated_target = np.asarray([
+        min(max(float(estimated_target[0]), float(px1)), float(px2)),
+        min(max(float(estimated_target[1]), float(py1)), float(py2)),
+    ], dtype=np.float32)
+    target = estimated_target.copy()
+
+    if direction[0] < 0.0 and left_gap <= right_gap:
+        target[0] = float(px1)
+    elif direction[0] > 0.0 and right_gap <= left_gap:
+        target[0] = float(px2)
+
+    if direction[1] < 0.0 and top_gap <= bottom_gap:
+        target[1] = float(py1)
+    elif direction[1] > 0.0 and bottom_gap <= top_gap:
+        target[1] = float(py2)
+
+    moved = target - ankle
+    can_expand = (
+        (inward_components['x'] and abs(float(moved[0])) >= 1.0) or
+        (inward_components['y'] and abs(float(moved[1])) >= 1.0)
+    )
+
+    if can_expand:
+        nx1 = max(px1, min(float(x1), float(target[0])))
+        ny1 = max(py1, min(float(y1), float(target[1])))
+        nx2 = min(px2, max(float(x2), float(target[0])))
+        ny2 = min(py2, max(float(y2), float(target[1])))
+    else:
+        nx1, ny1, nx2, ny2 = float(x1), float(y1), float(x2), float(y2)
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return box
+
+    return (
+        int(math.floor(nx1)),
+        int(math.floor(ny1)),
+        int(math.ceil(nx2)),
+        int(math.ceil(ny2)),
+    )
+
+
+def _foot_candidates(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    expansion: float,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+) -> list[tuple[str, tuple[int, int, int, int], np.ndarray]]:
+    """
+    Build foot candidates for every anatomical side MediaPipe can support.
+
+    Each candidate contains the anatomical side label, an expanded full-image
+    bbox, and the raw landmark points used to derive that bbox.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    expansion : float
+        Multiplicative expansion applied to each per-foot bbox.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used to grow foot boxes toward the likely body
+        boundary when MediaPipe foot landmarks under-estimate toes/heel.
+
+    Returns
+    -------
+    list[tuple[str, tuple[int, int, int, int], np.ndarray]]
+        Candidate list in ``(side, bbox_xyxy, points)`` format. ``side`` is an
+        anatomical label, ``bbox_xyxy`` is end-exclusive full-image geometry,
+        and ``points`` contains the resolved foot points.
+
+    Raises
+    ------
+    RuntimeError
+        If neither anatomical side yields usable foot geometry.
+    """
+    candidates: list[tuple[str, tuple[int, int, int, int], np.ndarray]] = []
+
+    for side in ('anatomical-left', 'anatomical-right'):
+        try:
+            pts = _foot_points_for_side(pose_xy, side=side)
+            box = foot_bbox_xyxy(
+                pts,
+                pose_xy,
+                image_shape,
+                side=side,
+                expansion=expansion,
+            )
+            box = _expand_foot_box_toward_person_edge(
+                box,
+                pose_xy,
+                side=side,
+                person_bbox=person_bbox,
+            )
+        except RuntimeError:
+            continue
+
+        candidates.append((side, box, pts))
+
+    if not candidates:
+        raise RuntimeError('Could not derive any foot geometry from pose.')
+
+    return candidates
+
+
+def _select_foot_candidates(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+) -> list[tuple[str, tuple[int, int, int, int], np.ndarray]]:
+    """
+    Select foot candidates using observer/image-side semantics.
+
+    MediaPipe foot landmarks are anatomical. Public crop targets use the same
+    convention as ``SubjectCrop`` hand targets: ``left`` means left side of the
+    image, and ``right`` means right side of the image. Selection is therefore
+    based on the horizontal center of each candidate bbox.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    which : {'left', 'right', 'both'}
+        Requested foot selection in image/viewer perspective.
+    expansion : float
+        Multiplicative expansion applied before candidate selection.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used to grow foot boxes toward the likely body
+        boundary.
+
+    Returns
+    -------
+    list[tuple[str, tuple[int, int, int, int], np.ndarray]]
+        Selected candidates in ``(side, bbox_xyxy, points)`` format.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no candidate can be built, or if side-specific selection would be
+        ambiguous.
+    """
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    candidates = _foot_candidates(
+        pose_xy,
+        image_shape,
+        expansion=expansion,
+        person_bbox=person_bbox,
+    )
+
+    if which == 'both':
+        return candidates
+
+    # Public left/right semantics are observer/image based, matching
+    # SubjectCrop hand targets. MediaPipe landmark names are anatomical, so
+    # choose the leftmost/rightmost candidate by image-space center.
+    ordered = sorted(
+        candidates,
+        key=lambda item: 0.5 * (item[1][0] + item[1][2]),
+    )
+
+    if len(ordered) >= 2:
+        return [ordered[0] if which == 'left' else ordered[-1]]
+
+    # With only one detected foot, accept side-specific selection only when the
+    # candidate is on the requested half of the image; otherwise fail loudly
+    # instead of silently returning the wrong foot.
+    _, box, _ = ordered[0]
+    _, w = image_shape[:2]
+    cx = 0.5 * (box[0] + box[2])
+
+    if which == 'left' and cx <= 0.5 * w:
+        return ordered
+    if which == 'right' and cx >= 0.5 * w:
+        return ordered
+
+    raise RuntimeError(
+        f'Could not reliably select {which} foot from a single detected foot.'
+    )
+
+
+def foot_bbox_xyxy(
+    foot_pts: np.ndarray,
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    side: str,
+    expansion: float = 1.8,
+) -> tuple[int, int, int, int]:
+    """
+    Compute a generous bbox from MediaPipe foot landmarks.
+
+    ``foot_pts`` is expected to contain at least two image-space points derived
+    from ankle, heel, and foot_index. The bbox is computed as a square enclosing
+    those raw landmark points, then expanded.
+
+    Parameters
+    ----------
+    foot_pts : np.ndarray
+        Image-space points for one foot, with shape ``(P, 2)`` and ``P >= 2``.
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+        The same-side knee/ankle may be used to estimate a minimum crop size.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used for clipping.
+    side : {'anatomical-left', 'anatomical-right'}
+        Anatomical side corresponding to ``foot_pts``.
+    expansion : float, default=1.8
+        Multiplicative expansion factor for the generated bbox.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive bbox ``(x1, y1, x2, y2)`` in full-image coordinates.
+
+    Raises
+    ------
+    RuntimeError
+        If ``foot_pts`` has an invalid shape or cannot define a non-empty bbox.
+    """
+    if foot_pts.ndim != 2 or foot_pts.shape[1] != 2:
+        raise RuntimeError(
+            f'Invalid foot point shape {foot_pts.shape!r}; expected (N, 2).'
+        )
+
+    if foot_pts.shape[0] < 2:
+        raise RuntimeError('At least two foot points are required.')
+
+    h, w = image_shape[:2]
+
+    x1 = float(np.min(foot_pts[:, 0]))
+    y1 = float(np.min(foot_pts[:, 1]))
+    x2 = float(np.max(foot_pts[:, 0]))
+    y2 = float(np.max(foot_pts[:, 1]))
+
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    raw_w = max(1.0, x2 - x1)
+    raw_h = max(1.0, y2 - y1)
+
+    ids = _FOOT_LANDMARKS[side]
+    knee = _valid_pose_point(pose_xy, ids['knee'])
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+    shin_len = 0.0
+    if knee is not None and ankle is not None:
+        shin_len = float(np.linalg.norm(ankle - knee))
+
+    min_size = max(24.0, 0.04 * max(w, h), 0.35 * shin_len)
+    base = max(raw_w, raw_h, min_size)
+
+    ex = max(1.0, float(expansion))
+    out_w = max(raw_w * ex, base * ex)
+    out_h = max(raw_h * ex, base * ex)
+
+    ox1 = int(math.floor(cx - out_w / 2.0))
+    ox2 = int(math.ceil(cx + out_w / 2.0))
+    oy1 = int(math.floor(cy - out_h / 2.0))
+    oy2 = int(math.ceil(cy + out_h / 2.0))
+
+    ox1 = max(0, min(w - 1, ox1))
+    oy1 = max(0, min(h - 1, oy1))
+    ox2 = max(ox1 + 1, min(w, ox2))
+    oy2 = max(oy1 + 1, min(h, oy2))
+
+    if ox2 <= ox1 or oy2 <= oy1:
+        raise RuntimeError('Invalid expanded foot bbox.')
+
+    return ox1, oy1, ox2, oy2
+
+
+def feet_bbox_xyxy_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.8,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+) -> tuple[int, int, int, int]:
+    """
+    Compute a bbox covering one or both feet from MediaPipe Pose landmarks.
+
+    ``which`` uses observer/image perspective:
+
+    - ``'left'``: foot appearing on the left side of the image
+    - ``'right'``: foot appearing on the right side of the image
+    - ``'both'``: union of all detected foot candidates
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+        Missing landmarks are encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    which : {'left', 'right', 'both'}
+        Foot selection in image/viewer perspective.
+    expansion : float, default=1.8
+        Multiplicative expansion applied to each per-foot bbox before union.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used as a spatial guard. When provided, each
+        landmark-derived foot box may be expanded toward the likely adjacent
+        person-bbox edge, which helps recover toes missed by MediaPipe
+        ``foot_index`` landmarks.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive bbox ``(x1, y1, x2, y2)`` in full-image coordinates.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no suitable foot candidate can be derived.
+    """
+    selected = _select_foot_candidates(
+        pose_xy,
+        image_shape,
+        which=which,
+        expansion=expansion,
+        person_bbox=person_bbox,
+    )
+
+    x1 = min(b[0] for _, b, _ in selected)
+    y1 = min(b[1] for _, b, _ in selected)
+    x2 = max(b[2] for _, b, _ in selected)
+    y2 = max(b[3] for _, b, _ in selected)
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError('Invalid combined foot bbox.')
+
+    return x1, y1, x2, y2
+
+
+def feet_mask_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.8,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+) -> np.ndarray:
+    """
+    Build a generous foot mask from MediaPipe Pose landmarks.
+
+    The mask is intentionally approximate. It fills the triangle/hull defined
+    by ankle, heel, and foot_index when available; with only two reliable points
+    it draws a thick local line and expands it. The resulting mask is meant to
+    constrain SAM/person masks to a foot-local region, not to segment toes.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+        Missing landmarks are encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    which : {'left', 'right', 'both'}
+        Foot selection in image/viewer perspective.
+    expansion : float, default=1.8
+        Expansion factor controlling the selected foot candidates and the
+        size-aware dilation applied to their masks.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used to expand foot candidates toward the likely
+        body boundary before building the local foot mask.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask with shape ``(H, W)``.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid or ``expansion`` is negative.
+    RuntimeError
+        If no usable foot mask can be derived.
+    """
+    import cv2
+
+    if expansion < 0:
+        raise ValueError(
+            f'Invalid expansion={expansion!r}; expected >= 0.'
+        )
+
+    h, w = image_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    selected = _select_foot_candidates(
+        pose_xy,
+        image_shape,
+        which=which,
+        expansion=expansion,
+        person_bbox=person_bbox,
+    )
+
+    for _, box, pts in selected:
+        pts_i = pts.astype(np.int32, copy=True)
+        pts_i[:, 0] = np.clip(pts_i[:, 0], 0, w - 1)
+        pts_i[:, 1] = np.clip(pts_i[:, 1], 0, h - 1)
+
+        local_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if pts_i.shape[0] >= 3:
+            hull = cv2.convexHull(pts_i)
+            if hull is not None and len(hull) >= 3:
+                cv2.fillConvexPoly(local_mask, hull, 255)
+        else:
+            x1, y1, x2, y2 = box
+            thickness = max(3, int(round(0.18 * max(x2 - x1, y2 - y1))))
+            cv2.line(
+                local_mask,
+                tuple(int(v) for v in pts_i[0]),
+                tuple(int(v) for v in pts_i[1]),
+                255,
+                thickness=thickness,
+                lineType=cv2.LINE_AA,
+            )
+
+        x1, y1, x2, y2 = box
+        size = max(x2 - x1, y2 - y1)
+        base_radius = max(2, int(round(0.16 * size)))
+        extra_radius = max(
+            0,
+            int(round(max(0.0, float(expansion) - 1.0) * 0.08 * size)),
+        )
+        radius = base_radius + extra_radius
+
+        if radius > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * radius + 1, 2 * radius + 1),
+            )
+            local_mask = cv2.dilate(local_mask, k, iterations=1)
+
+        mask = np.maximum(mask, local_mask)
+
+    if not np.any(mask):
+        raise RuntimeError(
+            f'Could not derive a foot mask for which={which!r}.'
+        )
+
+    return (mask > 0)
