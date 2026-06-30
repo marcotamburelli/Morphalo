@@ -151,7 +151,7 @@ with DAG(
         name='lineart',
         spec={
             'processor': 'lineart_realistic',
-            'detect_long_side': 1024,
+            'detect_resolution': 1024,
         },
     )
 

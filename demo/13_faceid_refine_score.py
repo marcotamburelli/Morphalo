@@ -322,7 +322,7 @@ with DAG(
         name='depth',
         spec={
             'processor': 'depth_midas',
-            'detect_long_side': 1024,
+            'detect_resolution': 1024,
         },
     )
 

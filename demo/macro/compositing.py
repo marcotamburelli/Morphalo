@@ -221,7 +221,7 @@ def cutout_stack_canny_img2img_group(
             name='canny',
             spec={
                 'processor': 'canny',
-                'detect_long_side': 1024,
+                'detect_resolution': 1024,
             },
         )
 
@@ -354,7 +354,7 @@ def cutout_stack_depth_img2img_group(
             name='depth',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': 1024,
+                'detect_resolution': 1024,
             },
         )
 
@@ -481,7 +481,7 @@ def cutout_stack_pose_img2img_group(
             name='pose',
             spec={
                 'processor': 'openpose',
-                'detect_long_side': 1024,
+                'detect_resolution': 1024,
             },
         )
 
@@ -686,7 +686,7 @@ def cutout_stack_depth_ip_img2img_group(
     fg_layer_feather: int | str = '0.5%',
     fg_layer_position: str = 'center',
     fg_layer_resize: Optional[ResizeMode] = None,
-    depth_detect_long_side: int = 1024,
+    depth_detect_resolution: int = 1024,
     depth_conditioning_scale: float = 0.7,
     ip_adapter_model_id: str = 'h94/IP-Adapter',
     ip_adapter_subfolder: str = 'sdxl_models',
@@ -741,8 +741,8 @@ def cutout_stack_depth_ip_img2img_group(
     fg_layer_resize : ResizeMode, optional
         Optional resize parameter for the subject layer.
 
-    depth_detect_long_side : int, optional
-        Long-side resolution used when computing the depth map.
+    depth_detect_resolution : int, optional
+        Native short-side resolution used when computing the depth map.
 
     depth_conditioning_scale : float, optional
         Conditioning scale used for the Depth ControlNet.
@@ -817,7 +817,7 @@ def cutout_stack_depth_ip_img2img_group(
             name='depth',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 

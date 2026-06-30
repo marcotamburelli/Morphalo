@@ -470,7 +470,7 @@ def two_stage_style_canny_group(
     img2_spec: SpecInput,
     style1_scale: IpAdapterScale,
     style2_scale: IpAdapterScale,
-    canny_detect_long_side: int = 1024,
+    canny_detect_resolution: int = 1024,
     canny_conditioning_scale_1: float = 0.7,
     canny_conditioning_scale_2: float = 0.7,
 ) -> NodeGroup:
@@ -537,8 +537,8 @@ def two_stage_style_canny_group(
     style2_scale : IpAdapterScale
         IP-Adapter scale configuration for the second stage.
 
-    canny_detect_long_side : int, optional
-        Long-side resolution used when computing the Canny map.
+    canny_detect_resolution : int, optional
+        Native short-side resolution used when computing the Canny map.
 
     canny_conditioning_scale_1 : float, optional
         ControlNet conditioning scale for stage 1.
@@ -570,7 +570,7 @@ def two_stage_style_canny_group(
             name='canny',
             spec={
                 'processor': 'canny',
-                'detect_long_side': canny_detect_long_side,
+                'detect_resolution': canny_detect_resolution,
             },
         )
 
@@ -644,7 +644,7 @@ def style_depth_txt2img_group(
     *,
     txt2img_spec: SpecInput,
     style_scale: IpAdapterScale,
-    depth_detect_long_side: int = 1024,
+    depth_detect_resolution: int = 1024,
     depth_conditioning_scale: float = 0.7,
     ip_adapter_model_id: str = 'h94/IP-Adapter',
     ip_adapter_subfolder: str = 'sdxl_models',
@@ -707,8 +707,8 @@ def style_depth_txt2img_group(
     style_scale : IpAdapterScale
         IP-Adapter scale configuration for the style branch.
 
-    depth_detect_long_side : int, optional
-        Long-side resolution used when computing the depth map.
+    depth_detect_resolution : int, optional
+        Native short-side resolution used when computing the depth map.
 
     depth_conditioning_scale : float, optional
         ControlNet conditioning scale for the depth branch.
@@ -752,7 +752,7 @@ def style_depth_txt2img_group(
             name='depth',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 
@@ -801,7 +801,7 @@ def two_stage_style_depth_group(
     img2_spec: SpecInput,
     style1_scale: IpAdapterScale,
     style2_scale: IpAdapterScale,
-    depth_detect_long_side: int = 1024,
+    depth_detect_resolution: int = 1024,
     depth_conditioning_scale_1: float = 0.7,
     depth_conditioning_scale_2: float = 0.7,
 ) -> NodeGroup:
@@ -868,8 +868,8 @@ def two_stage_style_depth_group(
     style2_scale : IpAdapterScale
         IP-Adapter scale configuration for the second stage.
 
-    depth_detect_long_side : int, optional
-        Long-side resolution used when computing the depth map.
+    depth_detect_resolution : int, optional
+        Native short-side resolution used when computing the depth map.
 
     depth_conditioning_scale_1 : float, optional
         ControlNet conditioning scale for stage 1.
@@ -901,7 +901,7 @@ def two_stage_style_depth_group(
             name='depth',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 

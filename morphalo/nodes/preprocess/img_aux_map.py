@@ -14,8 +14,7 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
-                                             resize_long_side_rgb, round_up)
+from morphalo.nodes.preprocess.utils import fit_to_target_rgb, round_up
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 
@@ -34,20 +33,23 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
     include pose skeletons, Canny edges, HED edges, line art, depth maps, normal
     maps, and other structure-oriented conditioning signals.
 
-    The node uses two separate resizing stages:
+    The node uses two separate sizing stages:
 
     1. Annotator inference resize
-        The source image is resized before being passed to the annotator. This is
-        controlled by ``detect_long_side`` and always preserves aspect ratio.
+        The source image is passed to the selected ``controlnet-aux`` annotator.
+        Native annotator parameters such as ``detect_resolution`` and
+        ``image_resolution`` may be supplied at the top level of ``spec`` or
+        inside ``params``.
 
     2. Final output resize
         The annotator result is resized to the final control-map canvas. This is
         controlled by ``out_width``, ``out_height``, ``pad_to_multiple_of``, and
         ``output_resize_mode``.
 
-    These two stages are intentionally independent. ``detect_long_side`` controls
-    only the resolution seen by the annotator; it does not define the final output
-    size.
+    These two stages are intentionally independent. ``detect_resolution`` and
+    ``image_resolution`` follow the underlying ``controlnet-aux`` implementation:
+    in the bundled processors they are interpreted as short-side resolutions and
+    rounded to multiples of 64. They do not define the final output canvas.
 
     Processing flow
     ---------------
@@ -64,17 +66,14 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       ``controlnet-aux`` annotators operate on PIL/RGB images, so the image is
       converted before preprocessing.
 
-    4. Resize the RGB image for annotator inference.
-
-      The longest side is scaled to ``detect_long_side`` while preserving the
-      source aspect ratio. This resized image is used only as annotator input.
-
-    5. Run the selected ``controlnet-aux`` annotator.
+    4. Run the selected ``controlnet-aux`` annotator on the original RGB image.
 
       Annotator defaults are read from ``MODEL_PARAMS[processor]`` and can be
-      overridden through ``params``.
+      overridden through ``params``. The common native resize parameters
+      ``detect_resolution`` and ``image_resolution`` may also be provided directly
+      in ``spec``.
 
-    6. Resolve the final output size.
+    5. Resolve the final output size.
 
       If ``out_width`` or ``out_height`` are provided, they define the requested
       final output canvas. Any missing dimension falls back to the corresponding
@@ -83,7 +82,7 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       The resolved size is then optionally rounded up using
       ``pad_to_multiple_of``.
 
-    7. Resize the annotator output to the final canvas.
+    6. Resize the annotator output to the final canvas.
 
       The resize strategy is controlled by ``output_resize_mode``:
 
@@ -91,11 +90,11 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       - ``'contain'`` preserves aspect ratio and pads the remaining area with
         black pixels.
 
-    8. Save the final map as PNG.
+    7. Save the final map as PNG.
 
       The final RGB map is converted back to BGR before being written with OpenCV.
 
-    9. Write a JSON sidecar.
+    8. Write a JSON sidecar.
 
       The sidecar contains resolved parameters, input/output geometry, and timing
       information.
@@ -130,17 +129,19 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
 
             Lightweight or stateless processors may ignore this value.
 
-        **Annotator inference resizing**
+        **Annotator-native sizing**
 
-        - ``detect_long_side`` : int, optional
-            Long-side resolution used when running the annotator. Default is
-            ``512``.
+        - ``detect_resolution`` : int, optional
+            Native ``controlnet-aux`` inference resolution.
 
-            The input image is resized proportionally so that its longest side
-            equals this value. The aspect ratio is preserved.
+            For the bundled processors this is interpreted as a short-side
+            resolution and rounded internally to a multiple of 64.
 
-            This parameter affects preprocessing cost and annotator detail level,
-            but it does not determine the final output size.
+        - ``image_resolution`` : int, optional
+            Native ``controlnet-aux`` map resolution after detection/rendering.
+
+            For the bundled processors this is also interpreted as a short-side
+            resolution and rounded internally to a multiple of 64.
 
         **Final output sizing**
 
@@ -197,6 +198,8 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
 
             The node starts from ``MODEL_PARAMS[processor]`` and applies this
             dictionary on top. Supported keys depend on the selected processor.
+            Top-level ``detect_resolution`` and ``image_resolution`` override the
+            same keys inside ``params`` when provided.
 
     path : str or pathlib.Path, optional
         Input image path.
@@ -324,13 +327,6 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
         processor = spec.get('processor', 'openpose_full')
         device = spec.get('device', 'cuda')
 
-        detect_long_side = int(spec.get('detect_long_side', 512))
-        if detect_long_side <= 0:
-            raise ValueError(
-                f"'{self.id}': invalid detect_long_side={detect_long_side!r}; "
-                'expected >= 0.'
-            )
-
         out_w = spec.get('out_width', None)
         out_h = spec.get('out_height', None)
 
@@ -349,9 +345,31 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             )
         keep_aspect = output_resize_mode == 'contain'
 
-        # params: defaults + overrides
+        # params: defaults + overrides + top-level native annotator sizing
         params = dict(MODEL_PARAMS.get(processor, {}))
         params.update(spec.get('params', {}) or {})
+
+        if 'detect_resolution' in spec:
+            params['detect_resolution'] = spec['detect_resolution']
+        elif 'detect_resolution' not in params:
+            params['detect_resolution'] = 512
+
+        if 'image_resolution' in spec:
+            params['image_resolution'] = spec['image_resolution']
+        elif 'image_resolution' not in params:
+            params['image_resolution'] = 512
+
+        for key in ('detect_resolution', 'image_resolution'):
+            if key not in params:
+                continue
+
+            value = int(params[key])
+            if value <= 0:
+                raise ValueError(
+                    f"'{self.id}': invalid {key}={params[key]!r}; "
+                    'expected a positive integer.'
+                )
+            params[key] = value
 
         frame_bgr = cv2.imread(str(in_path), cv2.IMREAD_COLOR)
         if frame_bgr is None:
@@ -375,12 +393,9 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
 
         annotator = self._build_annotator(processor, device=device)
 
-        # --- inference resize on RGB ---
+        # controlnet-aux detectors take PIL/RGB and perform their native resizing.
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb_small = resize_long_side_rgb(rgb, detect_long_side)
-
-        pil_in = Image.fromarray(rgb_small)
-        # controlnet-aux detectors take PIL
+        pil_in = Image.fromarray(rgb)
         pil_out = annotator(pil_in, **params).convert('RGB')
         out_rgb = np.array(pil_out, dtype=np.uint8)
 
@@ -418,7 +433,8 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             },
             'params': {
                 'processor': processor,
-                'detect_long_side': detect_long_side,
+                'detect_resolution': params.get('detect_resolution'),
+                'image_resolution': params.get('image_resolution'),
                 'out_width': out_w,
                 'out_height': out_h,
                 'pad_to_multiple_of': pad_to_multiple_of,

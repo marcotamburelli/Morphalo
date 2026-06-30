@@ -10,8 +10,8 @@ def reconstruct_from_geometry_group(
     txt2img_spec: SpecInput,
     canny_conditioning_scale: float,
     depth_conditioning_scale: float,
-    canny_detect_long_side: int = 1024,
-    depth_detect_long_side: int = 1024,
+    canny_detect_resolution: int = 1024,
+    depth_detect_resolution: int = 1024,
 ) -> NodeGroup:
     """
     Reconstruct a photorealistic image from geometric cues extracted from a source image.
@@ -63,12 +63,12 @@ def reconstruct_from_geometry_group(
         - Lower values: more freedom to reshape 3D structure according to the prompt,
         which may improve aesthetics but risks changing the intended pose.
 
-    canny_detect_long_side : int, optional
-        Target long-side resolution used by the Canny preprocessor. Higher values
+    canny_detect_resolution : int, optional
+        Native short-side resolution used by the Canny preprocessor. Higher values
         preserve finer edge detail but may also capture unwanted micro-edges/noise.
 
-    depth_detect_long_side : int, optional
-        Target long-side resolution used by the depth preprocessor (e.g. MiDaS).
+    depth_detect_resolution : int, optional
+        Native short-side resolution used by the depth preprocessor (e.g. MiDaS).
         Higher values can improve structural fidelity but may amplify estimator noise
         or produce unstable depth boundaries on stylized images.
 
@@ -108,14 +108,14 @@ def reconstruct_from_geometry_group(
             name='canny',
             spec={
                 'processor': 'canny',
-                'detect_long_side': canny_detect_long_side,
+                'detect_resolution': canny_detect_resolution,
             },
         )
         depth = ImgAuxMap(
             name='depth_midas',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 
@@ -161,8 +161,8 @@ def reconstruct_from_geometry_img2img_group(
     depth_conditioning_scale: float,
     adapter_scale: float,
     ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    canny_detect_long_side: int = 1024,
-    depth_detect_long_side: int = 1024,
+    canny_detect_resolution: int = 1024,
+    depth_detect_resolution: int = 1024,
 ) -> NodeGroup:
     """
     Reconstruct a more realistic image from geometric cues while preserving the source via Img2Img.
@@ -212,11 +212,11 @@ def reconstruct_from_geometry_img2img_group(
     ip_adapter_weight_name : str, optional
         IP-Adapter weight file name. Defaults to 'ip-adapter_sdxl_vit-h.bin'.
 
-    canny_detect_long_side : int, optional
-        Target long-side resolution used by the Canny preprocessor.
+    canny_detect_resolution : int, optional
+        Native short-side resolution used by the Canny preprocessor.
 
-    depth_detect_long_side : int, optional
-        Target long-side resolution used by the depth preprocessor.
+    depth_detect_resolution : int, optional
+        Native short-side resolution used by the depth preprocessor.
 
     Returns
     -------
@@ -247,14 +247,14 @@ def reconstruct_from_geometry_img2img_group(
             name='canny',
             spec={
                 'processor': 'canny',
-                'detect_long_side': canny_detect_long_side,
+                'detect_resolution': canny_detect_resolution,
             },
         )
         depth = ImgAuxMap(
             name='depth_midas',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 
@@ -314,8 +314,8 @@ def reconstruct_masked_region_from_geometry_inpaint_group(
     canny_conditioning_scale: float,
     depth_conditioning_scale: float,
     adapter_scale: float,
-    canny_detect_long_side: int = 1024,
-    depth_detect_long_side: int = 1024,
+    canny_detect_resolution: int = 1024,
+    depth_detect_resolution: int = 1024,
     ip_adapter_model_id: str = 'h94/IP-Adapter',
     ip_adapter_subfolder: str = 'sdxl_models',
     ip_adapter_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
@@ -404,11 +404,11 @@ def reconstruct_masked_region_from_geometry_inpaint_group(
         IP-Adapter scale controlling how strongly ``in_style`` influences the
         generated region.
 
-    canny_detect_long_side : int, optional
-        Long-side resolution used by the Canny preprocessor.
+    canny_detect_resolution : int, optional
+        Native short-side resolution used by the Canny preprocessor.
 
-    depth_detect_long_side : int, optional
-        Long-side resolution used by the depth preprocessor.
+    depth_detect_resolution : int, optional
+        Native short-side resolution used by the depth preprocessor.
 
     ip_adapter_model_id : str, optional
         Hugging Face repository identifier or local path for the IP-Adapter model.
@@ -454,7 +454,7 @@ def reconstruct_masked_region_from_geometry_inpaint_group(
             name='canny',
             spec={
                 'processor': 'canny',
-                'detect_long_side': canny_detect_long_side,
+                'detect_resolution': canny_detect_resolution,
             },
         )
 
@@ -462,7 +462,7 @@ def reconstruct_masked_region_from_geometry_inpaint_group(
             name='depth_midas',
             spec={
                 'processor': 'depth_midas',
-                'detect_long_side': depth_detect_long_side,
+                'detect_resolution': depth_detect_resolution,
             },
         )
 

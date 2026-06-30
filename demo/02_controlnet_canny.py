@@ -111,13 +111,13 @@ with DAG(
     # - 'canny'
     # - 'depth_midas' (if you want a depth map)
     #
-    # detect_long_side controls the resolution used for detection.
+    # detect_resolution is the native controlnet-aux short-side detection size.
     #
     canny = ImgAuxMap(
         name='canny',
         spec={
             'processor': 'canny',
-            'detect_long_side': 1024,
+            'detect_resolution': 1024,
         },
     )
 
@@ -168,7 +168,7 @@ with DAG(
 
     # Optional: swap to depth ControlNet
     #
-    # depth = ImgAuxMap(name='depth', spec={'processor': 'depth_midas', 'detect_long_side': 1024})
+    # depth = ImgAuxMap(name='depth', spec={'processor': 'depth_midas', 'detect_resolution': 1024})
     # source >> depth >> out.controlnet.add(
     #     'diffusers/controlnet-depth-sdxl-1.0',
     #     conditioning_scale=0.4,
