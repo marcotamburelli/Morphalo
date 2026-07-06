@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 from PIL import Image
 
@@ -19,16 +19,44 @@ from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 @dataclass
 class Config:
     size: Optional[SizeSpec]
+    long_side: Optional[Union[int, str]]
+    short_side: Optional[Union[int, str]]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
     params = spec.get('params', {})
 
     size_value = params.get('size')
-    if size_value is None:
-        return Config(size=None)
+    long_side = params.get('long_side')
+    short_side = params.get('short_side')
 
-    return Config(size=_read_size_value(size_value, node_id=node_id, name='params.size'))
+    provided = [
+        name for name, value in (
+            ('params.size', size_value),
+            ('params.long_side', long_side),
+            ('params.short_side', short_side),
+        )
+        if value is not None
+    ]
+    if len(provided) > 1:
+        raise ValueError(
+            f"'{node_id}': use only one resize mode, got {provided}"
+        )
+
+    if long_side is not None:
+        validate_size_expr(long_side)
+    if short_side is not None:
+        validate_size_expr(short_side)
+
+    return Config(
+        size=None if size_value is None else _read_size_value(
+            size_value,
+            node_id=node_id,
+            name='params.size',
+        ),
+        long_side=long_side,
+        short_side=short_side,
+    )
 
 
 def _read_size_value(value: Any, *, node_id: str, name: str) -> SizeSpec:
@@ -92,6 +120,25 @@ def _resolve_resize_size(
     raise ValueError('resize size cannot be [None, None]')
 
 
+def _resolve_side_resize_size(
+    side: Union[int, str],
+    *,
+    mode: Literal['long', 'short'],
+    input_width: int,
+    input_height: int,
+) -> tuple[int, int]:
+    reference = (
+        max(input_width, input_height)
+        if mode == 'long'
+        else min(input_width, input_height)
+    )
+    target_side = resolve_size_expr(side, reference=reference)
+    scale = float(target_side) / float(reference)
+    out_width = max(1, int(round(input_width * scale)))
+    out_height = max(1, int(round(input_height * scale)))
+    return out_width, out_height
+
+
 def _json_size(size: SizeSpec) -> list[Optional[Union[int, str]]]:
     return [size[0], size[1]]
 
@@ -146,6 +193,14 @@ class ResizeImage(NodeRef):
 
                 This value may be omitted when a transform input provides
                 ``crop.bbox_size`` or ``placement.bbox_size``.
+
+            ``long_side`` : int or str, optional
+                Resize proportionally so the longest side matches this value.
+
+            ``short_side`` : int or str, optional
+                Resize proportionally so the shortest side matches this value.
+
+                ``size``, ``long_side`` and ``short_side`` are mutually exclusive.
 
     Transform input
     ---------------
@@ -228,16 +283,29 @@ class ResizeImage(NodeRef):
         spatial = merge_spatial_transform(default_spatial, transform_spatial)
 
         size = None if spatial is None else spatial.bbox_size
+        side_mode = None
+        side_value = None
+        if size is None and transform_spatial is None:
+            if cfg.long_side is not None:
+                side_mode = 'long'
+                side_value = cfg.long_side
+            elif cfg.short_side is not None:
+                side_mode = 'short'
+                side_value = cfg.short_side
+
         size_source = (
             'transform'
             if transform_spatial is not None
             and transform_spatial.bbox_size is not None
-            else 'params'
+            else f'params.{side_mode}_side'
+            if side_mode is not None
+            else 'params.size'
         )
-        if size is None:
+
+        if size is None and side_value is None:
             raise ValueError(
-                f"'{node_id}': missing params.size and no transform bbox_size "
-                'was provided'
+                f"'{node_id}': missing params.size, params.long_side or "
+                "params.short_side, and no transform bbox_size was provided"
             )
 
         img_path = resolve_single_image_path(
@@ -248,11 +316,19 @@ class ResizeImage(NodeRef):
 
         img = Image.open(img_path)
         input_width, input_height = img.size
-        out_width, out_height = _resolve_resize_size(
-            size,
-            input_width=input_width,
-            input_height=input_height,
-        )
+        if side_value is not None:
+            out_width, out_height = _resolve_side_resize_size(
+                side_value,
+                mode=side_mode,
+                input_width=input_width,
+                input_height=input_height,
+            )
+        else:
+            out_width, out_height = _resolve_resize_size(
+                size,
+                input_width=input_width,
+                input_height=input_height,
+            )
 
         resized = img.resize((out_width, out_height), resample=Image.LANCZOS)
 
@@ -274,12 +350,16 @@ class ResizeImage(NodeRef):
             'input_size': [int(input_width), int(input_height)],
             'output_size': [int(out_width), int(out_height)],
             'resize': {
-                'size': _json_size(size),
+                'size': None if size is None else _json_size(size),
+                'long_side': cfg.long_side,
+                'short_side': cfg.short_side,
                 'source': size_source,
                 'resolved_size': [int(out_width), int(out_height)],
             },
             'params': {
                 'size': None if cfg.size is None else _json_size(cfg.size),
+                'long_side': cfg.long_side,
+                'short_side': cfg.short_side,
             },
         }
 
