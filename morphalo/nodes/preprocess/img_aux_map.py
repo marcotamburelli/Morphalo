@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import cv2
 import numpy as np
@@ -14,9 +14,198 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import fit_to_target_rgb, round_up
+from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
+                                             remove_small_components,
+                                             resolve_min_component_area,
+                                             round_up,
+                                             validate_min_component_area)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
+
+
+def _read_postprocess_config(
+    value: Any,
+    *,
+    node_id: str,
+) -> Dict[str, Any]:
+    """
+    Validate optional auxiliary-map post-processing configuration.
+
+    The post-processing block is intentionally small and edge-map oriented. It
+    is disabled when omitted or empty, and is meant for sparse structural maps
+    such as Canny, line art, HED, PiDiNet, and scribble outputs.
+
+    Do not enable this block for dense or semantically encoded maps unless that
+    loss of information is intentional. Depth and normal maps store meaningful
+    continuous grayscale or color values; segmentation maps store category
+    colors; pose maps encode small skeleton/keypoint marks. Binarizing and
+    morphologically opening those maps can destroy the conditioning signal.
+
+    Processing order is:
+      1. convert the annotator output to grayscale;
+      2. if ``binarize_threshold`` is provided, binarize the map;
+      3. infer foreground line pixels from the map polarity;
+      4. apply ``morph_open_radius`` if enabled;
+      5. remove components below ``min_component_area`` if enabled;
+      6. preserve original grays when no binarization threshold was provided,
+         otherwise restore the detected or requested binary line polarity.
+
+    Supported keys are:
+
+    ``binarize_threshold``
+        Optional grayscale threshold in ``[0, 255]`` used to convert the
+        annotator output to a binary line/background map. When omitted or
+        ``None``, grayscale line intensities are preserved and cleanup operates
+        on a foreground mask inferred from polarity.
+
+    ``min_component_area``
+        Absolute pixel area or percentage string used to remove disconnected
+        foreground components whose area is less than or equal to the resolved
+        value. Percentage strings follow the shared preprocessing convention:
+        ``'1%'`` is measured on the image long side and converted to area.
+
+    ``morph_open_radius``
+        Radius in pixels for morphological opening, i.e. erosion followed by
+        dilation. This removes small local details while approximately
+        preserving larger surviving contours.
+
+    ``polarity``
+        Foreground polarity for binarization. ``'bright'`` means bright lines on
+        a dark background, ``'dark'`` means dark lines on a bright background,
+        and ``'auto'`` infers the less-common side as foreground.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"'{node_id}': postprocess must be a dictionary")
+
+    cfg = dict(value)
+    if not cfg:
+        return {}
+
+    raw_threshold = cfg.get('binarize_threshold', None)
+    if raw_threshold is None:
+        threshold = None
+    else:
+        try:
+            threshold = int(raw_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"'{node_id}': postprocess.binarize_threshold must be an integer or None"
+            ) from exc
+        if not 0 <= threshold <= 255:
+            raise ValueError(
+                f"'{node_id}': postprocess.binarize_threshold must be in [0, 255]"
+            )
+
+    min_component_area = cfg.get('min_component_area', 0)
+    validate_min_component_area(
+        min_component_area,
+        node_id=node_id,
+        param_name='postprocess.min_component_area',
+    )
+
+    try:
+        morph_open_radius = int(cfg.get('morph_open_radius', 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{node_id}': postprocess.morph_open_radius must be an integer"
+        ) from exc
+    if morph_open_radius < 0:
+        raise ValueError(
+            f"'{node_id}': postprocess.morph_open_radius must be >= 0"
+        )
+
+    polarity = str(cfg.get('polarity', 'auto'))
+    if polarity not in ('auto', 'bright', 'dark'):
+        raise ValueError(
+            f"'{node_id}': postprocess.polarity must be 'auto', 'bright', or 'dark'"
+        )
+
+    return {
+        'binarize_threshold': threshold,
+        'min_component_area': min_component_area,
+        'morph_open_radius': morph_open_radius,
+        'polarity': polarity,
+    }
+
+
+def _postprocess_aux_map(
+    rgb: np.ndarray,
+    *,
+    config: Dict[str, Any],
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Simplify a sparse auxiliary edge/line map.
+
+    The function converts ``rgb`` to grayscale, binarizes it, treats the line
+    pixels as foreground, optionally removes small disconnected components, and
+    optionally applies morphological opening. It returns an RGB image with the
+    same line polarity as the detected or requested input style.
+    """
+    if not config:
+        return rgb, {'enabled': False}
+
+    threshold_value = config.get('binarize_threshold', None)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    requested_polarity = str(config.get('polarity', 'auto'))
+    if requested_polarity == 'auto':
+        polarity = 'dark' if float(np.mean(gray)) > 127.0 else 'bright'
+    else:
+        polarity = requested_polarity
+
+    if threshold_value is None:
+        foreground = gray < 255 if polarity == 'dark' else gray > 0
+    else:
+        threshold = int(threshold_value)
+        bright = gray > threshold
+        foreground = ~bright if polarity == 'dark' else bright
+
+    morph_open_radius = int(config.get('morph_open_radius', 0))
+    if morph_open_radius > 0:
+        k = 2 * morph_open_radius + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        fg_u8 = foreground.astype(np.uint8) * 255
+        foreground = cv2.morphologyEx(
+            fg_u8,
+            cv2.MORPH_OPEN,
+            kernel,
+        ) > 0
+
+    min_component_area = resolve_min_component_area(
+        config.get('min_component_area', 0),
+        width=rgb.shape[1],
+        height=rgb.shape[0],
+    )
+    foreground = remove_small_components(
+        foreground,
+        min_area=min_component_area,
+    )
+
+    if threshold_value is None:
+        background = 255 if polarity == 'dark' else 0
+        out_gray = np.full_like(gray, background, dtype=np.uint8)
+        out_gray[foreground] = gray[foreground]
+    else:
+        out_gray = np.zeros_like(gray, dtype=np.uint8)
+        if polarity == 'dark':
+            out_gray[:, :] = 255
+            out_gray[foreground] = 0
+        else:
+            out_gray[foreground] = 255
+
+    out_rgb = cv2.cvtColor(out_gray, cv2.COLOR_GRAY2RGB)
+    resolved = {
+        'enabled': True,
+        'binarize_threshold': threshold_value,
+        'min_component_area': config.get('min_component_area', 0),
+        'resolved_min_component_area': min_component_area,
+        'morph_open_radius': morph_open_radius,
+        'polarity': polarity,
+        'requested_polarity': requested_polarity,
+    }
+    return out_rgb, resolved
 
 
 @dataclass
@@ -73,7 +262,13 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       ``detect_resolution`` and ``image_resolution`` may also be provided directly
       in ``spec``.
 
-    5. Resolve the final output size.
+    5. Optionally post-process the annotator output.
+
+      When ``postprocess`` is provided, the annotator output is simplified as a
+      binary edge/line map before final resizing. This can remove weak gray
+      edges, small disconnected components, and tiny local line details.
+
+    6. Resolve the final output size.
 
       If ``out_width`` or ``out_height`` are provided, they define the requested
       final output canvas. Any missing dimension falls back to the corresponding
@@ -82,7 +277,7 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       The resolved size is then optionally rounded up using
       ``pad_to_multiple_of``.
 
-    6. Resize the annotator output to the final canvas.
+    7. Resize the annotator output to the final canvas.
 
       The resize strategy is controlled by ``output_resize_mode``:
 
@@ -90,11 +285,11 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
       - ``'contain'`` preserves aspect ratio and pads the remaining area with
         black pixels.
 
-    7. Save the final map as PNG.
+    8. Save the final map as PNG.
 
       The final RGB map is converted back to BGR before being written with OpenCV.
 
-    8. Write a JSON sidecar.
+    9. Write a JSON sidecar.
 
       The sidecar contains resolved parameters, input/output geometry, and timing
       information.
@@ -200,6 +395,63 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             dictionary on top. Supported keys depend on the selected processor.
             Top-level ``detect_resolution`` and ``image_resolution`` override the
             same keys inside ``params`` when provided.
+
+        **Auxiliary-map post-processing**
+
+        - ``postprocess`` : dict, optional
+            Optional edge/line-map simplification applied after the annotator and
+            before final output resizing. It is disabled when omitted.
+
+            This block is intended for sparse structural maps whose useful
+            signal is "where are the lines?", for example ``canny``,
+            ``lineart*``, ``scribble_*``, ``softedge_hed``, and
+            ``softedge_pidinet``. It is useful when the annotator produces too
+            many weak edges, texture marks, or disconnected specks and you want a
+            simpler ControlNet/T2I-Adapter guide.
+
+            It should normally be left disabled for dense or semantically encoded
+            maps. In particular, avoid it for depth maps such as ``depth_midas``,
+            normal maps such as ``normalbae``, segmentation maps, and pose maps
+            such as ``openpose_full``. These maps carry information in continuous
+            values, category colors, or tiny keypoint/skeleton geometry; the
+            postprocess step may binarize the image and can therefore destroy
+            the conditioning signal when a threshold is enabled.
+
+            When enabled, the operation order is:
+            grayscale conversion, optional ``binarize_threshold``, foreground
+            mask inference from polarity, ``morph_open_radius``,
+            ``min_component_area``, then binary polarity restoration or grayscale
+            preservation.
+
+            Supported keys:
+
+            ``binarize_threshold`` : int or None, optional
+                Grayscale threshold in ``[0, 255]`` used to convert the map to
+                binary foreground/background. Lower values preserve weaker
+                lines; higher values keep only stronger lines. If omitted or
+                ``None``, the postprocess keeps the original grayscale
+                intensities for surviving line pixels and only uses polarity to
+                build a cleanup mask. Default: ``None``.
+
+            ``min_component_area`` : int, float, str or None, optional
+                Remove disconnected foreground components whose area is less than
+                or equal to this threshold. Numeric values are pixel areas.
+                Percentage strings such as ``'1%'`` follow the shared
+                preprocessing convention: the percentage is measured linearly on
+                the long side and converted to area. Default: ``0``.
+
+            ``morph_open_radius`` : int, optional
+                Radius in pixels for morphological opening, i.e. erosion followed
+                by dilation. This removes small local details while approximately
+                preserving larger contours, but can erase very thin Canny,
+                lineart, or scribble strokes. Default: ``0``.
+
+            ``polarity`` : {'auto', 'bright', 'dark'}, optional
+                Foreground polarity for line pixels. ``'bright'`` means bright
+                lines on a dark background; ``'dark'`` means dark lines on a
+                bright background. ``'auto'`` treats the less-common side after
+                thresholding as foreground and preserves that output style.
+                Default: ``'auto'``.
 
     path : str or pathlib.Path, optional
         Input image path.
@@ -348,6 +600,10 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
         # params: defaults + overrides + top-level native annotator sizing
         params = dict(MODEL_PARAMS.get(processor, {}))
         params.update(spec.get('params', {}) or {})
+        postprocess_config = _read_postprocess_config(
+            spec.get('postprocess', None),
+            node_id=self.id,
+        )
 
         if 'detect_resolution' in spec:
             params['detect_resolution'] = spec['detect_resolution']
@@ -398,6 +654,10 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
         pil_in = Image.fromarray(rgb)
         pil_out = annotator(pil_in, **params).convert('RGB')
         out_rgb = np.array(pil_out, dtype=np.uint8)
+        out_rgb, resolved_postprocess = _postprocess_aux_map(
+            out_rgb,
+            config=postprocess_config,
+        )
 
         # --- output fit/pad ---
         out_rgb = fit_to_target_rgb(
@@ -440,6 +700,7 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
                 'pad_to_multiple_of': pad_to_multiple_of,
                 'output_resize_mode': output_resize_mode,
                 'annotator_params': params,
+                'postprocess': resolved_postprocess,
             },
             'output': {
                 'width': target_w,

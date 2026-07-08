@@ -688,6 +688,160 @@ def fit_to_target_rgb(
     return canvas
 
 
+def validate_min_component_area(
+    value: Any,
+    *,
+    node_id: str,
+    param_name: str = 'min_component_area',
+) -> None:
+    """
+    Validate a connected-component area cleanup threshold.
+
+    The shared preprocessing convention accepts either an absolute pixel area or
+    a percentage string. Absolute values are interpreted as areas in pixels.
+    Percentage strings, for example ``'1%'``, are validated here and resolved by
+    :func:`resolve_min_component_area` against an image size later.
+
+    Parameters
+    ----------
+    value : int, float, str or None
+        User-provided area threshold. ``None`` and ``0`` both mean "disabled" to
+        consumers.
+
+    node_id : str
+        Node identifier used to produce contextual validation errors.
+
+    param_name : str, optional
+        Parameter name to include in error messages. This lets nodes reuse the
+        same validation logic while preserving their public configuration names.
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is negative, not numeric, or not one of the supported
+        types.
+    """
+    if value is None:
+        return
+
+    if isinstance(value, (int, float)):
+        if value < 0:
+            raise ValueError(f"'{node_id}': {param_name} must be >= 0")
+        return
+
+    if isinstance(value, str):
+        s = value.strip()
+        try:
+            number = float(s[:-1]) if s.endswith('%') else float(s)
+        except ValueError as exc:
+            raise ValueError(
+                f"'{node_id}': invalid {param_name}={value!r}"
+            ) from exc
+
+        if number < 0:
+            raise ValueError(f"'{node_id}': {param_name} must be >= 0")
+        return
+
+    raise ValueError(
+        f"'{node_id}': {param_name} must be an int, float, "
+        'percentage string, or None'
+    )
+
+
+def resolve_min_component_area(
+    value: Any,
+    *,
+    width: int,
+    height: int,
+) -> int:
+    """
+    Resolve a component-area cleanup threshold to pixels.
+
+    Numeric values are interpreted directly as pixel areas. Percentage strings
+    are interpreted linearly on the image long side and then converted to an
+    area, so ``'1%'`` on a 1024x768 image becomes roughly
+    ``(1024 * 0.01) ** 2`` pixels.
+
+    Parameters
+    ----------
+    value : int, float, str or None
+        Area threshold to resolve. ``None`` resolves to ``0``.
+
+    width : int
+        Image width used for percentage thresholds.
+
+    height : int
+        Image height used for percentage thresholds.
+
+    Returns
+    -------
+    int
+        Resolved non-negative pixel area threshold.
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, str):
+        s = value.strip()
+        if s.endswith('%'):
+            pct = float(s[:-1]) / 100.0
+            side = max(width, height) * pct
+            return int(round(side * side))
+        return int(round(float(s)))
+
+    return int(round(float(value)))
+
+
+def remove_small_components(
+    mask: np.ndarray,
+    *,
+    min_area: int,
+) -> np.ndarray:
+    """
+    Remove foreground connected components whose area is below a threshold.
+
+    The input is treated as a binary foreground mask: non-zero values are
+    foreground, zero values are background. Components are computed with
+    8-connectivity. Components with area less than or equal to ``min_area`` are
+    removed; larger components are preserved.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Two-dimensional mask. Boolean masks are returned as boolean masks;
+        integer masks are returned as boolean masks suitable for indexing or
+        conversion back to ``uint8`` by the caller.
+
+    min_area : int
+        Maximum area, in pixels, to remove. Values less than or equal to zero
+        disable cleanup and return ``mask`` unchanged.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean keep mask when cleanup is applied, or the original ``mask`` when
+        ``min_area <= 0``.
+    """
+    if min_area <= 0:
+        return mask
+
+    if mask.ndim != 2:
+        raise ValueError('Component mask must be HxW')
+
+    cm = (mask != 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        cm,
+        connectivity=8,
+    )
+    if num <= 1:
+        return mask
+
+    keep = np.zeros(num, dtype=bool)
+    keep[0] = False
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] > int(min_area)
+    return keep[labels]
+
+
 def postprocess_mask(
     mask: np.ndarray,
     *,

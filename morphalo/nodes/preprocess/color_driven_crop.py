@@ -15,7 +15,10 @@ from morphalo.nodes.preprocess.utils import (CropModeSpec,
                                              expand_clip_bbox,
                                              parse_crop_mode,
                                              postprocess_mask,
-                                             tight_alpha_bbox)
+                                             remove_small_components,
+                                             resolve_min_component_area,
+                                             tight_alpha_bbox,
+                                             validate_min_component_area)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 
@@ -165,7 +168,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         )
     if box_margin < 0.0:
         raise ValueError(f"'{node_id}': box_margin must be >= 0")
-    _validate_min_component_area(min_component_area, node_id=node_id)
+    validate_min_component_area(min_component_area, node_id=node_id)
     if dilate_radius < 0:
         raise ValueError(f"'{node_id}': dilate_radius must be >= 0")
     if close_radius < 0:
@@ -246,95 +249,6 @@ def _parse_colors(
         )
 
     return tuple(_parse_color(item, node_id=node_id) for item in value)
-
-
-def _validate_min_component_area(value: Any, *, node_id: str) -> None:
-    """
-    Validate the component-area cleanup threshold.
-    """
-    if value is None:
-        return
-
-    if isinstance(value, int):
-        if value < 0:
-            raise ValueError(f"'{node_id}': min_component_area must be >= 0")
-        return
-
-    if isinstance(value, float):
-        if value < 0:
-            raise ValueError(f"'{node_id}': min_component_area must be >= 0")
-        return
-
-    if isinstance(value, str):
-        s = value.strip()
-        try:
-            if s.endswith('%'):
-                number = float(s[:-1])
-            else:
-                number = float(s)
-        except ValueError as exc:
-            raise ValueError(
-                f"'{node_id}': invalid min_component_area={value!r}"
-            ) from exc
-
-        if number < 0:
-            raise ValueError(f"'{node_id}': min_component_area must be >= 0")
-        return
-
-    raise ValueError(
-        f"'{node_id}': min_component_area must be an int, float, "
-        'percentage string, or None'
-    )
-
-
-def _resolve_min_component_area(
-    value: Any,
-    *,
-    width: int,
-    height: int,
-) -> int:
-    """
-    Resolve a pixel or long-side percentage component area threshold.
-    """
-    if value is None:
-        return 0
-
-    if isinstance(value, str):
-        s = value.strip()
-        if s.endswith('%'):
-            pct = float(s[:-1]) / 100.0
-            side = max(width, height) * pct
-            return int(round(side * side))
-        return int(round(float(s)))
-
-    return int(round(float(value)))
-
-
-def _remove_small_components(
-    mask: np.ndarray,
-    *,
-    min_area: int,
-) -> np.ndarray:
-    """
-    Remove selected connected components whose area is <= ``min_area``.
-    """
-    if min_area <= 0:
-        return mask
-
-    import cv2
-
-    cm = mask.astype(np.uint8)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(
-        cm,
-        connectivity=8,
-    )
-    if num <= 1:
-        return mask
-
-    keep = np.zeros(num, dtype=bool)
-    keep[0] = False
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] > int(min_area)
-    return keep[labels]
 
 
 def _initial_centers(samples: np.ndarray, count: int) -> np.ndarray:
@@ -965,13 +879,13 @@ class ColorDrivenCrop(NodeRef):
                 analysis_clusters=cfg.analysis_clusters,
             )
 
-        min_component_area = _resolve_min_component_area(
+        min_component_area = resolve_min_component_area(
             cfg.min_component_area,
             width=w,
             height=h,
         )
         raw_selected_mask = selected_mask
-        selected_mask = _remove_small_components(
+        selected_mask = remove_small_components(
             selected_mask,
             min_area=min_component_area,
         )
