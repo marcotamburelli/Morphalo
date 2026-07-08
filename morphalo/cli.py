@@ -6,9 +6,11 @@ from typing import Optional
 
 import typer
 
+from morphalo.core.config import MORPHALO_CUDA_CHUNK_SIZE
 from morphalo.core.spec_loader import load_hocon_spec
 from morphalo.dag import DagRegistry
 from morphalo.dag.runner import DAGRunner
+from morphalo.nodes.common.env import setup_env
 
 app = typer.Typer(
     help='Morphalo CLI',
@@ -58,7 +60,7 @@ def run_dags(
         help='With --node or --group, execute missing upstream nodes'
     ),
     cuda_chunk_size: int = typer.Option(
-        8,
+        MORPHALO_CUDA_CHUNK_SIZE,
         '--cuda-chunk-size',
         min=1,
         help=(
@@ -156,6 +158,7 @@ def run_dags(
       materialization (JSON artifacts).
     - This command does not return values; results are persisted to disk.
     """
+    setup_env()
     DagRegistry.clear()
     importlib.import_module(module)
 

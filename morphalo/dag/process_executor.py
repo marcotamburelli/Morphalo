@@ -432,6 +432,10 @@ def _node_worker_main(
     job_queue: mp.Queue,
     result_queue: mp.Queue,
 ) -> None:
+    from morphalo.nodes.common.env import setup_env
+
+    setup_env()
+
     # SIGINT is handled only by the parent. The worker must finish the current
     # node, run post_run(), and release its CUDA context through normal process
     # teardown instead of being interrupted in the middle of CUDA work.

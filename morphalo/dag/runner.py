@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from morphalo.core.config import MORPHALO_CUDA_CHUNK_SIZE
 from morphalo.core.paths import load_latest_output
 from morphalo.dag import NodeRef
 from morphalo.dag.core import DAG, Edge, get_entry_nodes
 from morphalo.dag.process_executor import ProcessNodeExecutor
 from morphalo.dag.validation import DagValidationError, validate_dag
+from morphalo.nodes.common.env import setup_env
 
 Output = Dict[str, Any]
 
@@ -394,7 +396,12 @@ class DAGRunner:
     out of scope.
     """
 
-    def __init__(self, dag: DAG, *, max_cuda_nodes: int = 8):
+    def __init__(
+        self,
+        dag: DAG,
+        *,
+        max_cuda_nodes: int = MORPHALO_CUDA_CHUNK_SIZE,
+    ):
         """
         Initializes a DAGRunner for a given DAG.
 
@@ -417,6 +424,8 @@ class DAGRunner:
             in the current worker after the limit is reached. Recycling the
             worker destroys its CUDA context before the next CUDA chunk.
         """
+
+        setup_env()
 
         self.__dag = dag
         if max_cuda_nodes <= 0:

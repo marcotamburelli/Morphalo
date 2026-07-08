@@ -10,7 +10,6 @@ from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
                                                  qwen_stats_device,
@@ -153,8 +152,8 @@ class QwenImage(ImageOutputMixin, PromptMixin, NodeRef):
         users are expected to specify one explicitly when classifier-free guidance
         is desired.
 
-    - Hugging Face cache and environment variables are configured via
-      ``setup_env()`` prior to loading any pipeline components.
+    - Hugging Face cache and environment variables are configured by the DAG
+      runner prior to loading any pipeline components.
     - Prompt resolution is performed by :class:`PromptBundle`: if a prompt
       bundle is wired into ``prompt:default``, it takes precedence over the
       local ``spec``; otherwise the local ``spec`` is used.
@@ -189,9 +188,6 @@ class QwenImage(ImageOutputMixin, PromptMixin, NodeRef):
         output_dir: str | Path,
         input: Optional[Dict[str, Dict]] = None,
     ) -> Dict[str, Any]:
-        # --- HF env ---
-        setup_env()
-
         spec = resolve_spec(self.spec)
 
         # --- prompt bundle ---

@@ -13,13 +13,12 @@ from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
-                                                 qwen_stats_device,
-                                                 resolve_qwen_image_edit_params,
-                                                 resolve_qwen_model_config,
-                                                 resolve_qwen_seed)
+                                                  qwen_stats_device,
+                                                  resolve_qwen_image_edit_params,
+                                                  resolve_qwen_model_config,
+                                                  resolve_qwen_seed)
 from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.wiring.mixins import PromptMixin
@@ -154,8 +153,6 @@ class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
         return True
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        setup_env()
-
         input = input or {}
 
         init_up = input.get('default')
@@ -167,7 +164,8 @@ class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
         init_path = init_up.get('image') or init_up.get('path')
         if not init_path:
             raise ValueError(
-                "Init image upstream output must contain 'image' (path).")
+                "Init image upstream output must contain 'image' (path)."
+            )
 
         init_image = Image.open(init_path).convert('RGB')
 

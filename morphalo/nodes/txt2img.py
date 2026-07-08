@@ -12,7 +12,6 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.image_output import ImageOutputMixin
@@ -347,8 +346,8 @@ class Txt2Img(
 
     Notes
     -----
-    - Hugging Face cache and environment variables are configured via ``setup_env()``
-    prior to loading any pipeline components.
+    - Hugging Face cache and environment variables are configured by the DAG
+    runner prior to loading any pipeline components.
     - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle is
     wired into ``prompt:default``, it takes precedence over the local ``spec``;
     otherwise the local ``spec`` is used.
@@ -384,10 +383,6 @@ class Txt2Img(
         from diffusers import (StableDiffusionXLAdapterPipeline,
                                StableDiffusionXLControlNetPipeline,
                                StableDiffusionXLPipeline)
-
-        # --- Hugging Face env (must be set before loading) ---
-        # HF env
-        setup_env()
 
         ctx = resolve_common(self.spec)
 

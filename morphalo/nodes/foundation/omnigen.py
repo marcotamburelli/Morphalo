@@ -14,7 +14,6 @@ from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.wiring import (OmniGenImageBundle,
                                               OmniGenImageRegistry)
@@ -172,8 +171,8 @@ class OmniGen(ImageOutputMixin, OmniGenImageMixin, PromptMixin, NodeRef):
 
     Notes
     -----
-    - Hugging Face cache and environment variables are configured via ``setup_env()``
-      prior to loading any pipeline components.
+    - Hugging Face cache and environment variables are configured by the DAG
+      runner prior to loading any pipeline components.
     - Prompt resolution is performed by :class:`PromptBundle`: if a prompt bundle is
       wired into ``prompt:default``, it takes precedence over the local ``spec``;
       otherwise the local ``spec`` is used.
@@ -204,9 +203,6 @@ class OmniGen(ImageOutputMixin, OmniGenImageMixin, PromptMixin, NodeRef):
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         from diffusers.utils import load_image
-
-        # --- HF env ---
-        setup_env()
 
         spec = resolve_spec(self.spec)
 

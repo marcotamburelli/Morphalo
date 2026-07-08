@@ -14,7 +14,6 @@ from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.qwen_controlnet_wiring import \
     QwenImageInpaintMixin
@@ -129,8 +128,6 @@ class QwenImageInpaint(
         output_dir: str | Path,
         input: Optional[Dict[str, Dict]] = None,
     ) -> Dict[str, Any]:
-        setup_env()
-
         input = input or {}
         spec = resolve_spec(self.spec)
 

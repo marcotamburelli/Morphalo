@@ -13,7 +13,6 @@ from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
                                                  qwen_stats_device,
@@ -199,8 +198,6 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
         return self.image.add(idx=idx)
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        setup_env()
-
         input = input or {}
         spec = resolve_spec(self.spec)
 

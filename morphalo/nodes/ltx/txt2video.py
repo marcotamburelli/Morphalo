@@ -11,7 +11,6 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.ltx.conditioning import apply_ic_lora
 from morphalo.nodes.ltx.io import finalize_video_output, save_video
 from morphalo.nodes.ltx.ltx_resolve import resolve_ltx_common
@@ -121,9 +120,6 @@ class Txt2Video(CudaPostRunMixin, IcLoRaMixin, PromptMixin, NodeRef):
         return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
 
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
-        # HF env
-        setup_env()
-
         ctx = resolve_ltx_common(self.spec)
 
         ic_lora_bundle = self.build_ic_lora_bundle(input)

@@ -12,7 +12,6 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.image_output import ImageOutputMixin
@@ -244,9 +243,6 @@ class Img2Img(
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         from diffusers import (StableDiffusionXLControlNetImg2ImgPipeline,
                                StableDiffusionXLImg2ImgPipeline)
-
-        # HF env
-        setup_env()
 
         ctx = resolve_common(self.spec)
 

@@ -12,7 +12,6 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
-from morphalo.nodes.common.env import setup_env
 from morphalo.nodes.common.io import save_image
 from morphalo.nodes.img import resolve_long_side_size
 from morphalo.nodes.image_output import ImageOutputMixin
@@ -347,7 +346,6 @@ class Inpaint(
         from diffusers import (StableDiffusionXLControlNetInpaintPipeline,
                                StableDiffusionXLInpaintPipeline)
 
-        setup_env()
         ctx = resolve_common(self.spec)
 
         input = input or {}
