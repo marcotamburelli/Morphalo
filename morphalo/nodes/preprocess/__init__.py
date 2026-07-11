@@ -3,6 +3,7 @@ from .box_crop import BoxCrop
 from .color_driven_crop import ColorDrivenCrop
 from .face_crop import FaceCrop
 from .flip_image import FlipImage
+from .human_segment_crop import HumanSegmentCrop
 from .image_stack import ImageStack
 from .image_layer_placement import ImageLayerPlacement
 from .img_aux_map import ImgAuxMap
@@ -18,6 +19,7 @@ __all__ = [
     'ColorDrivenCrop',
     'FaceCrop',
     'FlipImage',
+    'HumanSegmentCrop',
     'ImageStack',
     'ImageLayerPlacement',
     'ImgAuxMap',

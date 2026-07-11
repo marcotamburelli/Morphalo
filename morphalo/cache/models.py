@@ -10,17 +10,19 @@ from morphalo.cache import CacheKey, ModelCache
 
 if TYPE_CHECKING:
     from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
-                           OmniGenPipeline,
-                           QwenImageControlNetInpaintPipeline,
+                           OmniGenPipeline, QwenImageControlNetInpaintPipeline,
                            QwenImageControlNetModel, QwenImageEditPipeline,
                            QwenImageEditPlusPipeline,
                            StableDiffusionXLPipeline, T2IAdapter)
     from insightface.app import FaceAnalysis
-    from morphalo.nodes.sdxl_resolve import ResolvedModelRef
     from transformers import (CLIPVisionModelWithProjection,
-                              DPTForDepthEstimation, DPTImageProcessor)
+                              DPTForDepthEstimation, DPTImageProcessor,
+                              SegformerForSemanticSegmentation,
+                              SegformerImageProcessor)
     from transformers.pipelines.base import Pipeline
     from ultralytics import YOLO as YOLOModel
+
+    from morphalo.nodes.sdxl_resolve import ResolvedModelRef
 
 
 def dtype_key(dtype: torch.dtype) -> str:
@@ -151,6 +153,50 @@ def get_depth_estimator(*, model_id: str, device: str) -> Tuple[DPTImageProcesso
     model = ModelCache.get(mod_key)
     if model is None:
         model = DPTForDepthEstimation.from_pretrained(model_id).to(device)
+        model.eval()
+        ModelCache.put(mod_key, model)
+
+    return processor, model
+
+
+def get_human_segmenter(
+    *,
+    model_id: str,
+    device: str,
+    dtype: torch.dtype,
+) -> Tuple[SegformerImageProcessor, SegformerForSemanticSegmentation]:
+    from transformers import (SegformerForSemanticSegmentation,
+                              SegformerImageProcessor)
+
+    model_dtype = dtype if str(device).lower(
+    ).startswith('cuda') else torch.float32
+
+    proc_key = CacheKey(
+        kind='human_segment_processor',
+        ref=model_id,
+        device='cpu',
+        dtype='na',
+    )
+    mod_key = CacheKey(
+        kind='human_segment_model',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(model_dtype),
+    )
+
+    processor = ModelCache.get(proc_key)
+    if processor is None:
+        processor = ModelCache.put(
+            proc_key,
+            SegformerImageProcessor.from_pretrained(model_id),
+        )
+
+    model = ModelCache.get(mod_key)
+    if model is None:
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            model_id,
+            torch_dtype=model_dtype,
+        ).to(device)
         model.eval()
         ModelCache.put(mod_key, model)
 

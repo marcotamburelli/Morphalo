@@ -4,7 +4,6 @@ from typing import Any, Optional
 import numpy as np
 from PIL import Image
 
-
 POSE_EDGES = (
     (0, 1), (1, 2), (2, 3), (3, 7),
     (0, 4), (4, 5), (5, 6), (6, 8),
@@ -234,6 +233,31 @@ def write_crop_debug_overlay(
     cv2.rectangle(dbg, (tx1, ty1), (tx2, ty2), (255, 0, 0), 3)
 
     _draw_label(dbg, 'person', (bx1 + 4, max(12, by1 - 6)), (0, 255, 255))
+    _draw_label(dbg, target, (tx1 + 4, max(12, ty1 - 6)), (255, 0, 0))
+
+    dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')
+    Image.fromarray(dbg).save(dbg_path)
+    return dbg_path
+
+
+def write_mask_debug_overlay(
+    *,
+    img_rgb: np.ndarray,
+    out_path: Path,
+    target: str,
+    mask: np.ndarray,
+    target_bbox: tuple[int, int, int, int],
+) -> Path:
+    """
+    Write a lightweight debug overlay for mask-derived crops.
+    """
+    import cv2
+
+    dbg = img_rgb.copy()
+    tx1, ty1, tx2, ty2 = target_bbox
+
+    _draw_mask_overlay(dbg, mask)
+    cv2.rectangle(dbg, (tx1, ty1), (tx2 - 1, ty2 - 1), (255, 0, 0), 3)
     _draw_label(dbg, target, (tx1 + 4, max(12, ty1 - 6)), (255, 0, 0))
 
     dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')
