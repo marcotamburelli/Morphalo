@@ -314,7 +314,6 @@ with DAG(
                 'true_cfg_scale': 4.0,
                 'controlnet_conditioning_scale': 1.0,
             },
-            'seed': 1234,
         },
     )
 

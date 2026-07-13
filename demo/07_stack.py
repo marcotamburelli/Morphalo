@@ -87,12 +87,12 @@ MODEL_SPEC = {
 #     return a tight RGBA cutout trimmed to the non-transparent subject mask.
 #
 # `box_margin`:
-#     small margin applied around the initial detected subject box.
+#     small margin applied around the mask-derived crop box.
 #
 COMMON_PARAMS = {
     'mode': 'default',
     'crop_mode': 'trim',
-    'box_margin': 0.12,
+    'box_margin': '12%',
 }
 
 

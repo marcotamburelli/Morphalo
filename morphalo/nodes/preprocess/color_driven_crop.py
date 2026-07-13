@@ -10,15 +10,15 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import (CropModeSpec,
+from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
+                                             cleanup_shape_mask,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox,
+                                             expand_clip_bbox_by_size_expr,
                                              parse_crop_mode,
-                                             postprocess_mask,
-                                             remove_small_components,
-                                             resolve_min_component_area,
+                                             prepare_output_mask,
+                                             read_shape_cleanup_config,
                                              tight_alpha_bbox,
-                                             validate_min_component_area)
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 
@@ -42,11 +42,11 @@ class Config:
     feather: float
     strength: float
     colors: Optional[tuple[tuple[int, int, int], ...]]
-    box_margin: float
-    min_component_area: Any
+    box_margin: SizeExpr
     dilate_radius: int
     close_radius: int
     smoothing_radius: int
+    shape_cleanup: dict[str, Any]
 
 
 _DEFAULT_ANALYSIS_CLUSTERS = 6
@@ -137,8 +137,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     tolerance = float(params.get('tolerance', 12.0))
     feather = float(params.get('feather', 6.0))
     strength = float(params.get('strength', 1.0))
-    box_margin = float(params.get('box_margin', 0.08))
-    min_component_area = params.get('min_component_area', 0)
+    box_margin = params.get('box_margin', '8%')
     dilate_radius = int(params.get('dilate_radius', 0))
     close_radius = int(params.get('close_radius', 0))
     smoothing_radius = int(params.get('smoothing_radius', 0))
@@ -166,9 +165,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         raise ValueError(
             f"'{node_id}': strength must be in [0, 1]"
         )
-    if box_margin < 0.0:
-        raise ValueError(f"'{node_id}': box_margin must be >= 0")
-    validate_min_component_area(min_component_area, node_id=node_id)
+    validate_size_expr(box_margin)
     if dilate_radius < 0:
         raise ValueError(f"'{node_id}': dilate_radius must be >= 0")
     if close_radius < 0:
@@ -188,10 +185,13 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         strength=strength,
         colors=colors,
         box_margin=box_margin,
-        min_component_area=min_component_area,
         dilate_radius=dilate_radius,
         close_radius=close_radius,
         smoothing_radius=smoothing_radius,
+        shape_cleanup=read_shape_cleanup_config(
+            params.get('postprocess', None),
+            node_id=node_id,
+        ),
     )
 
 
@@ -768,15 +768,18 @@ class ColorDrivenCrop(NodeRef):
                 non-preserved pixels, ``0.5`` attenuates them partially, and
                 ``0`` disables alpha changes. Default: ``1.0``.
 
-            ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the color-derived
-                selection bbox, expressed as a fraction of bbox size. Applies
-                only when ``mode='default'`` and ``crop_mode`` is ``'trim'``,
-                ``'bbox'`` or ``'bbox[w:h]'``. Ignored for
+            ``box_margin`` : int or str, optional
+                Symmetric margin applied to the color-derived selection bbox.
+                Supported forms follow the standard size-expression convention:
+                integer pixels, ``'<n>px'`` or ``'<n>%'``. Percentages are
+                resolved against the mask bbox width for left/right and mask
+                bbox height for top/bottom.
+
+                Applies only when ``mode='default'`` and ``crop_mode`` is
+                ``'trim'``, ``'bbox'`` or ``'bbox[w:h]'``. Ignored for
                 ``crop_mode='full_frame'`` and mask outputs. For
                 ``crop_mode='bbox[w:h]'``, the margin is applied before
-                aspect-ratio expansion. Typical range: 0.03-0.12. Default:
-                ``0.08``.
+                aspect-ratio expansion. Default: ``'8%'``.
 
             ``colors`` : str or list, optional
                 Manual reference colors. Accepted entries are PIL/CSS-like
@@ -791,14 +794,45 @@ class ColorDrivenCrop(NodeRef):
                 colors provided. Mutually exclusive with ``colors``. Must be at
                 least ``1`` in automatic mode. Default: ``1``.
 
-            ``min_component_area`` : int, float, str or None, optional
-                Remove small selected connected components from the crop/mask
-                selection when their area is less than or equal to this
-                threshold. In default RGBA mode, removed selected components are
-                treated as non-preserved color noise and attenuated according to
-                ``strength``. Pixel values are used directly. Percentage strings
-                such as ``'1%'`` are interpreted linearly on the image long side
-                and converted to area. Default: ``0``.
+            ``postprocess`` : dict, optional
+                Structural cleanup applied to the selected color silhouette
+                before deriving crop geometry, RGBA alpha, or full-frame mask
+                output. This block defines the canonical shape used by the node,
+                so it is applied in every mode. Output-only mask refinements
+                such as ``close_radius``, ``dilate_radius`` and
+                ``smoothing_radius`` are applied later and only for
+                ``mode='mask'`` or ``mode='negative-mask'``.
+
+                Processing order is fixed: ``fill_holes`` ->
+                ``morph_open_radius`` -> ``min_component_area``.
+
+                ``fill_holes`` : int, float, str, 'all' or None, optional
+                    Fill enclosed background holes inside the selected shape
+                    before removing thin details. ``0`` or ``None`` disables
+                    hole filling. ``'all'`` fills every enclosed hole. Numeric
+                    values are pixel areas. Percentage strings such as ``'1%'``
+                    follow the shared component-area convention: the percentage
+                    is measured on the image long side and squared into an area
+                    threshold. Only holes with area less than or equal to the
+                    resolved threshold are filled.
+
+                ``morph_open_radius`` : int, optional
+                    Radius in pixels for morphological opening, applied after
+                    hole filling. Opening removes thin lines, speckles, and
+                    small bridges while preserving surviving larger regions.
+                    ``0`` disables this step.
+
+                ``min_component_area`` : int, float, str, 'biggest' or None, optional
+                    Remove disconnected foreground components after hole filling
+                    and opening. ``0`` or ``None`` disables component filtering.
+                    Numeric values are pixel areas. Percentage strings use the
+                    same long-side area convention as ``fill_holes``.
+                    ``'biggest'`` keeps only the largest connected component,
+                    useful for a single color object but potentially destructive
+                    when the same color intentionally appears in multiple
+                    separate regions.
+
+                Default: all disabled.
 
             ``dilate_radius`` : int, optional
                 Mask dilation radius in pixels, used only for ``mode='mask'``
@@ -879,15 +913,10 @@ class ColorDrivenCrop(NodeRef):
                 analysis_clusters=cfg.analysis_clusters,
             )
 
-        min_component_area = resolve_min_component_area(
-            cfg.min_component_area,
-            width=w,
-            height=h,
-        )
         raw_selected_mask = selected_mask
-        selected_mask = remove_small_components(
+        selected_mask = cleanup_shape_mask(
             selected_mask,
-            min_area=min_component_area,
+            **cfg.shape_cleanup,
         )
         removed_selected_mask = raw_selected_mask & ~selected_mask
         if np.any(removed_selected_mask):
@@ -926,16 +955,15 @@ class ColorDrivenCrop(NodeRef):
 
                 alpha = selected_mask.astype(np.uint8) * 255
                 x1, y1, x2, y2 = tight_alpha_bbox(alpha)
-                if cfg.box_margin > 0:
-                    x1, y1, x2, y2 = expand_clip_bbox(
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        w,
-                        h,
-                        cfg.box_margin,
-                    )
+                x1, y1, x2, y2 = expand_clip_bbox_by_size_expr(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    w,
+                    h,
+                    cfg.box_margin,
+                )
 
                 if cfg.crop_mode.mode == 'bbox':
                     if cfg.crop_mode.ratio is not None:
@@ -974,7 +1002,7 @@ class ColorDrivenCrop(NodeRef):
                     )
 
         else:
-            out_mask_u8 = postprocess_mask(
+            out_mask_u8 = prepare_output_mask(
                 selected_mask,
                 dilate_radius=cfg.dilate_radius,
                 close_radius=cfg.close_radius,
@@ -1013,10 +1041,10 @@ class ColorDrivenCrop(NodeRef):
             ),
             'num_dominant_colors': cfg.num_dominant_colors,
             'analysis_clusters': cfg.analysis_clusters,
-            'min_component_area': cfg.min_component_area,
             'dilate_radius': cfg.dilate_radius,
             'close_radius': cfg.close_radius,
             'smoothing_radius': cfg.smoothing_radius,
+            'postprocess': cfg.shape_cleanup,
         }
         out = {
             'ok': True,

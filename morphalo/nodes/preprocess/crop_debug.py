@@ -116,6 +116,62 @@ def _draw_foot_landmarks(img: np.ndarray, pose_xy: np.ndarray) -> None:
             cv2.line(img, p1, p2, color, 2, cv2.LINE_AA)
 
 
+def _draw_foot_sam_regions(img: np.ndarray, foot_sam_regions: Any) -> None:
+    """
+    Draw foot-specific SAM prompt diagnostics.
+
+    MediaPipe ankle/foot_index landmarks are already visible, but the actual
+    SAM prompt can include extra generated points: foot midpoint positives,
+    foot-axis negatives, opposite-foot negatives and the adaptive leg probe.
+    Drawing them here makes prompt mistakes visible without reading sidecars.
+    """
+    import cv2
+
+    if not foot_sam_regions:
+        return
+
+    for region in foot_sam_regions:
+        point_coords = getattr(region, 'point_coords', None) or []
+        point_labels = getattr(region, 'point_labels', None) or []
+
+        for point, label in zip(point_coords, point_labels):
+            px = int(round(float(point[0])))
+            py = int(round(float(point[1])))
+            is_positive = int(label) == 1
+            color = (0, 255, 0) if is_positive else (255, 64, 64)
+            text = 'sam +' if is_positive else 'sam -'
+
+            cv2.circle(img, (px, py), 5, color, -1)
+            cv2.circle(img, (px, py), 7, (0, 0, 0), 1)
+            _draw_label(
+                img,
+                text,
+                (px + 7, py + 14),
+                color,
+                scale=0.4,
+                thickness=1,
+            )
+
+        probe = getattr(region, 'leg_probe_point', None)
+        if probe is None:
+            continue
+
+        px = int(round(float(probe[0])))
+        py = int(round(float(probe[1])))
+        color = (255, 255, 0)
+
+        cv2.circle(img, (px, py), 6, color, -1)
+        cv2.circle(img, (px, py), 8, (0, 0, 0), 1)
+        _draw_label(
+            img,
+            'leg probe',
+            (px + 7, py - 7),
+            color,
+            scale=0.45,
+            thickness=1,
+        )
+
+
 def _draw_hand_landmarks(img: np.ndarray, hands_res: Any) -> None:
     """
     Draw MediaPipe hand landmarks when a hand crop computed them.
@@ -200,23 +256,27 @@ def write_crop_debug_overlay(
     out_path: Path,
     target: str,
     pose_xy: np.ndarray,
-    person_bbox: tuple[int, int, int, int],
+    sam_prompt_bbox: tuple[int, int, int, int],
     target_bbox: tuple[int, int, int, int],
     hands_res: Any = None,
     face_xy: Optional[np.ndarray] = None,
     mask: Optional[np.ndarray] = None,
+    foot_sam_regions: Any = None,
+    prompt_bbox_label: str = 'person',
 ) -> Path:
     """
     Write a crop debug image with bboxes, pose, and optional local landmarks.
 
     The overlay always includes all valid pose landmarks. It additionally draws
     hand landmarks, face landmarks, or mask overlays when the caller provides
-    those data.
+    those data. ``sam_prompt_bbox`` is the yellow/cyan prompt box used to guide
+    SAM; for non-person targets callers can override ``prompt_bbox_label`` to
+    describe the actual prompt domain.
     """
     import cv2
 
     dbg = img_rgb.copy()
-    bx1, by1, bx2, by2 = person_bbox
+    bx1, by1, bx2, by2 = sam_prompt_bbox
     tx1, ty1, tx2, ty2 = target_bbox
 
     _draw_mask_overlay(dbg, mask)
@@ -224,6 +284,7 @@ def write_crop_debug_overlay(
 
     if target in ('feet', 'left-foot', 'right-foot'):
         _draw_foot_landmarks(dbg, pose_xy)
+        _draw_foot_sam_regions(dbg, foot_sam_regions)
     if hands_res is not None:
         _draw_hand_landmarks(dbg, hands_res)
     if face_xy is not None:
@@ -232,7 +293,12 @@ def write_crop_debug_overlay(
     cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (0, 255, 255), 2)
     cv2.rectangle(dbg, (tx1, ty1), (tx2, ty2), (255, 0, 0), 3)
 
-    _draw_label(dbg, 'person', (bx1 + 4, max(12, by1 - 6)), (0, 255, 255))
+    _draw_label(
+        dbg,
+        prompt_bbox_label,
+        (bx1 + 4, max(12, by1 - 6)),
+        (0, 255, 255),
+    )
     _draw_label(dbg, target, (tx1 + 4, max(12, ty1 - 6)), (255, 0, 0))
 
     dbg_path = out_path.with_name(out_path.stem + '_debug_bbox.png')

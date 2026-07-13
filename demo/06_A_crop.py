@@ -10,7 +10,7 @@ Defined DAGs
     Full-frame positive and negative masks for the detected subject.
 
 ``subject_crop``
-    Trimmed RGBA crops for person, head, face, eyes, eyebrows and hands.
+    Trimmed RGBA crops for person, head, face, eyes, eyebrows, hands and feet.
 
 ``subject_crop_bbox_ratio``
     Rectangular bbox crops and aspect-ratio-guided crops.
@@ -30,7 +30,7 @@ from morphalo.nodes.preprocess import FaceCrop, SubjectCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
-INIT_IMG = '~/images/init_img_3.png'
+INIT_IMG = '~/images/2026-03-11_180553.png'
 
 SUBJECT_MODEL_SPEC = {
     'sam_model': 'facebook/sam-vit-large',
@@ -48,14 +48,26 @@ FACE_MODEL_SPEC = {
 COMMON_PARAMS = {
     'mode': 'default',
     'crop_mode': 'trim',
-    'box_margin': 0.12,
+    'box_margin': '12%',
     'expansion': 1.2,
+}
+
+SHAPE_CLEANUP_PARAMS = {
+    'morph_open_radius': 1,
+    'fill_holes': 'all',
+    'min_component_area': 'biggest',
+}
+
+FOOT_PARAMS = {
+    **COMMON_PARAMS,
+    'prompt_expansion': 0.12,
+    'postprocess': SHAPE_CLEANUP_PARAMS,
 }
 
 MASK_PARAMS = {
     'target': 'person',
     'mode': 'mask',
-    'box_margin': 0.12,
+    'box_margin': '12%',
     'dilate_radius': 10,
     'close_radius': 4,
     'smoothing_radius': 7,
@@ -136,6 +148,7 @@ with DAG(
             'params': {
                 **COMMON_PARAMS,
                 'target': 'face',
+                'postprocess': SHAPE_CLEANUP_PARAMS,
             },
         },
     )
@@ -239,6 +252,48 @@ with DAG(
         },
     )
 
+    feet_crop = SubjectCrop(
+        name='feet_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **FOOT_PARAMS,
+                'target': 'feet',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    left_foot_crop = SubjectCrop(
+        name='left_foot_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **FOOT_PARAMS,
+                'target': 'left-foot',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    right_foot_crop = SubjectCrop(
+        name='right_foot_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **FOOT_PARAMS,
+                'target': 'right-foot',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
     init_img >> [
         person_crop,
         head_crop,
@@ -252,6 +307,9 @@ with DAG(
         hands_crop,
         left_hand_crop,
         right_hand_crop,
+        feet_crop,
+        left_foot_crop,
+        right_foot_crop,
     ]
 
 

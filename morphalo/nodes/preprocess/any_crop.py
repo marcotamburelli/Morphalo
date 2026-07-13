@@ -15,11 +15,16 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
-from morphalo.nodes.preprocess.utils import (CropModeSpec,
+from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
+                                             cleanup_shape_mask,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox, parse_crop_mode,
-                                             postprocess_mask,
-                                             tight_alpha_bbox)
+                                             expand_clip_bbox,
+                                             expand_clip_bbox_by_size_expr,
+                                             parse_crop_mode,
+                                             prepare_output_mask,
+                                             read_shape_cleanup_config,
+                                             tight_alpha_bbox,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
@@ -69,7 +74,9 @@ class AnyCropConfig:
         Grounding DINO object-box confidence threshold.
     text_threshold : float
         Grounding DINO text-token confidence threshold.
-    box_margin : float
+    box_margin : int or str
+        Symmetric crop margin applied after mask cleanup.
+    prompt_expansion : float
         Symmetric bbox expansion ratio applied before SAM.
     select : {'best', 'largest', 'center', 'all'}
         Strategy used to select boxes when Grounding DINO returns multiple boxes.
@@ -91,12 +98,14 @@ class AnyCropConfig:
     crop_mode: Optional[CropModeSpec]
     box_threshold: float
     text_threshold: float
-    box_margin: float
+    box_margin: SizeExpr
+    prompt_expansion: float
     select: str
     save_debug: bool
     dilate_radius: int
     close_radius: int
     smoothing_radius: int
+    shape_cleanup: dict[str, Any]
 
 
 def _read_any_crop_cfg(spec: dict, node_id: str) -> AnyCropConfig:
@@ -146,7 +155,9 @@ def _read_any_crop_cfg(spec: dict, node_id: str) -> AnyCropConfig:
 
     box_threshold = float(params.get('box_threshold', 0.35))
     text_threshold = float(params.get('text_threshold', 0.25))
-    box_margin = float(params.get('box_margin', 0.08))
+    box_margin = params.get('box_margin', '8%')
+    validate_size_expr(box_margin)
+    prompt_expansion = float(params.get('prompt_expansion', 0.0))
 
     if not (0.0 <= box_threshold <= 1.0):
         raise ValueError(
@@ -160,9 +171,9 @@ def _read_any_crop_cfg(spec: dict, node_id: str) -> AnyCropConfig:
             '(expected in [0, 1])'
         )
 
-    if box_margin < 0:
+    if prompt_expansion < 0:
         raise ValueError(
-            f"'{node_id}': invalid box_margin={box_margin!r} "
+            f"'{node_id}': invalid prompt_expansion={prompt_expansion!r} "
             '(expected >= 0)'
         )
 
@@ -184,11 +195,16 @@ def _read_any_crop_cfg(spec: dict, node_id: str) -> AnyCropConfig:
         box_threshold=box_threshold,
         text_threshold=text_threshold,
         box_margin=box_margin,
+        prompt_expansion=prompt_expansion,
         select=select,
         save_debug=bool(debug.get('save_debug', False)),
         dilate_radius=int(params.get('dilate_radius', 0)),
         close_radius=int(params.get('close_radius', 0)),
         smoothing_radius=int(params.get('smoothing_radius', 0)),
+        shape_cleanup=read_shape_cleanup_config(
+            params.get('postprocess', None),
+            node_id=node_id,
+        ),
     )
 
 
@@ -523,7 +539,8 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
     3. Run Grounding DINO on the image and prompt.
     4. Select one or more detection boxes using ``params.select``.
     5. For ``select='all'``, suppress duplicate detections with class-agnostic NMS.
-    6. Clip and optionally expand each selected box using ``params.box_margin``.
+    6. Clip and optionally expand each selected box using
+       ``params.prompt_expansion``.
     7. Run SAM once per selected box.
     8. Select each SAM candidate with the highest predicted IoU score.
     9. Clean each local mask and combine selected masks by union.
@@ -680,17 +697,65 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 Grounding DINO text-token confidence threshold. Expected range:
                 ``[0, 1]``. Default: ``0.25``.
 
-            ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the selected detection box
-                before running SAM. The value is expressed as a fraction of the
-                box width and height.
+            ``box_margin`` : int or str, optional
+                Symmetric margin applied to the final crop bbox derived from the
+                cleaned SAM mask. Supported forms follow the standard
+                size-expression convention: integer pixels, ``'<n>px'`` or
+                ``'<n>%'``. Percentages are resolved against the mask bbox width
+                for left/right and mask bbox height for top/bottom.
 
-                Default: ``0.08``.
+                Default: ``'8%'``.
+
+            ``prompt_expansion`` : float, optional
+                Advanced SAM prompt padding ratio. This expands selected
+                Grounding DINO boxes before SAM while leaving output crop
+                geometry controlled by the cleaned mask and ``box_margin``.
+
+                Default: ``0.0``.
 
             ``select`` : {'best', 'largest', 'center', 'all'}, optional
                 Strategy used when Grounding DINO returns multiple boxes.
                 ``'all'`` combines all distinct detections into one crop/mask.
                 Default: ``'best'``.
+
+            ``postprocess`` : dict, optional
+                Structural cleanup applied to the selected SAM silhouette before
+                deriving crop geometry, RGBA alpha, or full-frame mask output.
+                This block defines the canonical shape used by the node, so it
+                is applied in every mode. Output-only mask refinements such as
+                ``close_radius``, ``dilate_radius`` and ``smoothing_radius`` are
+                applied later and only for ``mode='mask'`` or
+                ``mode='negative-mask'``.
+
+                Processing order is fixed: ``fill_holes`` ->
+                ``morph_open_radius`` -> ``min_component_area``.
+
+                ``fill_holes`` : int, float, str, 'all' or None, optional
+                    Fill enclosed background holes inside the selected shape
+                    before removing thin details. ``0`` or ``None`` disables
+                    hole filling. ``'all'`` fills every enclosed hole. Numeric
+                    values are pixel areas. Percentage strings such as ``'1%'``
+                    follow the shared component-area convention: the percentage
+                    is measured on the image long side and squared into an area
+                    threshold. Only holes with area less than or equal to the
+                    resolved threshold are filled.
+
+                ``morph_open_radius`` : int, optional
+                    Radius in pixels for morphological opening, applied after
+                    hole filling. Opening removes thin lines, speckles, and
+                    small bridges while preserving surviving larger regions.
+                    ``0`` disables this step.
+
+                ``min_component_area`` : int, float, str, 'biggest' or None, optional
+                    Remove disconnected foreground components after hole filling
+                    and opening. ``0`` or ``None`` disables component filtering.
+                    Numeric values are pixel areas. Percentage strings use the
+                    same long-side area convention as ``fill_holes``.
+                    ``'biggest'`` keeps only the largest connected component,
+                    useful for single-object prompts but potentially destructive
+                    for prompts that intentionally select multiple objects.
+
+                Default: all disabled.
 
             ``dilate_radius`` : int, optional
                 Mask dilation radius in pixels, used only for ``mode='mask'`` and
@@ -943,9 +1008,9 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 h=h,
             )
 
-            if cfg.box_margin > 0:
+            if cfg.prompt_expansion > 0:
                 bx1, by1, bx2, by2 = expand_clip_bbox(
-                    bx1, by1, bx2, by2, w, h, cfg.box_margin
+                    bx1, by1, bx2, by2, w, h, cfg.prompt_expansion
                 )
 
             sam_bbox = (bx1, by1, bx2, by2)
@@ -979,33 +1044,53 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
             else:
                 single_mask = mask
 
-        crop_x1 = min(bbox[0] for bbox in sam_bboxes)
-        crop_y1 = min(bbox[1] for bbox in sam_bboxes)
-        crop_x2 = max(bbox[2] for bbox in sam_bboxes)
-        crop_y2 = max(bbox[3] for bbox in sam_bboxes)
-
-        if cfg.mode == 'default' and cfg.crop_mode is not None:
-            if cfg.crop_mode.mode == 'bbox' and cfg.crop_mode.ratio is not None:
-                crop_x1, crop_y1, crop_x2, crop_y2 = expand_bbox_toward_ratio(
-                    crop_x1,
-                    crop_y1,
-                    crop_x2,
-                    crop_y2,
-                    full_w=w,
-                    full_h=h,
-                    ratio=cfg.crop_mode.ratio,
-                )
-
         if cfg.select != 'all':
             if single_mask is None:
                 raise RuntimeError(
                     f"AnyCrop node '{self.id}': SAM mask was not computed.")
             clean_mask = _clean_sam_mask_for_bbox(
                 single_mask,
-                bbox=(crop_x1, crop_y1, crop_x2, crop_y2),
+                bbox=sam_bboxes[0],
                 seed_bbox=sam_bboxes[0],
                 keep_all_components=False,
             )
+
+        clean_mask = cleanup_shape_mask(clean_mask, **cfg.shape_cleanup)
+        clean_mask_u8 = clean_mask.astype(np.uint8) * 255
+
+        crop_x1 = 0
+        crop_y1 = 0
+        crop_x2 = w
+        crop_y2 = h
+
+        if cfg.mode == 'default' and cfg.crop_mode is not None:
+            if cfg.crop_mode.mode != 'full_frame':
+                crop_x1, crop_y1, crop_x2, crop_y2 = tight_alpha_bbox(
+                    clean_mask_u8
+                )
+                crop_x1, crop_y1, crop_x2, crop_y2 = expand_clip_bbox_by_size_expr(
+                    crop_x1,
+                    crop_y1,
+                    crop_x2,
+                    crop_y2,
+                    w,
+                    h,
+                    cfg.box_margin,
+                )
+
+                if (
+                    cfg.crop_mode.mode == 'bbox'
+                    and cfg.crop_mode.ratio is not None
+                ):
+                    crop_x1, crop_y1, crop_x2, crop_y2 = expand_bbox_toward_ratio(
+                        crop_x1,
+                        crop_y1,
+                        crop_x2,
+                        crop_y2,
+                        full_w=w,
+                        full_h=h,
+                        ratio=cfg.crop_mode.ratio,
+                    )
 
         crop_mask = clean_mask[crop_y1:crop_y2, crop_x1:crop_x2]
 
@@ -1047,18 +1132,10 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
             else:
-                alpha = crop_mask.astype(np.uint8) * 255
+                alpha = clean_mask_u8[crop_y1:crop_y2, crop_x1:crop_x2]
                 crop_rgba = np.dstack([crop_rgb, alpha])
 
                 if cfg.crop_mode.mode == 'trim':
-                    tx1, ty1, tx2, ty2 = tight_alpha_bbox(alpha)
-                    crop_rgba = crop_rgba[ty1:ty2, tx1:tx2, :]
-
-                    out_x1 = int(crop_x1 + tx1)
-                    out_y1 = int(crop_y1 + ty1)
-                    out_x2 = int(crop_x1 + tx2)
-                    out_y2 = int(crop_y1 + ty2)
-
                     Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
                 elif cfg.crop_mode.mode == 'full_frame':
@@ -1078,7 +1155,7 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                     )
 
         else:
-            out_mask_u8 = postprocess_mask(
+            out_mask_u8 = prepare_output_mask(
                 clean_mask,
                 dilate_radius=cfg.dilate_radius,
                 close_radius=cfg.close_radius,
@@ -1126,10 +1203,12 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 'box_threshold': cfg.box_threshold,
                 'text_threshold': cfg.text_threshold,
                 'box_margin': cfg.box_margin,
+                'prompt_expansion': cfg.prompt_expansion,
                 'select': cfg.select,
                 'dilate_radius': cfg.dilate_radius,
                 'close_radius': cfg.close_radius,
                 'smoothing_radius': cfg.smoothing_radius,
+                'postprocess': cfg.shape_cleanup,
             },
             'detections': {
                 'candidate_count': len(boxes),

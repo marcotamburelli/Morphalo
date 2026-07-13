@@ -1227,6 +1227,44 @@ def _select_hand_indices(
     if which == 'both':
         return list(range(n_hands))
 
+    def _hand_horizontal_centers(indices: list[int]) -> list[tuple[int, float]]:
+        """
+        Return ``(idx, bbox_center_x)`` for hands with valid landmarks.
+        """
+        centers: list[tuple[int, float]] = []
+
+        for i in indices:
+            hand_xy = hands.xy[i]
+            valid = (
+                (hand_xy[:, 0] >= 0) &
+                (hand_xy[:, 1] >= 0)
+            )
+            pts = hand_xy[valid]
+            if pts.shape[0] == 0:
+                continue
+
+            x1 = float(np.min(pts[:, 0]))
+            x2 = float(np.max(pts[:, 0]))
+            centers.append((i, 0.5 * (x1 + x2)))
+
+        return centers
+
+    def _pick_extreme_hand(indices: list[int]) -> list[int]:
+        """
+        Pick exactly one hand by observer-side bbox center.
+        """
+        centers = _hand_horizontal_centers(indices)
+
+        if not centers:
+            return []
+
+        centers = sorted(centers, key=lambda item: item[1])
+
+        if which == 'left':
+            return [centers[0][0]]
+
+        return [centers[-1][0]]
+
     labels = [str(h).lower() for h in hands.handedness]
 
     target_label = {
@@ -1242,38 +1280,20 @@ def _select_hand_indices(
             selected.append(i)
 
     if selected:
-        return selected
+        return _pick_extreme_hand(selected)
 
     # Fallback: use horizontal image position only if at least two hands
     # are geometrically available. With a single detected hand, returning it
     # would be ambiguous and could silently select the wrong side.
-    centers: list[tuple[int, float]] = []
+    geometric = _hand_horizontal_centers(list(range(n_hands)))
 
-    for i in range(n_hands):
-        hand_xy = hands.xy[i]
-        valid = (
-            (hand_xy[:, 0] >= 0) &
-            (hand_xy[:, 1] >= 0)
-        )
-        pts = hand_xy[valid]
-        if pts.shape[0] == 0:
-            continue
-
-        cx = float(np.mean(pts[:, 0]))
-        centers.append((i, cx))
-
-    if len(centers) < 2:
+    if len(geometric) < 2:
         raise RuntimeError(
             f'Could not reliably select a hand for which={which!r}: '
             'handedness did not match and fewer than two hands were detected.'
         )
 
-    centers.sort(key=lambda t: t[1])
-
-    if which == 'left':
-        return [centers[0][0]]
-
-    return [centers[-1][0]]
+    return _pick_extreme_hand([item[0] for item in geometric])
 
 
 def hands_bbox_xyxy_from_landmarks(
@@ -1523,6 +1543,56 @@ _FOOT_LENGTH_FROM_SHOULDER_WEIGHT = 0.20
 _FOOT_LENGTH_FROM_HEAD_WEIGHT = 0.10
 _FOOT_LENGTH_SAFETY = 1.30
 _FOOT_LENGTH_MIN_PX = 18.0
+_FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_RATIO = 0.16
+_FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MIN_PX = 10.0
+_FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MAX_PX = 32.0
+
+
+@dataclass(frozen=True)
+class FootSamRegion:
+    """
+    Foot-local SAM prompt region.
+
+    ``base_bbox`` is the landmark/proportion-derived foot box. ``prompt_bbox``
+    may be expanded toward the person bbox and is intended only as SAM search
+    space.
+
+    ``point_coords`` / ``point_labels`` are the normal foot prompt:
+    ankle and foot_index are positive; optional image-aware positive points may
+    be inserted by the caller; an optional point from the opposite foot can be
+    negative when it is clearly outside ``base_bbox``.
+
+    ``leg_probe_point`` is deliberately kept separate. It is a point above the
+    ankle, toward the knee, placed inside ``prompt_bbox``. Callers can use it as
+    a positive probe to test whether SAM sees visual continuity between lower
+    leg and foot before deciding whether to reuse it as a negative point.
+
+    Parameters
+    ----------
+    side : str
+        Anatomical side label, either ``'anatomical-left'`` or
+        ``'anatomical-right'``.
+    base_bbox : tuple[int, int, int, int]
+        Landmark/proportion-derived foot bbox before expansion toward the
+        person bbox. This is the red target/base box in the foot debug overlay.
+    prompt_bbox : tuple[int, int, int, int]
+        Foot-local bbox passed to SAM. It may be expanded toward the person bbox
+        and is the cyan prompt/search box in the foot debug overlay.
+    point_coords : list[list[float]] or None
+        SAM point coordinates for the normal foot prompt.
+    point_labels : list[int] or None
+        SAM point labels aligned with ``point_coords``. ``1`` means positive and
+        ``0`` means negative.
+    leg_probe_point : list[float] or None
+        Optional lower-leg point inside ``prompt_bbox`` used for the adaptive
+        leg-continuity probe.
+    """
+    side: str
+    base_bbox: tuple[int, int, int, int]
+    prompt_bbox: tuple[int, int, int, int]
+    point_coords: Optional[list[list[float]]]
+    point_labels: Optional[list[int]]
+    leg_probe_point: Optional[list[float]]
 
 
 def _valid_pose_point(pose_xy: np.ndarray, idx: int) -> Optional[np.ndarray]:
@@ -1553,6 +1623,199 @@ def _valid_pose_point(pose_xy: np.ndarray, idx: int) -> Optional[np.ndarray]:
     return p.astype(np.float32, copy=False)
 
 
+def _point_segment_distance(
+    point: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> float:
+    """
+    Return the 2D distance between ``point`` and segment ``a -> b``.
+
+    Parameters
+    ----------
+    point : np.ndarray
+        Point to measure, as ``(x, y)`` image coordinates.
+    a : np.ndarray
+        First endpoint of the segment.
+    b : np.ndarray
+        Second endpoint of the segment.
+
+    Returns
+    -------
+    float
+        Euclidean distance from ``point`` to the closest point on segment
+        ``a -> b``. If the segment is degenerate, returns distance to ``a``.
+    """
+    ab = b - a
+    ab_len_sq = float(np.dot(ab, ab))
+
+    if ab_len_sq <= 1e-6:
+        return float(np.linalg.norm(point - a))
+
+    t = float(np.dot(point - a, ab) / ab_len_sq)
+    t = min(1.0, max(0.0, t))
+    closest = a + ab * t
+    return float(np.linalg.norm(point - closest))
+
+
+def _segments_intersect_2d(
+    a1: np.ndarray,
+    a2: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+) -> bool:
+    """
+    Return whether two 2D line segments intersect.
+
+    Parameters
+    ----------
+    a1 : np.ndarray
+        First endpoint of the first segment.
+    a2 : np.ndarray
+        Second endpoint of the first segment.
+    b1 : np.ndarray
+        First endpoint of the second segment.
+    b2 : np.ndarray
+        Second endpoint of the second segment.
+
+    Returns
+    -------
+    bool
+        ``True`` when the two closed segments intersect or touch; otherwise
+        ``False``.
+    """
+    def orient(p: np.ndarray, q: np.ndarray, r: np.ndarray) -> float:
+        return float((q[0] - p[0]) * (r[1] - p[1]) -
+                     (q[1] - p[1]) * (r[0] - p[0]))
+
+    def on_segment(p: np.ndarray, q: np.ndarray, r: np.ndarray) -> bool:
+        return (
+            min(float(p[0]), float(r[0])) <= float(q[0]) <= max(float(p[0]), float(r[0])) and
+            min(float(p[1]), float(r[1])) <= float(q[1]) <= max(float(p[1]), float(r[1]))
+        )
+
+    o1 = orient(a1, a2, b1)
+    o2 = orient(a1, a2, b2)
+    o3 = orient(b1, b2, a1)
+    o4 = orient(b1, b2, a2)
+
+    if (o1 > 0.0) != (o2 > 0.0) and (o3 > 0.0) != (o4 > 0.0):
+        return True
+
+    eps = 1e-6
+    return (
+        (abs(o1) <= eps and on_segment(a1, b1, a2)) or
+        (abs(o2) <= eps and on_segment(a1, b2, a2)) or
+        (abs(o3) <= eps and on_segment(b1, a1, b2)) or
+        (abs(o4) <= eps and on_segment(b1, a2, b2))
+    )
+
+
+def _lower_legs_are_crossed(pose_xy: np.ndarray) -> bool:
+    """
+    Return whether the projected lower-leg segments cross in image space.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+
+    Returns
+    -------
+    bool
+        ``True`` when left and right knee->ankle segments intersect in the
+        image projection, or when their horizontal ordering flips between knees
+        and ankles. Missing lower-leg landmarks return ``False``.
+    """
+    left = _FOOT_LANDMARKS['anatomical-left']
+    right = _FOOT_LANDMARKS['anatomical-right']
+    left_knee = _valid_pose_point(pose_xy, left['knee'])
+    left_ankle = _valid_pose_point(pose_xy, left['ankle'])
+    right_knee = _valid_pose_point(pose_xy, right['knee'])
+    right_ankle = _valid_pose_point(pose_xy, right['ankle'])
+
+    if (
+        left_knee is None
+        or left_ankle is None
+        or right_knee is None
+        or right_ankle is None
+    ):
+        return False
+
+    if _segments_intersect_2d(left_knee, left_ankle, right_knee, right_ankle):
+        return True
+
+    # Perspective and landmark noise can make the segments miss by a few pixels.
+    # A horizontal order flip between knees and ankles is still a useful signal
+    # that the lower legs are crossed in the image projection.
+    knee_dx = float(left_knee[0] - right_knee[0])
+    ankle_dx = float(left_ankle[0] - right_ankle[0])
+    return knee_dx * ankle_dx < 0.0
+
+
+def _foot_ankle_contaminated_by_crossed_leg(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+) -> bool:
+    """
+    Return whether a foot ankle is likely contaminated by the other crossed leg.
+
+    This is a conservative prompt-safety check. When lower legs are crossed and
+    the target ankle lies close to the other leg's knee -> ankle axis, positive
+    points around the ankle or color samples along ankle -> foot_index may
+    describe the other leg rather than the target foot. In that case the foot
+    prompt should rely on foot_index and stronger opposite-foot negatives.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    side : {'anatomical-left', 'anatomical-right'}
+        Target foot side whose ankle should be checked.
+
+    Returns
+    -------
+    bool
+        ``True`` when lower legs look crossed and the target ankle is close
+        enough to the other leg's knee->ankle axis to make ankle-based foot
+        prompts risky. ``False`` means the normal ankle + foot_index prompt can
+        be used.
+    """
+    if not _lower_legs_are_crossed(pose_xy):
+        return False
+
+    if side == 'anatomical-left':
+        target_ids = _FOOT_LANDMARKS['anatomical-left']
+        other_ids = _FOOT_LANDMARKS['anatomical-right']
+    elif side == 'anatomical-right':
+        target_ids = _FOOT_LANDMARKS['anatomical-right']
+        other_ids = _FOOT_LANDMARKS['anatomical-left']
+    else:
+        raise ValueError(f'Unknown foot side {side!r}.')
+
+    ankle = _valid_pose_point(pose_xy, target_ids['ankle'])
+    other_knee = _valid_pose_point(pose_xy, other_ids['knee'])
+    other_ankle = _valid_pose_point(pose_xy, other_ids['ankle'])
+
+    if ankle is None or other_knee is None or other_ankle is None:
+        return False
+
+    other_leg_len = float(np.linalg.norm(other_ankle - other_knee))
+    if other_leg_len < 4.0:
+        return False
+
+    threshold = min(
+        _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MAX_PX,
+        max(
+            _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MIN_PX,
+            _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_RATIO * other_leg_len,
+        ),
+    )
+    distance = _point_segment_distance(ankle, other_knee, other_ankle)
+    return distance <= threshold
+
+
 def _foot_points_for_side(
     pose_xy: np.ndarray,
     *,
@@ -1565,6 +1828,9 @@ def _foot_points_for_side(
     ``foot_index`` landmarks. If fewer than two of those points are available,
     the function falls back to a coarse synthetic two-point foot estimate from
     ``knee -> ankle``.
+
+    Heel may contribute to bbox geometry when valid, but it is not necessarily
+    used as a SAM positive prompt because it is less stable in practice.
 
     Parameters
     ----------
@@ -1714,6 +1980,11 @@ def _expand_foot_box_toward_person_edge(
 ) -> tuple[int, int, int, int]:
     """
     Expand a foot bbox from ankle toward the coarse foot-index direction.
+
+    When the coarse foot direction points toward the nearest compatible edge of
+    the person bbox, the prompt box may be extended up to that edge. This favors
+    foot completeness over strict locality and may intentionally include extra
+    context in difficult perspective views.
 
     MediaPipe ``heel`` and ``foot_index`` can be noisy, but ``ankle`` is usually
     more stable because it is anchored to the leg. This helper therefore treats
@@ -2142,6 +2413,562 @@ def feet_bbox_xyxy_from_landmarks(
     return x1, y1, x2, y2
 
 
+def _foot_sam_points_for_side(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+    base_bbox: Optional[tuple[int, int, int, int]] = None,
+    prompt_bbox: Optional[tuple[int, int, int, int]] = None,
+    additional_positive_points: Optional[list[list[float]]] = None,
+) -> tuple[Optional[list[list[float]]], Optional[list[int]]]:
+    """
+    Build the normal SAM foot prompt for one anatomical side.
+
+    The landmark positives are ankle and foot_index. The MediaPipe heel landmark
+    is not used because in practice it is less stable for prompting SAM.
+    If crossed-leg geometry suggests that the ankle is projected onto the other
+    leg, the prompt becomes more conservative and uses foot_index as the only
+    landmark positive.
+
+    ``additional_positive_points`` lets callers add extra positive prompt hints
+    computed by higher-level logic. This helper does not care how those points
+    were chosen; it only appends already validated coordinates to the SAM
+    prompt.
+
+    When the opposite foot is visible, the first valid point among its ankle,
+    heel and foot_index is added as a negative point, but only if that point is
+    inside this foot's local ``prompt_bbox`` and outside this foot's
+    ``base_bbox``. If it falls inside ``base_bbox``, the two feet may be
+    overlapping and the point would be an ambiguous negative; if it falls
+    outside ``prompt_bbox``, it is outside SAM's local prompt domain.
+
+    When ``prompt_bbox`` is available, one additional negative point is placed
+    in front of the foot, on the ankle -> foot_index ray, one pixel inside the
+    prompt bbox. This tells SAM that background beyond the toe/sandal direction
+    is not part of the target without putting a negative point near the lower
+    leg, where skin continuity can confuse the segmentation.
+
+    The lower-leg point is *not* added here. It is exposed separately as a probe
+    by ``_foot_leg_probe_point_for_side`` so callers can decide dynamically
+    whether it should become a negative prompt.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    side : {'anatomical-left', 'anatomical-right'}
+        Anatomical foot side.
+    base_bbox : tuple[int, int, int, int] or None, optional
+        Base foot bbox used to decide whether an opposite-foot point is safely
+        outside the current foot region.
+    prompt_bbox : tuple[int, int, int, int] or None, optional
+        Foot-local SAM prompt bbox used to place line-extension negatives one
+        pixel inside the box.
+    additional_positive_points : list[list[float]] or None, optional
+        Extra positive SAM points already validated by the caller.
+
+    Returns
+    -------
+    tuple[list[list[float]] | None, list[int] | None]
+        SAM point coordinates and labels. Returns ``(None, None)`` if no
+        positive foot points are available.
+    """
+    ids = _FOOT_LANDMARKS[side]
+    min_axis_len_px = 4.0
+    points: list[list[float]] = []
+    labels: list[int] = []
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+    foot_index = _valid_pose_point(pose_xy, ids['foot_index'])
+
+    # Crossed legs can project the target ankle onto the other lower leg. In
+    # that case ankle and ankle-derived chromatic points may describe the wrong
+    # texture, so we intentionally shrink the positive prompt to foot_index.
+    # The foot_index landmark is still the best available anchor for the target
+    # foot, while opposite-foot negatives below help SAM separate nearby feet.
+    ankle_contaminated = _foot_ankle_contaminated_by_crossed_leg(
+        pose_xy,
+        side=side,
+    )
+
+    landmark_positives = (
+        (foot_index,)
+        if ankle_contaminated
+        else (ankle, foot_index)
+    )
+
+    for p in landmark_positives:
+        if p is not None:
+            points.append([float(p[0]), float(p[1])])
+            labels.append(1)
+
+    if additional_positive_points and not ankle_contaminated:
+        for point in additional_positive_points:
+            if len(point) < 2:
+                continue
+
+            px, py = point[:2]
+            if px < 0 or py < 0:
+                continue
+
+            points.append([float(px), float(py)])
+            labels.append(1)
+
+    if not points:
+        return None, None
+
+    # Forward-axis negative:
+    # This point is useful only when we have the complete local geometry:
+    #
+    # - ankle and foot_index define a reliable foot direction;
+    # - prompt_bbox is the exact local SAM domain, so the negative can be placed
+    #   one pixel inside the cyan/debug box instead of outside SAM's prompt;
+    # - base_bbox is the conservative red/debug foot box, used as a safety guard
+    #   so the generated negative is never accepted if it lands on the likely
+    #   foot/sandal region.
+    #
+    # If any of these inputs is missing, skip the synthetic axis negative rather
+    # than guessing. The positive prompt points remain valid on their own.
+    if (
+        ankle is not None
+        and foot_index is not None
+        and prompt_bbox is not None
+        and base_bbox is not None
+    ):
+        foot_vec = foot_index - ankle
+        foot_len = float(np.linalg.norm(foot_vec))
+
+        if foot_len >= min_axis_len_px:
+            x1, y1, x2, y2 = prompt_bbox
+            min_x = float(x1)
+            min_y = float(y1)
+            max_x = float(x2 - 1)
+            max_y = float(y2 - 1)
+            direction = foot_vec / foot_len
+            ts: list[float] = []
+
+            # Intersect the forward ankle -> foot_index ray with the prompt
+            # bbox, then step one pixel back inside the box. We deliberately do
+            # not place the opposite/backward negative near the ankle: on bare
+            # legs or sandals it can land on leg/skin and tell SAM to exclude a
+            # texture that is continuous with the foot.
+            if abs(float(direction[0])) > 1e-6:
+                for bx in (min_x, max_x):
+                    t = (bx - float(ankle[0])) / float(direction[0])
+                    if t <= foot_len:
+                        continue
+                    y = float(ankle[1]) + float(direction[1]) * t
+                    if min_y <= y <= max_y:
+                        ts.append(t)
+
+            if abs(float(direction[1])) > 1e-6:
+                for by in (min_y, max_y):
+                    t = (by - float(ankle[1])) / float(direction[1])
+                    if t <= foot_len:
+                        continue
+                    x = float(ankle[0]) + float(direction[0]) * t
+                    if min_x <= x <= max_x:
+                        ts.append(t)
+
+            if ts:
+                bx1, by1, bx2, by2 = base_bbox
+                t = max(0.0, min(ts) - 1.0)
+
+                # If the prompt boundary is too close to foot_index, a forward
+                # negative would sit on/near the toes or sandal and become an
+                # ambiguous instruction. Require at least 20% of the observed
+                # ankle->foot_index distance beyond foot_index.
+                if t - foot_len >= 0.20 * foot_len:
+                    neg = ankle + direction * float(t)
+                    neg = np.asarray([
+                        min(max(float(neg[0]), min_x), max_x),
+                        min(max(float(neg[1]), min_y), max_y),
+                    ], dtype=np.float32)
+
+                    # Do not add the negative if it lands in the red/base foot
+                    # box: in that case the prompt bbox is too tight, or the
+                    # foot/sandal legitimately reaches that point.
+                    if not (bx1 <= neg[0] < bx2 and by1 <= neg[1] < by2):
+                        points.append([float(neg[0]), float(neg[1])])
+                        labels.append(0)
+
+    # Opposite-foot negative:
+    # Add landmarks from the other foot as negative prompts, but only when each
+    # point is both:
+    #
+    # - inside this foot's prompt_bbox, so SAM can actually use it in the local
+    #   prompt domain;
+    # - outside this foot's base_bbox, so the two feet are not overlapping in a
+    #   way that would make the negative ambiguous.
+    #
+    # In normal geometry, one safe opposite-foot point is enough. In crossed-leg
+    # contamination mode, the target ankle is unsafe as a positive, so we use
+    # both the other foot's ankle and foot_index as stronger negatives when
+    # available.
+    #
+    # This is intentionally separate from the forward-axis negative above: that
+    # one suppresses background beyond the current foot direction, while this
+    # one disambiguates nearby or overlapping feet.
+    if base_bbox is not None:
+        other_side = (
+            'anatomical-right'
+            if side == 'anatomical-left'
+            else 'anatomical-left'
+        )
+        other_ids = _FOOT_LANDMARKS[other_side]
+        bx1, by1, bx2, by2 = base_bbox
+        px1, py1, px2, py2 = prompt_bbox if prompt_bbox is not None else (
+            0,
+            0,
+            math.inf,
+            math.inf,
+        )
+
+        # Normal case: try ankle, heel, then foot_index and stop after the first
+        # safe opposite-foot negative. Contaminated-ankle case: use stronger,
+        # explicit opposite-foot anchors, but still skip heel because it is the
+        # least stable foot landmark in the images that motivated this prompt
+        # logic.
+        other_negative_names = (
+            ('ankle', 'foot_index')
+            if ankle_contaminated
+            else ('ankle', 'heel', 'foot_index')
+        )
+
+        for name in other_negative_names:
+            p = _valid_pose_point(pose_xy, other_ids[name])
+            if p is None:
+                continue
+
+            if not (px1 <= p[0] < px2 and py1 <= p[1] < py2):
+                continue
+
+            if bx1 <= p[0] < bx2 and by1 <= p[1] < by2:
+                continue
+
+            points.append([float(p[0]), float(p[1])])
+            labels.append(0)
+
+            if not ankle_contaminated:
+                break
+
+    return points, labels
+
+
+def _foot_leg_probe_point_for_side(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+    prompt_bbox: tuple[int, int, int, int],
+) -> Optional[list[float]]:
+    """
+    Return a lower-leg probe point inside the foot prompt bbox.
+
+    The probe is not a normal foot prompt. It is a diagnostic point used by
+    ``SubjectCrop``:
+
+    1. run SAM with ankle + foot_index to get a foot mask;
+    2. run SAM with only this probe point as a positive point;
+    3. compare the two masks inside ``prompt_bbox``.
+
+    If the probe mask overlaps the foot mask heavily, SAM sees visual continuity
+    between leg and foot (common with bare skin, sandals, flip-flops), so the
+    probe should *not* be used as a negative. If overlap is low, there is likely
+    a material/edge discontinuity (pants, socks, shoes), and the same point can
+    be useful as a negative prompt.
+
+    Geometrically, the point lies on the ray ``ankle -> knee``. We intersect
+    that ray with ``prompt_bbox`` and step back by one pixel, guaranteeing the
+    point is inside the exact bbox that SAM receives.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    side : {'anatomical-left', 'anatomical-right'}
+        Anatomical foot side.
+    prompt_bbox : tuple[int, int, int, int]
+        End-exclusive foot prompt bbox passed to SAM.
+
+    Returns
+    -------
+    list[float] or None
+        Probe point ``[x, y]`` inside ``prompt_bbox`` when knee and ankle are
+        available and define a usable direction; otherwise ``None``.
+    """
+    ids = _FOOT_LANDMARKS[side]
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+    knee = _valid_pose_point(pose_xy, ids['knee'])
+
+    if ankle is None or knee is None:
+        return None
+
+    leg_vec = knee - ankle
+    leg_len = float(np.linalg.norm(leg_vec))
+
+    if leg_len < 4.0:
+        return None
+
+    x1, y1, x2, y2 = prompt_bbox
+    min_x = float(x1)
+    min_y = float(y1)
+    max_x = float(x2 - 1)
+    max_y = float(y2 - 1)
+
+    direction = leg_vec / leg_len
+    ts: list[float] = []
+
+    # Parametric ray: p(t) = ankle + direction * t, t >= 0.
+    # For each axis, compute the t at which the ray reaches the relevant bbox
+    # boundary. The first positive intersection is where the ray exits the box.
+    if direction[0] > 0.0:
+        ts.append((max_x - float(ankle[0])) / float(direction[0]))
+    elif direction[0] < 0.0:
+        ts.append((min_x - float(ankle[0])) / float(direction[0]))
+
+    if direction[1] > 0.0:
+        ts.append((max_y - float(ankle[1])) / float(direction[1]))
+    elif direction[1] < 0.0:
+        ts.append((min_y - float(ankle[1])) / float(direction[1]))
+
+    positive_ts = [t for t in ts if t > 0.0]
+
+    if not positive_ts:
+        return None
+
+    dist = max(0.0, min(positive_ts) - 1.0)
+    probe = ankle + direction * dist
+
+    # Floating point math near diagonal boundaries can land microscopically
+    # outside the box, so clamp after stepping back from the edge.
+    probe = np.asarray([
+        min(max(float(probe[0]), min_x), max_x),
+        min(max(float(probe[1]), min_y), max_y),
+    ], dtype=np.float32)
+
+    return [float(probe[0]), float(probe[1])]
+
+
+def feet_sam_regions_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.8,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+    additional_positive_points_by_side: Optional[dict[str, list[list[float]]]] = None,
+) -> list[FootSamRegion]:
+    """
+    Build foot-local SAM regions.
+
+    The ``which='both'`` path returns one region per selected foot. Callers can
+    run SAM independently for each region and union the resulting masks, while
+    still using the union of all returned bboxes as the final crop envelope.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    which : {'left', 'right', 'both'}
+        Foot selection in image/viewer perspective.
+    expansion : float, default=1.8
+        Multiplicative expansion used to build each base foot bbox.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used only to expand each local prompt bbox toward
+        the likely body/silhouette edge.
+    additional_positive_points_by_side : dict[str, list[list[float]]] or None, optional
+        Extra positive prompt points keyed by anatomical side. This is intended
+        for image-aware prompt enrichment computed outside this geometry helper.
+
+    Returns
+    -------
+    list[FootSamRegion]
+        One region per selected foot, each containing base bbox, prompt bbox,
+        normal SAM points and optional leg probe point.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no suitable foot region can be derived.
+    """
+    selected = _select_foot_candidates(
+        pose_xy,
+        image_shape,
+        which=which,
+        expansion=expansion,
+        person_bbox=None,
+    )
+
+    regions: list[FootSamRegion] = []
+
+    for side, base_bbox, _ in selected:
+        prompt_bbox = _expand_foot_box_toward_person_edge(
+            base_bbox,
+            pose_xy,
+            side=side,
+            person_bbox=person_bbox,
+        )
+        point_coords, point_labels = _foot_sam_points_for_side(
+            pose_xy,
+            side=side,
+            base_bbox=base_bbox,
+            prompt_bbox=prompt_bbox,
+            additional_positive_points=(
+                additional_positive_points_by_side or {}
+            ).get(side),
+        )
+        leg_probe_point = _foot_leg_probe_point_for_side(
+            pose_xy,
+            side=side,
+            prompt_bbox=prompt_bbox,
+        )
+        regions.append(FootSamRegion(
+            side=side,
+            base_bbox=base_bbox,
+            prompt_bbox=prompt_bbox,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            leg_probe_point=leg_probe_point,
+        ))
+
+    return regions
+
+
+def foot_sam_region_with_prompt_bbox(
+    region: FootSamRegion,
+    pose_xy: np.ndarray,
+    prompt_bbox: tuple[int, int, int, int],
+    additional_positive_points_by_side: Optional[dict[str, list[list[float]]]] = None,
+) -> FootSamRegion:
+    """
+    Return ``region`` with an updated prompt bbox and recomputed SAM points.
+
+    ``SubjectCrop`` may expand prompt bboxes with ``box_margin`` after the
+    initial region is built. The leg probe point depends on the exact prompt box,
+    so it must be recomputed instead of copied.
+
+    Parameters
+    ----------
+    region : FootSamRegion
+        Existing foot region.
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates.
+    prompt_bbox : tuple[int, int, int, int]
+        New end-exclusive prompt bbox.
+    additional_positive_points_by_side : dict[str, list[list[float]]] or None, optional
+        Extra positive prompt points keyed by anatomical side.
+
+    Returns
+    -------
+    FootSamRegion
+        Updated region preserving ``side`` and ``base_bbox`` while recomputing
+        normal prompt points and ``leg_probe_point`` for ``prompt_bbox``.
+    """
+    point_coords, point_labels = _foot_sam_points_for_side(
+        pose_xy,
+        side=region.side,
+        base_bbox=region.base_bbox,
+        prompt_bbox=prompt_bbox,
+        additional_positive_points=(
+            additional_positive_points_by_side or {}
+        ).get(region.side),
+    )
+    leg_probe_point = _foot_leg_probe_point_for_side(
+        pose_xy,
+        side=region.side,
+        prompt_bbox=prompt_bbox,
+    )
+
+    return FootSamRegion(
+        side=region.side,
+        base_bbox=region.base_bbox,
+        prompt_bbox=prompt_bbox,
+        point_coords=point_coords,
+        point_labels=point_labels,
+        leg_probe_point=leg_probe_point,
+    )
+
+
+def feet_sam_points_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+    expansion: float = 1.8,
+    person_bbox: Optional[tuple[int, int, int, int]] = None,
+) -> tuple[Optional[list[list[float]]], Optional[list[int]]]:
+    """
+    Build aggregated SAM point prompts for one or both feet.
+
+    This is a compatibility wrapper around ``feet_sam_regions_from_landmarks``
+    for callers that only need point prompts and do not need per-foot prompt
+    bboxes. The returned points are the normal foot prompts from each selected
+    region:
+
+    - ankle and foot_index are positive points;
+    - heel is intentionally excluded because it is often less stable in
+      MediaPipe Pose foot geometry;
+    - foot-axis edge points and an optional opposite-foot point may be added as
+      negatives when they are clearly outside the current foot's base bbox.
+
+    The lower-leg probe point is deliberately *not* returned here. It is stored
+    on each ``FootSamRegion`` because callers must first compare the foot mask
+    with a separate leg-probe mask before deciding whether that point is safe to
+    reuse as a negative prompt.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe pose landmarks in image coordinates, with shape ``(33, 2)``.
+        Missing landmarks are encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only ``(H, W)`` are used.
+    which : {'left', 'right', 'both'}
+        Foot selection in image/viewer perspective.
+    expansion : float, default=1.8
+        Multiplicative expansion used to build each base foot bbox.
+    person_bbox : tuple[int, int, int, int] or None, optional
+        Optional person bbox used to expand local foot prompt bboxes toward the
+        likely body/silhouette edge before deriving prompt regions.
+
+    Returns
+    -------
+    tuple[list[list[float]] | None, list[int] | None]
+        Aggregated SAM point coordinates and labels for the selected feet.
+        Labels use SAM convention: ``1`` for positive, ``0`` for negative.
+        Returns ``(None, None)`` if no prompt point can be built.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no suitable foot region can be derived.
+    """
+    regions = feet_sam_regions_from_landmarks(
+        pose_xy,
+        image_shape,
+        which=which,
+        expansion=expansion,
+        person_bbox=person_bbox,
+    )
+
+    points: list[list[float]] = []
+    labels: list[int] = []
+
+    for region in regions:
+        points.extend(region.point_coords or [])
+        labels.extend(region.point_labels or [])
+
+    if not points:
+        return None, None
+
+    return points, labels
+
+
 def feet_mask_from_landmarks(
     pose_xy: np.ndarray,
     image_shape: tuple[int, ...],
@@ -2157,6 +2984,9 @@ def feet_mask_from_landmarks(
     by ankle, heel, and foot_index when available; with only two reliable points
     it draws a thick local line and expands it. The resulting mask is meant to
     constrain SAM/person masks to a foot-local region, not to segment toes.
+
+    Note: This helper produces geometry-only guidance and is not the primary
+    foot-segmentation path used by the current SubjectCrop implementation.
 
     Parameters
     ----------
@@ -2195,6 +3025,10 @@ def feet_mask_from_landmarks(
 
     h, w = image_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
+
+    # Build one geometric candidate per requested foot. With ``which='both'``
+    # the two feet stay independent until the very end, so a wide/uncertain
+    # bbox around one foot does not directly swallow the other foot.
     selected = _select_foot_candidates(
         pose_xy,
         image_shape,
@@ -2211,10 +3045,15 @@ def feet_mask_from_landmarks(
         local_mask = np.zeros((h, w), dtype=np.uint8)
 
         if pts_i.shape[0] >= 3:
+            # When ankle, heel and foot_index are available, the convex hull is
+            # the cleanest geometry-only approximation of the visible foot.
             hull = cv2.convexHull(pts_i)
             if hull is not None and len(hull) >= 3:
                 cv2.fillConvexPoly(local_mask, hull, 255)
         else:
+            # If only two points survived, keep a thick segment rather than
+            # inventing a triangle from unreliable anatomy. The later dilation
+            # makes this fallback forgiving enough for crop guidance.
             x1, y1, x2, y2 = box
             thickness = max(3, int(round(0.18 * max(x2 - x1, y2 - y1))))
             cv2.line(
@@ -2228,6 +3067,11 @@ def feet_mask_from_landmarks(
 
         x1, y1, x2, y2 = box
         size = max(x2 - x1, y2 - y1)
+
+        # The raw MediaPipe foot landmarks are sparse and often sit inside the
+        # actual shoe/skin silhouette. Dilation turns the landmark hull/segment
+        # into a generous crop-support mask; it is not intended as final
+        # pixel-perfect segmentation.
         base_radius = max(2, int(round(0.16 * size)))
         extra_radius = max(
             0,

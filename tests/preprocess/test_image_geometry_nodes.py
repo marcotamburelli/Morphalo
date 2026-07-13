@@ -15,7 +15,11 @@ from morphalo.nodes.preprocess.mask_insert_layer import (
     _place_overlay_on_local_canvas,
     _resize_overlay_to_box,
 )
-from morphalo.nodes.preprocess.utils import read_spatial_transform
+from morphalo.nodes.preprocess.utils import (
+    cleanup_shape_mask,
+    expand_clip_bbox_by_size_expr,
+    read_spatial_transform,
+)
 
 
 def _save_grid(path):
@@ -38,6 +42,53 @@ def _pixels(path):
         [img.getpixel((x, y)) for x in range(img.width)]
         for y in range(img.height)
     ]
+
+
+def test_expand_clip_bbox_by_size_expr_resolves_pixels_and_percentages():
+    assert expand_clip_bbox_by_size_expr(
+        20, 30, 60, 80, 100, 100, '10%'
+    ) == (16, 25, 64, 85)
+
+    assert expand_clip_bbox_by_size_expr(
+        20, 30, 60, 80, 100, 100, '8px'
+    ) == (12, 22, 68, 88)
+
+    assert expand_clip_bbox_by_size_expr(
+        4, 5, 20, 25, 30, 30, 10
+    ) == (0, 0, 30, 30)
+
+
+def test_cleanup_shape_mask_fills_limited_internal_holes():
+    mask = np.ones((8, 8), dtype=bool)
+    mask[3:5, 3:5] = False
+    mask[0, 0] = False
+
+    out = cleanup_shape_mask(mask, fill_holes=4)
+
+    assert out[3:5, 3:5].all()
+    assert not out[0, 0]
+
+
+def test_cleanup_shape_mask_can_keep_biggest_component():
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[1:3, 1:3] = True
+    mask[4:8, 4:8] = True
+
+    out = cleanup_shape_mask(mask, min_component_area='biggest')
+
+    assert not out[1:3, 1:3].any()
+    assert out[4:8, 4:8].all()
+
+
+def test_cleanup_shape_mask_opening_removes_thin_lines():
+    mask = np.zeros((9, 9), dtype=bool)
+    mask[2:7, 2:7] = True
+    mask[4, 7:9] = True
+
+    out = cleanup_shape_mask(mask, morph_open_radius=1)
+
+    assert out[4, 4]
+    assert not out[4, 8]
 
 
 def test_transpose_image_clockwise_rotates_quarter_turn(tmp_path):

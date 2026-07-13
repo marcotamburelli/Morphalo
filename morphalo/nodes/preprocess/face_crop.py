@@ -17,16 +17,21 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
-from morphalo.nodes.preprocess.utils import (CropModeSpec,
+from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
+                                             cleanup_shape_mask,
+                                             cleanup_shape_mask_by_parts,
                                              expand_bbox_toward_ratio,
+                                             expand_clip_bbox_by_size_expr,
                                              expand_clip_bbox,
                                              invert_mask_inside_box,
                                              offset_bbox_xyxy,
                                              offset_landmarks_xy,
                                              parse_crop_mode,
                                              positive_points_for_sam,
-                                             postprocess_mask,
-                                             tight_alpha_bbox)
+                                             prepare_output_mask,
+                                             read_shape_cleanup_config,
+                                             tight_alpha_bbox,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.face_region import (
     eye_bbox_xyxy_from_landmarks, eye_mask_from_landmarks,
@@ -46,7 +51,8 @@ class Config:
     sam_model: Optional[str]
     mode: str
     crop_mode: Optional[CropModeSpec]
-    box_margin: float
+    box_margin: SizeExpr
+    prompt_expansion: float
     save_debug: bool
     dilate_radius: int
     close_radius: int
@@ -55,6 +61,7 @@ class Config:
     face_landmarker_task: str
     pose_landmarker_task: str
     smoothing_radius: int
+    shape_cleanup: dict[str, Any]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -113,13 +120,24 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     if target == 'face':
         sam_model = str(model.get('sam_model', 'facebook/sam-vit-large'))
 
+    box_margin = params.get('box_margin', '12%')
+    validate_size_expr(box_margin)
+
+    prompt_expansion = float(params.get('prompt_expansion', 0.0))
+    if prompt_expansion < 0:
+        raise ValueError(
+            f"'{node_id}': invalid prompt_expansion={prompt_expansion!r} "
+            '(expected >= 0)'
+        )
+
     return Config(
         device=device,
         dtype=dtype,
         sam_model=sam_model,
         mode=mode,
         crop_mode=crop_mode,
-        box_margin=float(params.get('box_margin', 0.12)),
+        box_margin=box_margin,
+        prompt_expansion=prompt_expansion,
         save_debug=bool(debug.get('save_debug', False)),
         dilate_radius=int(params.get('dilate_radius', 0)),
         close_radius=int(params.get('close_radius', 0)),
@@ -128,6 +146,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         face_landmarker_task=str(face_landmarker_task),
         pose_landmarker_task=str(pose_landmarker_task),
         smoothing_radius=int(params.get('smoothing_radius', 0)),
+        shape_cleanup=read_shape_cleanup_config(
+            params.get('postprocess', None),
+            node_id=node_id,
+        ),
     )
 
 
@@ -195,13 +217,14 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
           avoid overly tight crops around internal facial landmarks.
         - The expanded local face bbox is remapped to full-image coordinates.
         - Face landmarks are also remapped to full-image coordinates.
-        - ``box_margin`` optionally expands the full-image SAM prompt bbox.
+        - ``prompt_expansion`` optionally expands the full-image SAM prompt bbox.
         - SAM segments the face using the expanded face bbox and a sparse subset
           of positive face-landmark points.
         - A face-landmark coverage check is used to detect occasional SAM
           polarity mistakes. If too few face landmarks fall inside the selected
           mask, the mask is inverted locally inside the prompt bbox.
-        - The final crop region corresponds to the expanded full-image face bbox.
+        - The final crop region is derived from the selected mask and then
+          optionally expanded using ``box_margin``.
 
     ``target='eyes'``
         - MediaPipe Pose landmarks are computed for the full image.
@@ -405,15 +428,74 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
                 Default: ``'trim'``.
 
-            ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the full-face SAM prompt
-                bbox, expressed as a fraction of bbox size.
+            ``box_margin`` : int or str, optional
+                Symmetric margin applied to the final crop bbox derived from
+                the post-processed target mask. Supported forms follow the
+                standard size-expression convention: integer pixels,
+                ``'<n>px'`` or ``'<n>%'``. Percentages are resolved against the
+                mask bbox width for left/right and mask bbox height for
+                top/bottom.
 
-                This parameter is used only for ``target='face'``. Eye and
-                eyebrow targets are controlled by landmark geometry and
-                ``expansion``.
+                This margin is applied only to cropped default outputs
+                (``crop_mode='trim'``, ``'bbox'`` or ``'bbox[w:h]'``). It is
+                ignored for ``mode='mask'``, ``mode='negative-mask'`` and
+                ``crop_mode='full_frame'`` because those outputs preserve the
+                full source frame.
 
-                Typical range: 0.05-0.20. Default: 0.12.
+                Default: ``'12%'``.
+
+            ``prompt_expansion`` : float, optional
+                Advanced SAM prompt padding ratio for ``target='face'``.
+                This expands the bbox passed to SAM before segmentation while
+                leaving output crop geometry controlled by the post-processed
+                mask and ``box_margin``.
+
+                Default: 0.0.
+
+            ``postprocess`` : dict, optional
+                Structural cleanup applied to the selected facial silhouette
+                before deriving crop geometry, RGBA alpha, or full-frame mask
+                output. This block defines the canonical shape used by the node,
+                so it is applied in every mode. Output-only mask refinements
+                such as ``close_radius``, ``dilate_radius`` and
+                ``smoothing_radius`` are applied later and only for
+                ``mode='mask'`` or ``mode='negative-mask'``.
+
+                Processing order is fixed: ``fill_holes`` ->
+                ``morph_open_radius`` -> ``min_component_area``.
+                For logical multi-part targets such as ``eyes`` and
+                ``eyebrows``, cleanup is applied independently to each target
+                part before the parts are unioned; therefore
+                ``min_component_area='biggest'`` keeps the largest component per
+                eye/eyebrow, not one eye/eyebrow globally.
+
+                ``fill_holes`` : int, float, str, 'all' or None, optional
+                    Fill enclosed background holes inside the selected shape
+                    before removing thin details. ``0`` or ``None`` disables
+                    hole filling. ``'all'`` fills every enclosed hole. Numeric
+                    values are pixel areas. Percentage strings such as ``'1%'``
+                    follow the shared component-area convention: the percentage
+                    is measured on the image long side and squared into an area
+                    threshold. Only holes with area less than or equal to the
+                    resolved threshold are filled.
+
+                ``morph_open_radius`` : int, optional
+                    Radius in pixels for morphological opening, applied after
+                    hole filling. Opening removes thin lines, speckles, and
+                    small bridges while preserving surviving larger regions.
+                    ``0`` disables this step.
+
+                ``min_component_area`` : int, float, str, 'biggest' or None, optional
+                    Remove disconnected foreground components after hole filling
+                    and opening. ``0`` or ``None`` disables component filtering.
+                    Numeric values are pixel areas. Percentage strings use the
+                    same long-side area convention as ``fill_holes``.
+                    ``'biggest'`` keeps only the largest connected component,
+                    useful for a single facial target but potentially
+                    destructive for legitimate multi-part targets such as both
+                    eyes or both eyebrows.
+
+                Default: all disabled.
 
             ``expansion`` : float, optional
                 Expansion factor applied to landmark-derived feature geometry.
@@ -424,8 +506,8 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                   expands the landmark-derived eyebrow bbox / mask;
                 - for ``target='face'``:
                   the landmark-derived face bbox is expanded internally by
-                  ``FACE_BBOX_EXPANSION`` and can then be expanded further by
-                  ``box_margin``.
+                  ``FACE_BBOX_EXPANSION``; optional prompt padding is controlled
+                  by ``prompt_expansion``.
 
                 Default: ``1.0``.
 
@@ -648,6 +730,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         # Feature targets such as eyes and eyebrows skip SAM and use a
         # landmark-derived full-frame mask. The full face target uses SAM instead.
         feature_mask: Optional[np.ndarray] = None
+        shape_part_masks: Optional[np.ndarray] = None
 
         if cfg.target == 'face':
             # Compute the face bbox in head-area local coordinates, then remap it to
@@ -732,11 +815,11 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
 
-        # Only the full face target uses SAM, so box_margin expands only the face SAM
-        # prompt bbox. Eye and eyebrow targets are controlled by landmark expansion.
-        if cfg.box_margin > 0 and cfg.target == 'face':
+        # Only the full face target uses SAM. Keep prompt padding separate from
+        # output crop margin.
+        if cfg.prompt_expansion > 0 and cfg.target == 'face':
             bx1, by1, bx2, by2 = expand_clip_bbox(
-                bx1, by1, bx2, by2, w, h, cfg.box_margin
+                bx1, by1, bx2, by2, w, h, cfg.prompt_expansion
             )
 
         if cfg.target == 'face':
@@ -829,55 +912,82 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                     f"FaceCrop node '{node_id}': feature mask not computed."
                 )
             mask = feature_mask
+            shape_part_masks = feature_mask
             sam_model_id = None
 
-        crop_x1, crop_y1, crop_x2, crop_y2 = bx1, by1, bx2, by2
-
-        if cfg.mode == 'default' and cfg.crop_mode is not None:
-            if cfg.crop_mode.mode == 'bbox' and cfg.crop_mode.ratio is not None:
-                crop_x1, crop_y1, crop_x2, crop_y2 = expand_bbox_toward_ratio(
-                    crop_x1,
-                    crop_y1,
-                    crop_x2,
-                    crop_y2,
-                    full_w=w,
-                    full_h=h,
-                    ratio=cfg.crop_mode.ratio,
-                )
-
-        crop_mask = mask[crop_y1:crop_y2, crop_x1:crop_x2]
-        if crop_mask.size == 0:
-            raise RuntimeError(
-                f"FaceCrop node '{node_id}': empty crop after bbox."
-            )
-
-        cm = crop_mask.astype(np.uint8)
+        cm = mask.astype(np.uint8)
         num, labels, stats, _ = cv2.connectedComponentsWithStats(
             cm, connectivity=8
         )
 
         # Eye and eyebrow masks may intentionally contain multiple disconnected
-        # components. Keep all feature components, but reduce the full face mask to a
-        # single component to avoid attaching unrelated fragments.
+        # components. Keep all feature components, but reduce the full face mask
+        # to a single component to avoid attaching unrelated fragments.
         if num > 1:
             if cfg.target != 'face':
-                crop_mask = (labels != 0)
+                mask = (labels != 0)
             else:
-                ccx = cm.shape[1] // 2
-                ccy = cm.shape[0] // 2
-                target = labels[ccy, ccx]
+                cx = int((bx1 + bx2) // 2)
+                cy = int((by1 + by2) // 2)
+                target = 0
+                if 0 <= cx < w and 0 <= cy < h:
+                    target = int(labels[cy, cx])
 
                 if target == 0:
                     areas = stats[1:, cv2.CC_STAT_AREA]
                     target = 1 + int(np.argmax(areas))
 
-                crop_mask = (labels == target)
+                mask = (labels == target)
+
+        if shape_part_masks is not None:
+            shape_mask = cleanup_shape_mask_by_parts(
+                mask,
+                shape_part_masks,
+                **cfg.shape_cleanup,
+            )
+        else:
+            shape_mask = cleanup_shape_mask(mask, **cfg.shape_cleanup)
+        shape_mask_u8 = shape_mask.astype(np.uint8) * 255
 
         out_path = make_node_output_path(
             out_dir=out_dir,
             node_id=node_id,
             ext='png',
         )
+
+        crop_x1 = 0
+        crop_y1 = 0
+        crop_x2 = w
+        crop_y2 = h
+
+        if cfg.mode == 'default' and cfg.crop_mode is not None:
+            if cfg.crop_mode.mode != 'full_frame':
+                crop_x1, crop_y1, crop_x2, crop_y2 = tight_alpha_bbox(
+                    shape_mask.astype(np.uint8)
+                )
+                crop_x1, crop_y1, crop_x2, crop_y2 = expand_clip_bbox_by_size_expr(
+                    crop_x1,
+                    crop_y1,
+                    crop_x2,
+                    crop_y2,
+                    w,
+                    h,
+                    cfg.box_margin,
+                )
+
+                if (
+                    cfg.crop_mode.mode == 'bbox'
+                    and cfg.crop_mode.ratio is not None
+                ):
+                    crop_x1, crop_y1, crop_x2, crop_y2 = expand_bbox_toward_ratio(
+                        crop_x1,
+                        crop_y1,
+                        crop_x2,
+                        crop_y2,
+                        full_w=w,
+                        full_h=h,
+                        ratio=cfg.crop_mode.ratio,
+                    )
 
         out_x1 = int(crop_x1)
         out_y1 = int(crop_y1)
@@ -900,18 +1010,10 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                 Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
             else:
-                alpha = crop_mask.astype(np.uint8) * 255
+                alpha = shape_mask_u8[crop_y1:crop_y2, crop_x1:crop_x2]
                 crop_rgba = np.dstack([crop_rgb, alpha])
 
                 if cfg.crop_mode.mode == 'trim':
-                    tx1, ty1, tx2, ty2 = tight_alpha_bbox(alpha)
-                    crop_rgba = crop_rgba[ty1:ty2, tx1:tx2, :]
-
-                    out_x1 = int(crop_x1 + tx1)
-                    out_y1 = int(crop_y1 + ty1)
-                    out_x2 = int(crop_x1 + tx2)
-                    out_y2 = int(crop_y1 + ty2)
-
                     Image.fromarray(crop_rgba, mode='RGBA').save(out_path)
 
                 elif cfg.crop_mode.mode == 'full_frame':
@@ -931,13 +1033,8 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                     )
 
         else:
-            full_mask = np.zeros((h, w), dtype=np.uint8)
-            full_mask[crop_y1:crop_y2, crop_x1:crop_x2] = (
-                crop_mask.astype(np.uint8) * 255
-            )
-
-            full_mask = postprocess_mask(
-                full_mask,
+            full_mask = prepare_output_mask(
+                shape_mask,
                 dilate_radius=cfg.dilate_radius,
                 close_radius=cfg.close_radius,
                 smoothing_radius=cfg.smoothing_radius,
@@ -987,10 +1084,12 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                 'mode': cfg.mode,
                 'crop_mode': None if cfg.crop_mode is None else cfg.crop_mode.raw,
                 'box_margin': cfg.box_margin,
+                'prompt_expansion': cfg.prompt_expansion,
                 'dilate_radius': cfg.dilate_radius,
                 'close_radius': cfg.close_radius,
                 'expansion': cfg.expansion,
                 'smoothing_radius': cfg.smoothing_radius,
+                'postprocess': cfg.shape_cleanup,
             },
             'crop': {
                 'anchor_xy': [

@@ -110,7 +110,7 @@ def test_node_writes_rgba_png_and_metadata(tmp_path):
                 'params': {
                     'analysis_clusters': 1,
                     'num_dominant_colors': 1,
-                    'box_margin': 0.0,
+                    'box_margin': '0%',
                 }
             },
         )
@@ -246,7 +246,7 @@ def test_default_bbox_keeps_color_driven_alpha(tmp_path):
                 'params': {
                     'colors': 'white',
                     'crop_mode': 'bbox[1:1]',
-                    'box_margin': 0.0,
+                    'box_margin': '0%',
                     'tolerance': 1.0,
                     'feather': 0.0,
                 }
@@ -308,8 +308,10 @@ def test_min_component_area_removes_small_selected_islands(tmp_path):
             spec={
                 'params': {
                     'colors': 'white',
-                    'box_margin': 0.0,
-                    'min_component_area': 4,
+                    'box_margin': '0%',
+                    'postprocess': {
+                        'min_component_area': 4,
+                    },
                     'tolerance': 1.0,
                     'feather': 0.0,
                 }
@@ -342,7 +344,7 @@ def test_default_box_margin_expands_color_bbox(tmp_path):
 
     out = node.run(tmp_path)
 
-    assert out['params']['box_margin'] == 0.08
+    assert out['params']['box_margin'] == '8%'
     assert out['crop']['bbox_xyxy'] == [8, 8, 32, 32]
 
 
@@ -361,7 +363,9 @@ def test_min_component_area_removes_small_islands_from_rgba_alpha(tmp_path):
                 'params': {
                     'colors': 'white',
                     'crop_mode': 'full_frame',
-                    'min_component_area': 4,
+                    'postprocess': {
+                        'min_component_area': 4,
+                    },
                     'tolerance': 1.0,
                     'feather': 0.0,
                 }

@@ -1,7 +1,7 @@
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Union
+from typing import Any, Iterable, Literal, Optional, Union
 
 import cv2
 import numpy as np
@@ -166,6 +166,44 @@ def expand_clip_bbox(
     bw, bh = (x2 - x1), (y2 - y1)
     dx = int(round(bw * margin))
     dy = int(round(bh * margin))
+
+    bx1 = max(0, x1 - dx)
+    by1 = max(0, y1 - dy)
+    bx2 = min(w, x2 + dx)
+    by2 = min(h, y2 + dy)
+
+    if bx2 <= bx1 or by2 <= by1:
+        raise RuntimeError(f"Invalid expanded bbox: {(bx1, by1, bx2, by2)}")
+
+    return bx1, by1, bx2, by2
+
+
+def expand_clip_bbox_by_size_expr(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    w: int,
+    h: int,
+    margin: SizeExpr,
+) -> tuple[int, int, int, int]:
+    # assume x2,y2 are end-exclusive after this normalization
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
+
+    x1 = max(0, min(w, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h, y1))
+    y2 = max(0, min(h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        raise RuntimeError(f"Invalid bbox: {(x1, y1, x2, y2)}")
+
+    bw, bh = (x2 - x1), (y2 - y1)
+    dx = resolve_size_expr(margin, reference=bw, min_size=0)
+    dy = resolve_size_expr(margin, reference=bh, min_size=0)
 
     bx1 = max(0, x1 - dx)
     by1 = max(0, y1 - dy)
@@ -706,7 +744,8 @@ def validate_min_component_area(
     ----------
     value : int, float, str or None
         User-provided area threshold. ``None`` and ``0`` both mean "disabled" to
-        consumers.
+        consumers. The string ``'biggest'`` means "keep only the largest
+        component" for consumers that support it.
 
     node_id : str
         Node identifier used to produce contextual validation errors.
@@ -731,6 +770,8 @@ def validate_min_component_area(
 
     if isinstance(value, str):
         s = value.strip()
+        if s == 'biggest':
+            return
         try:
             number = float(s[:-1]) if s.endswith('%') else float(s)
         except ValueError as exc:
@@ -783,6 +824,11 @@ def resolve_min_component_area(
 
     if isinstance(value, str):
         s = value.strip()
+        if s == 'biggest':
+            raise ValueError(
+                "resolve_min_component_area does not accept 'biggest'; "
+                "handle it before resolving numeric thresholds."
+            )
         if s.endswith('%'):
             pct = float(s[:-1]) / 100.0
             side = max(width, height) * pct
@@ -842,7 +888,266 @@ def remove_small_components(
     return keep[labels]
 
 
-def postprocess_mask(
+def keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    """
+    Keep only the largest foreground connected component.
+    """
+    if mask.ndim != 2:
+        raise ValueError('Component mask must be HxW')
+
+    cm = (mask != 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        cm,
+        connectivity=8,
+    )
+    if num <= 1:
+        return mask
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.size == 0:
+        return mask.astype(bool)
+
+    target = 1 + int(np.argmax(areas))
+    return labels == target
+
+
+def fill_mask_holes(
+    mask: np.ndarray,
+    *,
+    max_area: int | None,
+) -> np.ndarray:
+    """
+    Fill background holes that do not touch the image border.
+    """
+    if mask.ndim != 2:
+        raise ValueError('Mask must be HxW')
+
+    fg = mask.astype(bool)
+    bg = (~fg).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        bg,
+        connectivity=8,
+    )
+    if num <= 1:
+        return fg
+
+    h, w = fg.shape[:2]
+    border_labels = set(np.unique(labels[0, :]).tolist())
+    border_labels.update(np.unique(labels[h - 1, :]).tolist())
+    border_labels.update(np.unique(labels[:, 0]).tolist())
+    border_labels.update(np.unique(labels[:, w - 1]).tolist())
+
+    out = fg.copy()
+    for label in range(1, num):
+        if label in border_labels:
+            continue
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if max_area is None or area <= int(max_area):
+            out[labels == label] = True
+
+    return out
+
+
+def read_shape_cleanup_config(
+    value: Any,
+    *,
+    node_id: str,
+    default_min_component_area: Any = 0,
+) -> dict[str, Any]:
+    """
+    Read shared crop shape-cleanup configuration.
+    """
+    if value is None:
+        cfg: dict[str, Any] = {}
+    elif isinstance(value, dict):
+        cfg = dict(value)
+    else:
+        raise ValueError(f"'{node_id}': postprocess must be a dictionary")
+
+    fill_holes = cfg.get('fill_holes', 0)
+    if isinstance(fill_holes, str):
+        s = fill_holes.strip()
+        if s != 'all':
+            validate_min_component_area(
+                s,
+                node_id=node_id,
+                param_name='postprocess.fill_holes',
+            )
+            fill_holes = s
+    else:
+        validate_min_component_area(
+            fill_holes,
+            node_id=node_id,
+            param_name='postprocess.fill_holes',
+        )
+
+    try:
+        morph_open_radius = int(cfg.get('morph_open_radius', 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{node_id}': postprocess.morph_open_radius must be an integer"
+        ) from exc
+    if morph_open_radius < 0:
+        raise ValueError(
+            f"'{node_id}': postprocess.morph_open_radius must be >= 0"
+        )
+
+    min_component_area = cfg.get(
+        'min_component_area',
+        default_min_component_area,
+    )
+    validate_min_component_area(
+        min_component_area,
+        node_id=node_id,
+        param_name='postprocess.min_component_area',
+    )
+
+    return {
+        'fill_holes': fill_holes,
+        'morph_open_radius': morph_open_radius,
+        'min_component_area': min_component_area,
+    }
+
+
+def cleanup_shape_mask(
+    mask: np.ndarray,
+    *,
+    fill_holes: Any = 0,
+    morph_open_radius: int = 0,
+    min_component_area: Any = 0,
+) -> np.ndarray:
+    """
+    Clean a crop target shape mask before bbox/alpha/output derivation.
+
+    Processing order:
+      1. fill internal holes;
+      2. apply morphological opening;
+      3. remove small components or keep only the biggest component.
+    """
+    if mask.ndim != 2:
+        raise ValueError('Mask must be HxW')
+    if morph_open_radius < 0:
+        raise ValueError('morph_open_radius must be >= 0')
+
+    out = mask.astype(bool)
+    h, w = out.shape[:2]
+
+    if fill_holes is not None:
+        fill_all = isinstance(fill_holes, str) and fill_holes.strip() == 'all'
+        fill_area = 0
+        if fill_all:
+            fill_area = None
+        else:
+            fill_area = resolve_min_component_area(
+                fill_holes,
+                width=w,
+                height=h,
+            )
+        if fill_all or int(fill_area) > 0:
+            out = fill_mask_holes(out, max_area=fill_area)
+
+    if morph_open_radius > 0:
+        k = 2 * int(morph_open_radius) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        out = cv2.morphologyEx(
+            out.astype(np.uint8) * 255,
+            cv2.MORPH_OPEN,
+            kernel,
+        ) > 0
+
+    if isinstance(min_component_area, str) and min_component_area.strip() == 'biggest':
+        out = keep_largest_component(out)
+    else:
+        resolved_min_area = resolve_min_component_area(
+            min_component_area,
+            width=w,
+            height=h,
+        )
+        out = remove_small_components(out, min_area=resolved_min_area)
+
+    return out.astype(bool)
+
+
+def cleanup_shape_mask_by_parts(
+    mask: np.ndarray,
+    parts: np.ndarray | Iterable[np.ndarray] | None,
+    *,
+    fill_holes: Any = 0,
+    morph_open_radius: int = 0,
+    min_component_area: Any = 0,
+) -> np.ndarray:
+    """
+    Clean a shape mask independently inside logical target parts.
+
+    Composite targets such as both feet, both hands, eyes, or eyebrows may be
+    represented by multiple intentionally disconnected shapes. Running
+    ``min_component_area='biggest'`` after their union would keep only one
+    target. This helper applies the same cleanup to each logical part first,
+    then unions the cleaned parts.
+    """
+    if parts is None:
+        return cleanup_shape_mask(
+            mask,
+            fill_holes=fill_holes,
+            morph_open_radius=morph_open_radius,
+            min_component_area=min_component_area,
+        )
+
+    if mask.ndim != 2:
+        raise ValueError('Shape mask must be HxW')
+
+    shape = mask.shape
+    source_masks: list[np.ndarray] = []
+
+    if isinstance(parts, np.ndarray):
+        if parts.shape != shape:
+            raise ValueError('Shape part mask must match mask shape')
+        pm = (parts != 0).astype(np.uint8)
+        num, labels, _, _ = cv2.connectedComponentsWithStats(pm, connectivity=8)
+        for label in range(1, num):
+            source_masks.append(labels == label)
+    else:
+        for part in parts:
+            if part.shape != shape:
+                raise ValueError('Shape part mask must match mask shape')
+            source_masks.append(part != 0)
+
+    if not source_masks:
+        return cleanup_shape_mask(
+            mask,
+            fill_holes=fill_holes,
+            morph_open_radius=morph_open_radius,
+            min_component_area=min_component_area,
+        )
+
+    base = (mask != 0)
+    out = np.zeros(shape, dtype=bool)
+    hit = False
+
+    for part_mask in source_masks:
+        piece = base & part_mask
+        if not np.any(piece):
+            continue
+        hit = True
+        out |= cleanup_shape_mask(
+            piece,
+            fill_holes=fill_holes,
+            morph_open_radius=morph_open_radius,
+            min_component_area=min_component_area,
+        )
+
+    if not hit:
+        return cleanup_shape_mask(
+            mask,
+            fill_holes=fill_holes,
+            morph_open_radius=morph_open_radius,
+            min_component_area=min_component_area,
+        )
+
+    return out.astype(bool)
+
+
+def prepare_output_mask(
     mask: np.ndarray,
     *,
     dilate_radius: int = 0,
@@ -850,7 +1155,7 @@ def postprocess_mask(
     smoothing_radius: int = 0,
 ) -> np.ndarray:
     """
-    Post-process a binary/soft mask to make it suitable for inpainting and diffusion.
+    Prepare a binary/soft shape mask for mask or negative-mask output.
 
     Steps (optional, in order):
       1. Morphological closing (fills holes, connects thin gaps)

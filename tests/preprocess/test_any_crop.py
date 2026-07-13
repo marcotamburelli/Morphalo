@@ -121,7 +121,7 @@ def test_all_run_uses_union_bbox_and_records_selected_detections(
                 'params': {
                     'mode': 'default',
                     'crop_mode': 'bbox',
-                    'box_margin': 0,
+                    'box_margin': '0%',
                     'select': 'all',
                 },
             },

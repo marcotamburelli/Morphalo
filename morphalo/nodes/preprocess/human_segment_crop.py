@@ -15,11 +15,15 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.crop_debug import write_mask_debug_overlay
-from morphalo.nodes.preprocess.utils import (CropModeSpec,
+from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
+                                             cleanup_shape_mask,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox, parse_crop_mode,
-                                             postprocess_mask,
-                                             tight_alpha_bbox)
+                                             expand_clip_bbox_by_size_expr,
+                                             parse_crop_mode,
+                                             prepare_output_mask,
+                                             read_shape_cleanup_config,
+                                             tight_alpha_bbox,
+                                             validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 TargetSpec = str | list[str] | tuple[str, ...]
@@ -64,11 +68,12 @@ class Config:
     mode: str
     crop_mode: Optional[CropModeSpec]
     target: TargetSpec
-    box_margin: float
+    box_margin: SizeExpr
     dilate_radius: int
     close_radius: int
     smoothing_radius: int
     save_debug: bool
+    shape_cleanup: dict[str, Any]
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -95,9 +100,8 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     target = params.get('target', 'person')
     _resolve_target_labels(target, node_id=node_id)
 
-    box_margin = float(params.get('box_margin', 0.08))
-    if box_margin < 0.0:
-        raise ValueError(f"'{node_id}': box_margin must be >= 0")
+    box_margin = params.get('box_margin', '8%')
+    validate_size_expr(box_margin)
 
     dilate_radius = int(params.get('dilate_radius', 0))
     close_radius = int(params.get('close_radius', 0))
@@ -124,6 +128,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         close_radius=close_radius,
         smoothing_radius=smoothing_radius,
         save_debug=bool(debug.get('save_debug', False)),
+        shape_cleanup=read_shape_cleanup_config(
+            params.get('postprocess', None),
+            node_id=node_id,
+        ),
     )
 
 
@@ -462,14 +470,58 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
 
                 Default: ``'trim'``.
 
-            ``box_margin`` : float, optional
-                Symmetric expansion ratio applied to the mask-derived selection
-                bbox, expressed as a fraction of bbox size. Applies only when
-                ``mode='default'`` and ``crop_mode`` is ``'trim'``, ``'bbox'``
-                or ``'bbox[w:h]'``. Ignored for ``crop_mode='full_frame'`` and
-                mask outputs. For ``crop_mode='bbox[w:h]'``, the margin is
-                applied before aspect-ratio expansion. Typical range:
-                ``0.03``-``0.12``. Default: ``0.08``.
+            ``box_margin`` : int or str, optional
+                Symmetric margin applied to the mask-derived selection bbox.
+                Supported forms follow the standard size-expression convention:
+                integer pixels, ``'<n>px'`` or ``'<n>%'``. Percentages are
+                resolved against the mask bbox width for left/right and mask
+                bbox height for top/bottom.
+
+                Applies only when ``mode='default'`` and ``crop_mode`` is
+                ``'trim'``, ``'bbox'`` or ``'bbox[w:h]'``. Ignored for
+                ``crop_mode='full_frame'`` and mask outputs. For
+                ``crop_mode='bbox[w:h]'``, the margin is applied before
+                aspect-ratio expansion. Default: ``'8%'``.
+
+            ``postprocess`` : dict, optional
+                Structural cleanup applied to the selected parser silhouette
+                before deriving crop geometry, RGBA alpha, or full-frame mask
+                output. This block defines the canonical shape used by the node,
+                so it is applied in every mode. Output-only mask refinements
+                such as ``close_radius``, ``dilate_radius`` and
+                ``smoothing_radius`` are applied later and only for
+                ``mode='mask'`` or ``mode='negative-mask'``.
+
+                Processing order is fixed: ``fill_holes`` ->
+                ``morph_open_radius`` -> ``min_component_area``.
+
+                ``fill_holes`` : int, float, str, 'all' or None, optional
+                    Fill enclosed background holes inside the selected shape
+                    before removing thin details. ``0`` or ``None`` disables
+                    hole filling. ``'all'`` fills every enclosed hole. Numeric
+                    values are pixel areas. Percentage strings such as ``'1%'``
+                    follow the shared component-area convention: the percentage
+                    is measured on the image long side and squared into an area
+                    threshold. Only holes with area less than or equal to the
+                    resolved threshold are filled.
+
+                ``morph_open_radius`` : int, optional
+                    Radius in pixels for morphological opening, applied after
+                    hole filling. Opening removes thin lines, speckles, and
+                    small bridges while preserving surviving larger regions.
+                    ``0`` disables this step.
+
+                ``min_component_area`` : int, float, str, 'biggest' or None, optional
+                    Remove disconnected foreground components after hole filling
+                    and opening. ``0`` or ``None`` disables component filtering.
+                    Numeric values are pixel areas. Percentage strings use the
+                    same long-side area convention as ``fill_holes``.
+                    ``'biggest'`` keeps only the largest connected component,
+                    useful for single-region clothing crops but potentially
+                    destructive for legitimate multi-part targets such as both
+                    arms, both legs, or shoes.
+
+                Default: all disabled.
 
             ``dilate_radius`` : int, optional
                 Mask dilation radius in pixels, used only for ``mode='mask'``
@@ -630,6 +682,7 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
                 f"for target={cfg.target!r}."
             )
 
+        selected_mask = cleanup_shape_mask(selected_mask, **cfg.shape_cleanup)
         alpha_full = selected_mask.astype(np.uint8) * 255
         bbox_x1, bbox_y1, bbox_x2, bbox_y2 = tight_alpha_bbox(alpha_full)
 
@@ -656,16 +709,15 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
 
             else:
                 x1, y1, x2, y2 = bbox_x1, bbox_y1, bbox_x2, bbox_y2
-                if cfg.box_margin > 0:
-                    x1, y1, x2, y2 = expand_clip_bbox(
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        w,
-                        h,
-                        cfg.box_margin,
-                    )
+                x1, y1, x2, y2 = expand_clip_bbox_by_size_expr(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    w,
+                    h,
+                    cfg.box_margin,
+                )
 
                 if cfg.crop_mode.mode == 'bbox':
                     if cfg.crop_mode.ratio is not None:
@@ -712,7 +764,7 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
                     )
 
         else:
-            out_mask_u8 = postprocess_mask(
+            out_mask_u8 = prepare_output_mask(
                 selected_mask,
                 dilate_radius=cfg.dilate_radius,
                 close_radius=cfg.close_radius,
@@ -749,6 +801,7 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
             'dilate_radius': cfg.dilate_radius,
             'close_radius': cfg.close_radius,
             'smoothing_radius': cfg.smoothing_radius,
+            'postprocess': cfg.shape_cleanup,
         }
 
         out = {

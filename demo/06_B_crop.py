@@ -44,7 +44,7 @@ MODEL_SPEC = {
 COMMON_PARAMS = {
     'mode': 'default',
     'crop_mode': 'trim',
-    'box_margin': 0.08,
+    'box_margin': '8%',
 }
 
 MASK_PARAMS = {
