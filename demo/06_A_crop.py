@@ -10,7 +10,8 @@ Defined DAGs
     Full-frame positive and negative masks for the detected subject.
 
 ``subject_crop``
-    Trimmed RGBA crops for person, head, face, eyes, eyebrows, hands and feet.
+    Trimmed RGBA crops for person, head, face, eyes, eyebrows, hands and feet,
+    including image-relative and explicit anatomical face-side examples.
 
 ``subject_crop_bbox_ratio``
     Rectangular bbox crops and aspect-ratio-guided crops.
@@ -186,6 +187,28 @@ with DAG(
         },
     )
 
+    anatomical_left_eye_crop = FaceCrop(
+        name='anatomical_left_eye_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'anatomical-left-eye',
+            },
+        },
+    )
+
+    anatomical_right_eye_crop = FaceCrop(
+        name='anatomical_right_eye_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'anatomical-right-eye',
+            },
+        },
+    )
+
     eyebrows_crop = FaceCrop(
         name='eyebrows_crop',
         spec={
@@ -215,6 +238,28 @@ with DAG(
             'params': {
                 **COMMON_PARAMS,
                 'target': 'right-eyebrow',
+            },
+        },
+    )
+
+    anatomical_left_eyebrow_crop = FaceCrop(
+        name='anatomical_left_eyebrow_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'anatomical-left-eyebrow',
+            },
+        },
+    )
+
+    anatomical_right_eyebrow_crop = FaceCrop(
+        name='anatomical_right_eyebrow_crop',
+        spec={
+            'model': FACE_MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'anatomical-right-eyebrow',
             },
         },
     )
@@ -301,9 +346,13 @@ with DAG(
         eyes_crop,
         left_eye_crop,
         right_eye_crop,
+        anatomical_left_eye_crop,
+        anatomical_right_eye_crop,
         eyebrows_crop,
         left_eyebrow_crop,
         right_eyebrow_crop,
+        anatomical_left_eyebrow_crop,
+        anatomical_right_eyebrow_crop,
         hands_crop,
         left_hand_crop,
         right_hand_crop,

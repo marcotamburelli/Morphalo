@@ -17,6 +17,8 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.segmentation import predict_sam_mask
+from morphalo.nodes.preprocess.segmentation_helper import (
+    select_image_side_mask_candidate)
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              cleanup_shape_mask,
                                              cleanup_shape_mask_by_parts,
@@ -33,15 +35,42 @@ from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              tight_alpha_bbox,
                                              validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
-from morphalo.nodes.vision.face_region import (
-    eye_bbox_xyxy_from_landmarks, eye_mask_from_landmarks,
-    eyebrow_bbox_xyxy_from_landmarks, eyebrow_mask_from_landmarks,
-    face_bbox_xyxy_from_landmarks, mp_face_landmarks)
+from morphalo.nodes.vision.face_region import (eye_mask_from_landmarks,
+                                               eyebrow_mask_from_landmarks,
+                                               face_bbox_xyxy_from_landmarks,
+                                               mp_face_landmarks)
 from morphalo.nodes.vision.human import (crop_head_area_from_pose,
                                          mp_pose_landmarks_xy)
 
 FACE_BBOX_EXPANSION = 1.15
 HEAD_AREA_EXPANSION = 1.6
+FACE_TARGETS = (
+    'face',
+    'eyes',
+    'left-eye',
+    'right-eye',
+    'anatomical-left-eye',
+    'anatomical-right-eye',
+    'eyebrows',
+    'left-eyebrow',
+    'right-eyebrow',
+    'anatomical-left-eyebrow',
+    'anatomical-right-eyebrow',
+)
+
+IMAGE_RELATIVE_FACE_TARGETS = {
+    'left-eye': ('eye', 'left'),
+    'right-eye': ('eye', 'right'),
+    'left-eyebrow': ('eyebrow', 'left'),
+    'right-eyebrow': ('eyebrow', 'right'),
+}
+
+ANATOMICAL_FACE_TARGETS = {
+    'anatomical-left-eye': ('eye', 'left'),
+    'anatomical-right-eye': ('eye', 'right'),
+    'anatomical-left-eyebrow': ('eyebrow', 'left'),
+    'anatomical-right-eyebrow': ('eyebrow', 'right'),
+}
 
 
 @dataclass
@@ -83,19 +112,11 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     )
 
     target = str(params.get('target', 'face'))
-    if target not in (
-        'face',
-        'eyes',
-        'left-eye',
-        'right-eye',
-        'eyebrows',
-        'left-eyebrow',
-        'right-eyebrow',
-    ):
+    if target not in FACE_TARGETS:
+        expected = ', '.join(repr(t) for t in FACE_TARGETS)
         raise ValueError(
-            f"'{node_id}': invalid target={target!r} (expected 'face', 'eyes', "
-            "'left-eye', 'right-eye', 'eyebrows', 'left-eyebrow' or "
-            "'right-eyebrow')"
+            f"'{node_id}': invalid target={target!r} "
+            f'(expected one of: {expected})'
         )
 
     face_landmarker_task = model.get('face_landmarker_task')
@@ -153,6 +174,91 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     )
 
 
+def _full_frame_mask(
+    local_mask: np.ndarray,
+    *,
+    full_shape: tuple[int, int],
+    offset_xy: tuple[int, int],
+) -> np.ndarray:
+    """
+    Paste a head-area-local feature mask into full-image coordinates.
+
+    Parameters
+    ----------
+    local_mask : np.ndarray
+        Boolean mask in the pose-guided head-area coordinate system.
+
+    full_shape : tuple[int, int]
+        Full image shape as ``(height, width)``.
+
+    offset_xy : tuple[int, int]
+        ``(x, y)`` offset of the local head area inside the full image.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean full-frame mask.
+    """
+    full_h, full_w = full_shape
+    off_x, off_y = offset_xy
+    local_h, local_w = local_mask.shape
+
+    out = np.zeros((full_h, full_w), dtype=bool)
+    out[off_y:off_y + local_h, off_x:off_x + local_w] = local_mask
+    return out
+
+
+def _face_feature_mask_from_landmarks(
+    face_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    kind: str,
+    which: str,
+    expansion: float,
+) -> np.ndarray:
+    """
+    Build an eye or eyebrow feature mask from face landmarks.
+
+    Parameters
+    ----------
+    face_xy : np.ndarray
+        MediaPipe face landmarks in the same coordinate system as
+        ``image_shape``.
+
+    image_shape : tuple[int, ...]
+        Image shape for the landmark coordinate system.
+
+    kind : {'eye', 'eyebrow'}
+        Facial feature family to mask.
+
+    which : {'left', 'right', 'both'}
+        Anatomical landmark group requested from the MediaPipe face topology.
+
+    expansion : float
+        Feature-mask expansion factor.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean feature mask.
+    """
+    if kind == 'eye':
+        return eye_mask_from_landmarks(
+            face_xy,
+            image_shape,
+            which=which,
+            expansion=expansion,
+        )
+    if kind == 'eyebrow':
+        return eyebrow_mask_from_landmarks(
+            face_xy,
+            image_shape,
+            which=which,
+            expansion=expansion,
+        )
+    raise ValueError(f'Invalid facial feature kind={kind!r}.')
+
+
 @dataclass
 class FaceCrop(CudaPostRunMixin, NodeRef):
     """
@@ -171,11 +277,17 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     - ``eyes``: landmark-derived mask for both eyes;
     - ``left-eye``: landmark-derived mask for the eye on the left side of the image;
     - ``right-eye``: landmark-derived mask for the eye on the right side of the image;
+    - ``anatomical-left-eye``: landmark-derived mask for the anatomical left eye;
+    - ``anatomical-right-eye``: landmark-derived mask for the anatomical right eye;
     - ``eyebrows``: landmark-derived mask for both eyebrows;
     - ``left-eyebrow``: landmark-derived mask for the eyebrow on the left side of
       the image;
     - ``right-eyebrow``: landmark-derived mask for the eyebrow on the right side
       of the image.
+    - ``anatomical-left-eyebrow``: landmark-derived mask for the anatomical left
+      eyebrow;
+    - ``anatomical-right-eyebrow``: landmark-derived mask for the anatomical
+      right eyebrow.
 
     Side-specific targets use image/viewer perspective:
 
@@ -183,6 +295,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
       the image;
     - ``right-eye`` and ``right-eyebrow`` refer to the region on the right side
       of the image.
+
+    Anatomical side targets keep the underlying MediaPipe landmark-side
+    convention and do not compare image position.
 
     This node intentionally focuses on facial details. Body-level targets such
     as ``person``, ``head``, ``hands``, ``left-hand`` and ``right-hand`` are
@@ -240,10 +355,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     ``target='left-eye'``
         - MediaPipe derives face landmarks inside the pose-guided head search
           area.
-        - Landmark indices corresponding to the eye on the left side of the image
-          are selected.
-        - A local eye bbox and mask are computed from landmarks and optionally
-          expanded via ``expansion``.
+        - Anatomical left/right eye masks are computed from landmarks and
+          optionally expanded via ``expansion``.
+        - The mask whose bbox center appears leftmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
         - SAM is skipped.
@@ -253,10 +367,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     ``target='right-eye'``
         - MediaPipe derives face landmarks inside the pose-guided head search
           area.
-        - Landmark indices corresponding to the eye on the right side of the
-          image are selected.
-        - A local eye bbox and mask are computed from landmarks and optionally
-          expanded via ``expansion``.
+        - Anatomical left/right eye masks are computed from landmarks and
+          optionally expanded via ``expansion``.
+        - The mask whose bbox center appears rightmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
         - SAM is skipped.
@@ -277,10 +390,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     ``target='left-eyebrow'``
         - MediaPipe derives face landmarks inside the pose-guided head search
           area.
-        - Landmark indices corresponding to the eyebrow on the left side of the
-          image are selected.
-        - A local eyebrow bbox and mask are computed from landmarks and
+        - Anatomical left/right eyebrow masks are computed from landmarks and
           optionally expanded via ``expansion``.
+        - The mask whose bbox center appears leftmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
         - SAM is skipped.
@@ -290,10 +402,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     ``target='right-eyebrow'``
         - MediaPipe derives face landmarks inside the pose-guided head search
           area.
-        - Landmark indices corresponding to the eyebrow on the right side of the
-          image are selected.
-        - A local eyebrow bbox and mask are computed from landmarks and
+        - Anatomical left/right eyebrow masks are computed from landmarks and
           optionally expanded via ``expansion``.
+        - The mask whose bbox center appears rightmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
         - SAM is skipped.
@@ -379,7 +490,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
         ``params`` : dict
             ``target`` : {'face', 'eyes', 'left-eye', 'right-eye',
-            'eyebrows', 'left-eyebrow', 'right-eyebrow'}, optional
+            'anatomical-left-eye', 'anatomical-right-eye', 'eyebrows',
+            'left-eyebrow', 'right-eyebrow', 'anatomical-left-eyebrow',
+            'anatomical-right-eyebrow'}, optional
                 Facial region to extract. Default: ``'face'``.
 
             ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -730,7 +843,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         # Feature targets such as eyes and eyebrows skip SAM and use a
         # landmark-derived full-frame mask. The full face target uses SAM instead.
         feature_mask: Optional[np.ndarray] = None
-        shape_part_masks: Optional[np.ndarray] = None
+        shape_part_masks: Optional[np.ndarray | list[np.ndarray]] = None
 
         if cfg.target == 'face':
             # Compute the face bbox in head-area local coordinates, then remap it to
@@ -750,67 +863,81 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         # Eye / eyebrow geometry is computed in the pose-guided head area, then
         # remapped to full-image coordinates. The mask is pasted into a full-frame
         # boolean mask so the downstream crop/mask logic can stay target-agnostic.
-        elif cfg.target in ('eyes', 'left-eye', 'right-eye'):
-            which = {
-                'eyes': 'both',
-                'left-eye': 'left',
-                'right-eye': 'right',
-            }[cfg.target]
+        elif cfg.target in (
+            'eyes',
+            'left-eye',
+            'right-eye',
+            'anatomical-left-eye',
+            'anatomical-right-eye',
+            'eyebrows',
+            'left-eyebrow',
+            'right-eyebrow',
+            'anatomical-left-eyebrow',
+            'anatomical-right-eyebrow',
+        ):
+            if cfg.target.startswith('eyebrow') or 'eyebrow' in cfg.target:
+                feature_kind = 'eyebrow'
+                both_target = 'eyebrows'
+            else:
+                feature_kind = 'eye'
+                both_target = 'eyes'
 
-            r_x1, r_y1, r_x2, r_y2 = eye_bbox_xyxy_from_landmarks(
-                face_xy_local,
-                head_area_rgb.shape,
-                which=which,
-                expansion=max(1.0, float(cfg.expansion)),
+            expansion = max(1.0, float(cfg.expansion))
+
+            left_mask = _full_frame_mask(
+                _face_feature_mask_from_landmarks(
+                    face_xy_local,
+                    head_area_rgb.shape,
+                    kind=feature_kind,
+                    which='left',
+                    expansion=expansion,
+                ),
+                full_shape=(h, w),
+                offset_xy=(a_x, a_y),
+            )
+            right_mask = _full_frame_mask(
+                _face_feature_mask_from_landmarks(
+                    face_xy_local,
+                    head_area_rgb.shape,
+                    kind=feature_kind,
+                    which='right',
+                    expansion=expansion,
+                ),
+                full_shape=(h, w),
+                offset_xy=(a_x, a_y),
             )
 
-            bx1, by1, bx2, by2 = offset_bbox_xyxy(
-                (r_x1, r_y1, r_x2, r_y2),
-                dx=a_x,
-                dy=a_y,
+            if cfg.target == both_target:
+                feature_mask = left_mask | right_mask
+                shape_part_masks = [left_mask, right_mask]
+            elif cfg.target in ANATOMICAL_FACE_TARGETS:
+                _, anatomical_side = ANATOMICAL_FACE_TARGETS[cfg.target]
+                feature_mask = (
+                    left_mask if anatomical_side == 'left' else right_mask
+                )
+                shape_part_masks = feature_mask
+            else:
+                _, image_side = IMAGE_RELATIVE_FACE_TARGETS[cfg.target]
+                selection = select_image_side_mask_candidate(
+                    [
+                        (f'anatomical-left-{feature_kind}', left_mask),
+                        (f'anatomical-right-{feature_kind}', right_mask),
+                    ],
+                    image_side=image_side,
+                    node_id=node_id,
+                    target_name=cfg.target,
+                    error_prefix='FaceCrop',
+                )
+                feature_mask = (
+                    left_mask
+                    if selection.selected_index == 0
+                    else right_mask
+                )
+                shape_part_masks = feature_mask
+
+            bx1, by1, bx2, by2 = tight_alpha_bbox(
+                feature_mask.astype(np.uint8)
             )
-
-            local_feature_mask = eye_mask_from_landmarks(
-                face_xy_local,
-                head_area_rgb.shape,
-                which=which,
-                expansion=max(1.0, float(cfg.expansion)),
-            )
-
-            feature_mask = np.zeros((h, w), dtype=bool)
-            mh, mw = local_feature_mask.shape
-            feature_mask[a_y:a_y + mh, a_x:a_x + mw] = local_feature_mask
-
-        elif cfg.target in ('eyebrows', 'left-eyebrow', 'right-eyebrow'):
-            which = {
-                'eyebrows': 'both',
-                'left-eyebrow': 'left',
-                'right-eyebrow': 'right',
-            }[cfg.target]
-
-            r_x1, r_y1, r_x2, r_y2 = eyebrow_bbox_xyxy_from_landmarks(
-                face_xy_local,
-                head_area_rgb.shape,
-                which=which,
-                expansion=max(1.0, float(cfg.expansion)),
-            )
-
-            bx1, by1, bx2, by2 = offset_bbox_xyxy(
-                (r_x1, r_y1, r_x2, r_y2),
-                dx=a_x,
-                dy=a_y,
-            )
-
-            local_feature_mask = eyebrow_mask_from_landmarks(
-                face_xy_local,
-                head_area_rgb.shape,
-                which=which,
-                expansion=max(1.0, float(cfg.expansion)),
-            )
-
-            feature_mask = np.zeros((h, w), dtype=bool)
-            mh, mw = local_feature_mask.shape
-            feature_mask[a_y:a_y + mh, a_x:a_x + mw] = local_feature_mask
 
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
@@ -912,7 +1039,8 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                     f"FaceCrop node '{node_id}': feature mask not computed."
                 )
             mask = feature_mask
-            shape_part_masks = feature_mask
+            if shape_part_masks is None:
+                shape_part_masks = feature_mask
             sam_model_id = None
 
         cm = mask.astype(np.uint8)

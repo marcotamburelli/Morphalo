@@ -1,35 +1,35 @@
 """
-HumanSegmentCrop demo.
+FashnSegmentCrop demo.
 
-This demo showcases semantic human parsing with ``HumanSegmentCrop``. Unlike
+This demo showcases semantic human parsing with ``FashnSegmentCrop``. Unlike
 ``SubjectCrop``, this node does not use YOLO, MediaPipe or SAM for the first
 implementation phase: it uses the FASHN SegFormer human parser to produce
 pixel-wise semantic masks.
 
 Defined DAGs
 ------------
-``human_segment_masks``
+``fashn_segment_masks``
     Full-frame positive and negative person masks.
 
-``human_segment_crop``
+``fashn_segment_crop``
     Trimmed RGBA crops for semantic parser targets such as person, body, skin,
-    clothes, head and an explicit target sequence.
+    clothes, head, arms, legs-with-pants and an explicit target sequence.
 
-``human_segment_bbox_ratio``
+``fashn_segment_bbox_ratio``
     Rectangular bbox crops and aspect-ratio-guided crops from parser masks.
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.06_B_crop --dag human_segment_masks
-    ./bin/run_dag.sh demo.06_B_crop --dag human_segment_crop
-    ./bin/run_dag.sh demo.06_B_crop --dag human_segment_bbox_ratio
+    ./bin/run_dag.sh demo.06_B_crop --dag fashn_segment_masks
+    ./bin/run_dag.sh demo.06_B_crop --dag fashn_segment_crop
+    ./bin/run_dag.sh demo.06_B_crop --dag fashn_segment_bbox_ratio
 """
 
 from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage
-from morphalo.nodes.preprocess import HumanSegmentCrop
+from morphalo.nodes.preprocess import FashnSegmentCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -62,15 +62,15 @@ NEGATIVE_MASK_PARAMS = {
 
 
 with DAG(
-    name='human_segment_masks',
-    out_dir=ROOT / 'outputs' / '06_B_human_segment_masks',
+    name='fashn_segment_masks',
+    out_dir=ROOT / 'outputs' / '06_B_fashn_segment_masks',
 ):
     init_img = FileImage(
         name='init_img',
         path=INIT_IMG,
     )
 
-    person_mask = HumanSegmentCrop(
+    person_mask = FashnSegmentCrop(
         name='person_mask',
         spec={
             'model': MODEL_SPEC,
@@ -81,7 +81,7 @@ with DAG(
         },
     )
 
-    background_mask = HumanSegmentCrop(
+    background_mask = FashnSegmentCrop(
         name='background_mask',
         spec={
             'model': MODEL_SPEC,
@@ -99,15 +99,15 @@ with DAG(
 
 
 with DAG(
-    name='human_segment_crop',
-    out_dir=ROOT / 'outputs' / '06_B_human_segment_crop',
+    name='fashn_segment_crop',
+    out_dir=ROOT / 'outputs' / '06_B_fashn_segment_crop',
 ):
     init_img = FileImage(
         name='init_img',
         path=INIT_IMG,
     )
 
-    person_crop = HumanSegmentCrop(
+    person_crop = FashnSegmentCrop(
         name='person_crop',
         spec={
             'model': MODEL_SPEC,
@@ -118,7 +118,7 @@ with DAG(
         },
     )
 
-    body_crop = HumanSegmentCrop(
+    body_crop = FashnSegmentCrop(
         name='body_crop',
         spec={
             'model': MODEL_SPEC,
@@ -129,7 +129,7 @@ with DAG(
         },
     )
 
-    skin_crop = HumanSegmentCrop(
+    skin_crop = FashnSegmentCrop(
         name='skin_crop',
         spec={
             'model': MODEL_SPEC,
@@ -140,7 +140,7 @@ with DAG(
         },
     )
 
-    clothes_crop = HumanSegmentCrop(
+    clothes_crop = FashnSegmentCrop(
         name='clothes_crop',
         spec={
             'model': MODEL_SPEC,
@@ -151,7 +151,7 @@ with DAG(
         },
     )
 
-    head_crop = HumanSegmentCrop(
+    head_crop = FashnSegmentCrop(
         name='head_crop',
         spec={
             'model': MODEL_SPEC,
@@ -162,7 +162,32 @@ with DAG(
         },
     )
 
-    mixed_parts_crop = HumanSegmentCrop(
+    # arms_crop = FashnSegmentCrop(
+    #     name='arms_crop',
+    #     spec={
+    #         'model': MODEL_SPEC,
+    #         'params': {
+    #             **COMMON_PARAMS,
+    #             'target': 'arms',
+    #         },
+    #     },
+    # )
+
+    legs_with_pants_crop = FashnSegmentCrop(
+        name='legs_with_pants_crop',
+        spec={
+            'model': MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': [
+                    'legs',
+                    'pants',
+                ],
+            },
+        },
+    )
+
+    mixed_parts_crop = FashnSegmentCrop(
         name='mixed_parts_crop',
         spec={
             'model': MODEL_SPEC,
@@ -172,7 +197,7 @@ with DAG(
                     'head',
                     'hands',
                     'feet',
-                    'dress',
+                    'torso',
                 ],
             },
         },
@@ -184,20 +209,22 @@ with DAG(
         skin_crop,
         clothes_crop,
         head_crop,
+        # arms_crop,
+        legs_with_pants_crop,
         mixed_parts_crop,
     ]
 
 
 with DAG(
-    name='human_segment_bbox_ratio',
-    out_dir=ROOT / 'outputs' / '06_B_human_segment_bbox_ratio',
+    name='fashn_segment_bbox_ratio',
+    out_dir=ROOT / 'outputs' / '06_B_fashn_segment_bbox_ratio',
 ):
     init_img = FileImage(
         name='init_img',
         path=INIT_IMG,
     )
 
-    person_bbox = HumanSegmentCrop(
+    person_bbox = FashnSegmentCrop(
         name='person_bbox',
         spec={
             'model': MODEL_SPEC,
@@ -209,7 +236,7 @@ with DAG(
         },
     )
 
-    person_bbox_square = HumanSegmentCrop(
+    person_bbox_square = FashnSegmentCrop(
         name='person_bbox_square',
         spec={
             'model': MODEL_SPEC,
@@ -221,7 +248,7 @@ with DAG(
         },
     )
 
-    clothes_bbox = HumanSegmentCrop(
+    clothes_bbox = FashnSegmentCrop(
         name='clothes_bbox',
         spec={
             'model': MODEL_SPEC,
@@ -233,7 +260,7 @@ with DAG(
         },
     )
 
-    head_bbox_square = HumanSegmentCrop(
+    head_bbox_square = FashnSegmentCrop(
         name='head_bbox_square',
         spec={
             'model': MODEL_SPEC,

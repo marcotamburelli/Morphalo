@@ -15,6 +15,7 @@ Point = tuple[float, float]
 
 CropModeName = Literal['bbox', 'trim', 'full_frame']
 SpatialTransformKind = Literal['crop', 'placement']
+TargetSpec = str | list[str] | tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,114 @@ class CropModeSpec:
     mode: CropModeName
     ratio: Optional[tuple[int, int]] = None
     raw: str = 'trim'
+
+
+def resolve_segment_target_labels(
+    target: TargetSpec,
+    *,
+    labels: dict[str, int],
+    composite_targets: dict[str, tuple[str, ...]],
+    node_id: str,
+    taxonomy_name: str,
+) -> list[str]:
+    """
+    Resolve a semantic segmentation target into de-duplicated atomic labels.
+
+    Semantic crop nodes commonly expose two kinds of public targets:
+
+    - atomic labels, which map one-to-one to class ids emitted by a parser;
+    - composite aliases, which describe a useful region as a stable ordered
+      collection of atomic labels.
+
+    This helper centralizes the validation and expansion logic shared by those
+    nodes. ``target`` may be a single label or alias string, a list of strings,
+    or a tuple of strings. Atomic labels pass through unchanged, composite
+    aliases expand to their member labels, and duplicate atomic labels are
+    removed while preserving first-seen order. Preserving order keeps metadata
+    deterministic and makes downstream debug output easier to compare.
+
+    Parameters
+    ----------
+    target : str | list[str] | tuple[str, ...]
+        Raw user target specification from node parameters.
+
+    labels : dict[str, int]
+        Atomic taxonomy labels accepted by the node, keyed by public label name
+        and valued by parser class id. Only keys are used by this function, but
+        the full mapping is accepted so callers can pass their canonical label
+        table directly.
+
+    composite_targets : dict[str, tuple[str, ...]]
+        Composite aliases accepted by the node. Each alias must expand to
+        atomic label names present in ``labels``. Invalid composite definitions
+        raise ``ValueError`` so taxonomy mistakes fail close to the caller.
+
+    node_id : str
+        Node identifier used to make validation errors actionable inside a DAG.
+
+    taxonomy_name : str
+        Human-readable taxonomy name included in validation errors, for example
+        ``'FASHN'`` or ``'Sapiens2'``.
+
+    Returns
+    -------
+    list[str]
+        Stable, de-duplicated atomic label names resolved from ``target``.
+
+    Raises
+    ------
+    ValueError
+        If ``target`` has an unsupported type, a sequence is empty, any sequence
+        item is not a string, a target name is unknown, or a composite alias
+        references a label outside ``labels``.
+    """
+    valid_targets = tuple(labels.keys()) + tuple(composite_targets.keys())
+    expected = ', '.join(repr(t) for t in valid_targets)
+
+    if isinstance(target, str):
+        items = [target]
+    elif isinstance(target, (list, tuple)):
+        if not target:
+            raise ValueError(f"'{node_id}': target sequence cannot be empty")
+        items = list(target)
+    else:
+        raise ValueError(
+            f"'{node_id}': invalid target={target!r} "
+            f"(expected a string, list of strings, or tuple of strings; "
+            f"valid {taxonomy_name} values: {expected})"
+        )
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"'{node_id}': invalid target item={item!r} "
+                f"(expected a string; valid {taxonomy_name} values: {expected})"
+            )
+
+        if item in labels:
+            expanded = (item,)
+        elif item in composite_targets:
+            expanded = composite_targets[item]
+        else:
+            raise ValueError(
+                f"'{node_id}': invalid target={item!r} "
+                f"(expected one of: {expected})"
+            )
+
+        for label in expanded:
+            if label not in labels:
+                raise ValueError(
+                    f"'{node_id}': composite target={item!r} expands to "
+                    f"unknown {taxonomy_name} label={label!r}"
+                )
+            if label not in seen:
+                resolved.append(label)
+                seen.add(label)
+
+    return resolved
 
 
 def tight_alpha_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:

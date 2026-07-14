@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from morphalo.cache.models import get_human_segmenter
+from morphalo.cache.models import get_fashn_segmenter
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
@@ -16,12 +16,13 @@ from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.crop_debug import write_mask_debug_overlay
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask,
+                                             cleanup_shape_mask_by_parts,
                                              expand_bbox_toward_ratio,
                                              expand_clip_bbox_by_size_expr,
                                              parse_crop_mode,
                                              prepare_output_mask,
                                              read_shape_cleanup_config,
+                                             resolve_segment_target_labels,
                                              tight_alpha_bbox,
                                              validate_size_expr)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
@@ -56,9 +57,6 @@ COMPOSITE_TARGETS: dict[str, tuple[str, ...]] = {
     'person': tuple(label for label in FASHN_LABELS if label != 'background'),
     'skin': ('face', 'arms', 'hands', 'legs', 'feet', 'torso'),
 }
-
-VALID_TARGETS = tuple(FASHN_LABELS.keys()) + tuple(COMPOSITE_TARGETS.keys())
-
 
 @dataclass
 class Config:
@@ -160,47 +158,13 @@ def _resolve_target_labels(
     list[str]
         FASHN label names used to build the semantic mask.
     """
-    expected = ', '.join(repr(t) for t in VALID_TARGETS)
-
-    if isinstance(target, str):
-        items = [target]
-    elif isinstance(target, (list, tuple)):
-        if not target:
-            raise ValueError(f"'{node_id}': target sequence cannot be empty")
-        items = list(target)
-    else:
-        raise ValueError(
-            f"'{node_id}': invalid target={target!r} "
-            f"(expected a string, list of strings, or tuple of strings; "
-            f"valid values: {expected})"
-        )
-
-    labels: list[str] = []
-    seen: set[str] = set()
-
-    for item in items:
-        if not isinstance(item, str):
-            raise ValueError(
-                f"'{node_id}': invalid target item={item!r} "
-                f"(expected a string; valid values: {expected})"
-            )
-
-        if item in FASHN_LABELS:
-            expanded = (item,)
-        elif item in COMPOSITE_TARGETS:
-            expanded = COMPOSITE_TARGETS[item]
-        else:
-            raise ValueError(
-                f"'{node_id}': invalid target={item!r} "
-                f"(expected one of: {expected})"
-            )
-
-        for label in expanded:
-            if label not in seen:
-                labels.append(label)
-                seen.add(label)
-
-    return labels
+    return resolve_segment_target_labels(
+        target,
+        labels=FASHN_LABELS,
+        composite_targets=COMPOSITE_TARGETS,
+        node_id=node_id,
+        taxonomy_name='FASHN',
+    )
 
 
 def _target_label_ids(labels: list[str]) -> list[int]:
@@ -218,6 +182,44 @@ def _target_label_ids(labels: list[str]) -> list[int]:
         FASHN parser class ids in the same order.
     """
     return [FASHN_LABELS[label] for label in labels]
+
+
+def _segment_part_masks(
+    segments: np.ndarray,
+    label_ids: list[int],
+) -> list[np.ndarray]:
+    """
+    Build per-label masks for part-wise structural cleanup.
+
+    ``FashnSegmentCrop`` can select composite targets such as ``person``,
+    ``body`` or explicit lists like ``['head', 'hands', 'feet']``. Those
+    targets may legitimately contain multiple disconnected semantic regions.
+    Returning one mask per selected parser class lets
+    ``cleanup_shape_mask_by_parts`` apply component filtering independently to
+    each semantic part before unioning the result. This prevents settings such
+    as ``min_component_area='biggest'`` from keeping only the largest component
+    across the entire composite target.
+
+    Parameters
+    ----------
+    segments : np.ndarray
+        ``H x W`` integer segmentation map returned by the FASHN parser.
+
+    label_ids : list[int]
+        Parser class ids selected by the resolved target.
+
+    Returns
+    -------
+    list[np.ndarray]
+        Boolean ``H x W`` masks, one for each selected class id that is present
+        in ``segments``. Missing labels are skipped so downstream cleanup falls
+        back gracefully when a composite member is absent in the image.
+    """
+    return [
+        segments == int(label_id)
+        for label_id in label_ids
+        if np.any(segments == int(label_id))
+    ]
 
 
 def _predict_segments(
@@ -252,7 +254,7 @@ def _predict_segments(
         ``(segments, runtime_dtype)`` where ``segments`` is an ``H x W`` array
         of FASHN class ids.
     """
-    processor, model = get_human_segmenter(
+    processor, model = get_fashn_segmenter(
         model_id=model_id,
         device=device,
         dtype=dtype,
@@ -286,11 +288,11 @@ def _predict_segments(
 
 
 @dataclass
-class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
+class FashnSegmentCrop(CudaPostRunMixin, NodeRef):
     """
     Human semantic segment crop and mask generator.
 
-    ``HumanSegmentCrop`` uses a SegFormer human parser intended for
+    ``FashnSegmentCrop`` uses a SegFormer human parser intended for
     single-person images to select semantic body, clothing, and accessory
     regions. The selected semantic region can be written as:
 
@@ -582,10 +584,10 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
             Output image size as ``[width, height]``.
 
         ``model`` : dict
-            Model/runtime metadata, including the human segmenter model id,
+            Model/runtime metadata, including the FASHN segmenter model id,
             runtime device, requested dtype, and runtime dtype.
 
-        ``human_segment_crop`` : dict
+        ``fashn_segment_crop`` : dict
             Resolved semantic crop configuration, including ``target``,
             selected label names, and selected label ids.
 
@@ -678,11 +680,21 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
 
         if not np.any(selected_mask):
             raise RuntimeError(
-                f"HumanSegmentCrop node '{node_id}': selected mask is empty "
+                f"FashnSegmentCrop node '{node_id}': selected mask is empty "
                 f"for target={cfg.target!r}."
             )
 
-        selected_mask = cleanup_shape_mask(selected_mask, **cfg.shape_cleanup)
+        selected_mask = cleanup_shape_mask_by_parts(
+            selected_mask,
+            _segment_part_masks(segments, label_ids),
+            **cfg.shape_cleanup,
+        )
+        if not np.any(selected_mask):
+            raise RuntimeError(
+                f"FashnSegmentCrop node '{node_id}': structural cleanup "
+                f"removed the entire selected mask for target={cfg.target!r}."
+            )
+
         alpha_full = selected_mask.astype(np.uint8) * 255
         bbox_x1, bbox_y1, bbox_x2, bbox_y2 = tight_alpha_bbox(alpha_full)
 
@@ -819,7 +831,7 @@ class HumanSegmentCrop(CudaPostRunMixin, NodeRef):
                 'requested_dtype': str(cfg.dtype).replace('torch.', ''),
                 'runtime_dtype': str(runtime_dtype).replace('torch.', ''),
             },
-            'human_segment_crop': {
+            'fashn_segment_crop': {
                 **params,
                 'labels': resolved_labels,
                 'label_ids': [int(label_id) for label_id in label_ids],

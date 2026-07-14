@@ -159,7 +159,7 @@ def get_depth_estimator(*, model_id: str, device: str) -> Tuple[DPTImageProcesso
     return processor, model
 
 
-def get_human_segmenter(
+def get_fashn_segmenter(
     *,
     model_id: str,
     device: str,
@@ -172,13 +172,13 @@ def get_human_segmenter(
     ).startswith('cuda') else torch.float32
 
     proc_key = CacheKey(
-        kind='human_segment_processor',
+        kind='fashn_segment_processor',
         ref=model_id,
         device='cpu',
         dtype='na',
     )
     mod_key = CacheKey(
-        kind='human_segment_model',
+        kind='fashn_segment_model',
         ref=model_id,
         device=device,
         dtype=dtype_key(model_dtype),
@@ -194,6 +194,75 @@ def get_human_segmenter(
     model = ModelCache.get(mod_key)
     if model is None:
         model = SegformerForSemanticSegmentation.from_pretrained(
+            model_id,
+            torch_dtype=model_dtype,
+        ).to(device)
+        model.eval()
+        ModelCache.put(mod_key, model)
+
+    return processor, model
+
+
+def get_sapiens2_segmenter(
+    *,
+    model_id: str,
+    device: str,
+    dtype: torch.dtype,
+) -> Tuple[Any, Any]:
+    """
+    Load or retrieve a cached Sapiens2 semantic segmentation processor/model.
+
+    The processor is cached on CPU because it is device-independent. The model
+    is cached by model id, target device, and effective dtype. CUDA devices use
+    the requested dtype, while non-CUDA devices are promoted to float32 for
+    runtime compatibility with common PyTorch CPU kernels.
+
+    Parameters
+    ----------
+    model_id : str
+        Hugging Face model identifier for a Sapiens2 segmentation checkpoint.
+
+    device : str
+        Torch device where the model should run.
+
+    dtype : torch.dtype
+        Requested dtype for model weights on CUDA devices.
+
+    Returns
+    -------
+    tuple[Any, Any]
+        ``(processor, model)`` where ``processor`` is an
+        ``AutoImageProcessor`` instance and ``model`` is a
+        ``Sapiens2ForSemanticSegmentation`` instance in eval mode.
+    """
+    from transformers import AutoImageProcessor, Sapiens2ForSemanticSegmentation
+
+    model_dtype = dtype if str(device).lower(
+    ).startswith('cuda') else torch.float32
+
+    proc_key = CacheKey(
+        kind='sapiens2_segment_processor',
+        ref=model_id,
+        device='cpu',
+        dtype='na',
+    )
+    mod_key = CacheKey(
+        kind='sapiens2_segment_model',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(model_dtype),
+    )
+
+    processor = ModelCache.get(proc_key)
+    if processor is None:
+        processor = ModelCache.put(
+            proc_key,
+            AutoImageProcessor.from_pretrained(model_id),
+        )
+
+    model = ModelCache.get(mod_key)
+    if model is None:
+        model = Sapiens2ForSemanticSegmentation.from_pretrained(
             model_id,
             torch_dtype=model_dtype,
         ).to(device)
