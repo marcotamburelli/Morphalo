@@ -14,17 +14,16 @@ from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox,
-                                             expand_clip_bbox_by_size_expr,
                                              parse_crop_mode,
-                                             prepare_output_mask,
                                              read_shape_cleanup_config,
-                                             tight_alpha_bbox,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import (
+    expand_clip_bbox, expand_clip_bbox_by_size_expr, tight_mask_bbox)
+from morphalo.nodes.preprocess.utils.mask_ops import (cleanup_shape_mask,
+                                                      prepare_output_mask)
+from morphalo.nodes.preprocess.utils.sam import predict_sam_mask
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.wiring.mixins import PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
@@ -1065,7 +1064,7 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
 
         if cfg.mode == 'default' and cfg.crop_mode is not None:
             if cfg.crop_mode.mode != 'full_frame':
-                crop_x1, crop_y1, crop_x2, crop_y2 = tight_alpha_bbox(
+                crop_x1, crop_y1, crop_x2, crop_y2 = tight_mask_bbox(
                     clean_mask_u8
                 )
                 crop_x1, crop_y1, crop_x2, crop_y2 = expand_clip_bbox_by_size_expr(

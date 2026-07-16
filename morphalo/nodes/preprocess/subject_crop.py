@@ -1,5 +1,5 @@
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -19,30 +19,36 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.crop_debug import write_crop_debug_overlay
-from morphalo.nodes.preprocess.segmentation import predict_sam_mask
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask,
-                                             cleanup_shape_mask_by_parts,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox_by_size_expr,
-                                             expand_clip_bbox,
-                                             invert_mask_inside_box,
                                              parse_crop_mode,
                                              positive_points_for_sam,
-                                             prepare_output_mask,
                                              read_shape_cleanup_config,
-                                             tight_alpha_bbox,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import (
+    clip_mask_to_bbox, expand_clip_bbox, expand_clip_bbox_by_size_expr,
+    tight_mask_bbox, union_bboxes_xyxy)
+from morphalo.nodes.preprocess.utils.mask_ops import (
+    bridge_consistent_edge_endpoints, cleanup_shape_mask, cleanup_shape_mask_by_parts, extend_consistent_edge_endpoints, invert_mask_inside_box,
+    labeled_points_inside_mask, prepare_output_mask,
+    reachable_components_from_labeled_points,
+    remove_small_components_unless_touching)
+from morphalo.nodes.preprocess.utils.mask_selection import \
+    reference_mask_coverage
+from morphalo.nodes.preprocess.utils.sam import (
+    SamMaskCandidate, build_sam_candidates_from_raw_masks, predict_sam_mask,
+    select_best_guided_sam_mask)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
-from morphalo.nodes.vision.chromatic_segmentation import (
-    split_segment_by_chromatic_runs,
-)
+from morphalo.nodes.vision.chromatic_segmentation import \
+    split_segment_by_chromatic_runs
 from morphalo.nodes.vision.face_region import (face_bbox_xyxy_from_landmarks,
                                                mp_face_landmarks)
-from morphalo.nodes.vision.human import (FootSamRegion,
+from morphalo.nodes.vision.human import (ArmRegionGeometry, SamRegion,
+                                         arm_regions_from_landmarks,
+                                         arm_segments_from_landmarks,
                                          crop_head_area_from_pose,
                                          foot_sam_region_with_prompt_bbox,
-                                         feet_sam_regions_from_landmarks,
+                                         foot_sam_regions_from_landmarks,
                                          hands_bbox_xyxy_from_landmarks,
                                          hands_mask_from_landmarks,
                                          mp_hand_landmarks_full,
@@ -58,6 +64,191 @@ FACE_SEARCH_AREA_EXPANSION = 1.6
 FOOT_LEG_PROBE_COVERAGE_THRESHOLD = 0.55
 FOOT_CHROMATIC_LAB_DISTANCE_THRESHOLD = 14.0
 FOOT_CHROMATIC_MIN_SEGMENT_LEN_PX = 3.0
+ARM_CHROMATIC_LAB_DISTANCE_THRESHOLD = 14.0
+ARM_CHROMATIC_MIN_SEGMENT_LEN_PX = 4.0
+
+# ``ARM_CANNY_L_*`` controls edge detection on the LAB luminance channel.
+# Lower values increase sensitivity to weak brightness boundaries such as
+# low-contrast skin, fabric, shadows, and soft silhouette transitions.
+ARM_CANNY_L_LOW_THRESHOLD = 30
+ARM_CANNY_L_HIGH_THRESHOLD = 100
+#
+# ``ARM_CANNY_AB_*`` controls edge detection on the LAB chromatic channels.
+# These channels recover boundaries between similarly bright but differently
+# colored regions. They are usually noisier than luminance, so their thresholds
+# should generally remain stricter than extremely permissive values.
+ARM_CANNY_AB_LOW_THRESHOLD = 35
+ARM_CANNY_AB_HIGH_THRESHOLD = 100
+#
+# Local contrast enhancement
+# --------------------------
+# CLAHE is applied only to the LAB luminance channel before Canny.
+#
+# ``ARM_CANNY_CLAHE_CLIP_LIMIT`` controls how aggressively local contrast is
+# amplified. Higher values reveal weaker boundaries but also emphasize fabric
+# texture, hair strands, wrinkles, and image noise.
+ARM_CANNY_CLAHE_CLIP_LIMIT = 1.5
+#
+# ``ARM_CANNY_CLAHE_TILE_SIZE`` is the width and height of each CLAHE tile.
+# Smaller tiles make enhancement more local and aggressive; larger tiles make
+# it smoother and closer to global contrast enhancement.
+ARM_CANNY_CLAHE_TILE_SIZE = 8
+#
+# Spatial edge filtering
+# ----------------------
+# Luminance edges are accepted up to the complete arm tube radius.
+# Chromatic edges are more easily contaminated by texture, so they are accepted
+# only within this fraction of the maximum skeleton distance.
+#
+# Lower values reduce chromatic noise but may miss the external boundary of
+# wide sleeves. Higher values preserve more clothing boundaries but may retain
+# unrelated color transitions.
+ARM_CANNY_AB_DISTANCE_RATIO = 0.75
+#
+# Barrier morphology
+# ------------------
+# ``ARM_CANNY_EDGE_CLOSE_RADIUS`` applies blind morphological closing to the
+# complete edge mask. It is currently disabled because endpoint-aware bridging
+# is more selective and less likely to connect unrelated texture fragments.
+ARM_CANNY_EDGE_CLOSE_RADIUS = 0
+#
+# ``ARM_CANNY_EDGE_DILATE_RADIUS`` thickens accepted visual barriers before
+# flood-fill. Larger values close tiny leaks more effectively, but may consume
+# too much valid arm area or merge nearby contours.
+ARM_CANNY_EDGE_DILATE_RADIUS = 1
+#
+# ``ARM_CANNY_MIN_EDGE_COMPONENT_AREA`` removes isolated visual-edge components
+# smaller than this number of pixels, unless they touch an explicit synthetic
+# shoulder or wrist barrier. Increasing it suppresses more texture noise but
+# may discard legitimate short contour fragments.
+ARM_CANNY_MIN_EDGE_COMPONENT_AREA = 12
+#
+# Endpoint-aware contour bridging
+# -------------------------------
+# Interrupted contours are reconnected only when two skeletonized edge
+# endpoints are spatially close and their local outgoing directions are
+# geometrically compatible.
+#
+# ``ARM_CANNY_MAX_BRIDGE_GAP`` is the maximum endpoint distance, in pixels,
+# eligible for reconnection. Larger values close longer missing contour
+# sections but increase the risk of connecting unrelated edges.
+ARM_CANNY_MAX_BRIDGE_GAP = 15.0
+#
+# ``ARM_CANNY_BRIDGE_TANGENT_RADIUS`` is the local skeleton graph distance used
+# to estimate the outgoing tangent at each endpoint. Larger values give a more
+# stable direction on smooth contours, while smaller values follow local curves
+# more closely but are more sensitive to pixel noise.
+ARM_CANNY_BRIDGE_TANGENT_RADIUS = 6
+#
+# ``ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT`` is the minimum cosine alignment
+# between each endpoint's outgoing tangent and the direction toward the other
+# endpoint. Values closer to 1.0 require the endpoints to face each other more
+# directly.
+ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT = 0.70
+#
+# ``ARM_CANNY_BRIDGE_MIN_PARALLELISM`` is the minimum absolute cosine
+# similarity between the two endpoint tangents. Values closer to 1.0 require
+# the interrupted contour fragments to be more nearly collinear.
+ARM_CANNY_BRIDGE_MIN_PARALLELISM = 0.65
+#
+# ``ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION`` is the minimum fraction of bridge
+# pixels that must lie inside the permitted bridge domain, defined by the arm
+# skeleton distance and the local SAM neighborhood.
+ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION = 0.90
+#
+# Flood-fill edge restoration
+# ---------------------------
+# Thick barriers temporarily consume pixels that may belong to the arm.
+# ``ARM_CANNY_RESTORE_EDGE_RADIUS`` controls how far from the reachable
+# flood-filled region barrier pixels may be restored, provided they were also
+# selected by SAM.
+ARM_CANNY_RESTORE_EDGE_RADIUS = 2
+#
+# Refined-mask validation
+# -----------------------
+# The refined result is compared with the original SAM mask before acceptance.
+#
+# ``ARM_CANNY_ACCEPT_MIN_AREA_RATIO`` rejects refinements that retain too little
+# of the SAM candidate, which usually indicates a leak, an over-aggressive
+# barrier, or poor flood-fill connectivity.
+ARM_CANNY_ACCEPT_MIN_AREA_RATIO = 0.15
+#
+# ``ARM_CANNY_ACCEPT_MAX_AREA_RATIO`` rejects refinements that grow excessively
+# relative to SAM. Values above 1.0 allow limited growth caused by controlled
+# restoration logic, although the current pipeline normally keeps the final
+# candidate inside the SAM mask.
+ARM_CANNY_ACCEPT_MAX_AREA_RATIO = 1.25
+
+# Endpoint extension
+# ------------------
+# Endpoint bridging requires compatible contour fragments on both sides of a
+# gap. Endpoint extension handles the complementary case where one reliable
+# contour terminates and no matching fragment is visible beyond the gap.
+#
+# An endpoint is eligible only when it belongs to a sufficiently long
+# skeletonized edge component and its outgoing tangent is approximately
+# parallel to the local arm skeleton. The extension follows the edge tangent,
+# not the skeleton itself, and remains constrained to the permitted bridge
+# domain.
+#
+# ``ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH`` is the minimum skeletonized
+# component length, in pixels, required before one of its endpoints may be
+# extended. Larger values reduce the chance of extending short texture fragments
+# or noise, but may reject legitimate weak arm contours.
+ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH = 20
+#
+# ``ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH`` optionally excludes components
+# longer than the configured value. ``None`` disables the upper bound. Long
+# contours are usually the most reliable candidates, so an upper limit is
+# normally unnecessary.
+ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH = None
+#
+# ``ARM_CANNY_EXTENSION_MAX_LENGTH`` is the maximum number of pixels that may be
+# synthesized beyond an eligible endpoint. Increasing it can bridge longer
+# low-contrast regions, but also increases the risk of inventing a barrier where
+# no real arm boundary exists.
+ARM_CANNY_EXTENSION_MAX_LENGTH = 12.0
+#
+# ``ARM_CANNY_EXTENSION_TANGENT_RADIUS`` is the local edge-skeleton graph
+# distance used to estimate the endpoint's outgoing tangent. Larger values give
+# more stable directions on smooth contours; smaller values follow sharp local
+# curvature more closely but are more sensitive to pixel noise.
+ARM_CANNY_EXTENSION_TANGENT_RADIUS = 6
+#
+# ``ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS`` is the radius, in pixels,
+# around the nearest arm-skeleton point used to derive candidate local skeleton
+# directions. Near the elbow this neighborhood may expose both upper-arm and
+# forearm directions, allowing the endpoint to match the locally relevant one.
+ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS = 10
+#
+# ``ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM`` is the minimum absolute
+# cosine similarity between the outgoing edge tangent and at least one nearby
+# arm-skeleton direction. Values closer to 1.0 require the contour to be more
+# nearly longitudinal with respect to the arm.
+ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM = 0.75
+#
+# ``ARM_CANNY_EXTENSION_SNAP_RADIUS`` is the local search radius used while
+# extending an endpoint. When another edge is encountered inside this radius,
+# the extension snaps to the best forward-aligned pixel and stops.
+ARM_CANNY_EXTENSION_SNAP_RADIUS = 2
+
+# Flood-fill margin recovery
+# --------------------------
+# Flood-fill always stops on the inner side of the visual barriers. Even after
+# restoring the reachable-side barrier pixels, the accepted region remains
+# slightly contracted because the detected contour itself occupies a finite
+# thickness.
+#
+# Expand the accepted flood-filled region by the estimated barrier thickness
+# plus one additional safety pixel. The result is clipped to the original SAM
+# mask, so this expansion can only recover pixels that already belonged to the
+# selected SAM candidate.
+#
+# The expansion radius is intentionally derived from the configured barrier
+# dilation to keep both stages geometrically consistent.
+ARM_CANNY_FLOOD_EXPANSION_RADIUS = (
+    ARM_CANNY_EDGE_DILATE_RADIUS + 1
+)
 
 
 @dataclass
@@ -82,6 +273,101 @@ class Config:
     smoothing_radius: int
     min_landmark_fraction: Optional[float]
     shape_cleanup: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SegmentationContext:
+    """
+    Runtime dependencies shared by target-specific segmentation pipelines.
+
+    The context keeps target pipelines focused on segmentation decisions instead
+    of carrying long parameter lists through every helper. It intentionally
+    contains only immutable shared inputs and model handles; target-specific
+    products such as face landmarks, hand results, or foot regions belong in
+    ``TargetSegmentationResult``.
+
+    Parameters
+    ----------
+    node_id : str
+        Current node identifier, used for contextual errors.
+    cfg : Config
+        Validated node configuration.
+    img_rgb : np.ndarray
+        Full-frame RGB source image.
+    pose_xy : np.ndarray
+        Full-frame MediaPipe pose landmarks in pixel coordinates.
+    width : int
+        Source image width in pixels.
+    height : int
+        Source image height in pixels.
+    sam_processor : Any
+        SAM-compatible processor returned by ``get_sam``.
+    sam_model : Any
+        SAM-compatible model returned by ``get_sam``.
+    """
+    node_id: str
+    cfg: Config
+    img_rgb: np.ndarray
+    pose_xy: np.ndarray
+    width: int
+    height: int
+    sam_processor: Any
+    sam_model: Any
+
+
+@dataclass(frozen=True)
+class TargetSegmentationResult:
+    """
+    Result produced by one target-specific segmentation pipeline.
+
+    The final output stage should not need to know how a target was segmented.
+    Each pipeline therefore returns the selected mask, the geometry used for
+    component selection/debug, and any optional target-specific debug data in a
+    single object.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Full-frame boolean mask for the selected target.
+    target_bbox : tuple[int, int, int, int]
+        End-exclusive bbox describing the target-local geometry. This bbox is
+        used by connected-component selection and debug rendering.
+    prompt_bbox : tuple[int, int, int, int]
+        End-exclusive bbox used as the main SAM prompt domain. For multi-region
+        targets, this is the union of all region prompt boxes.
+    shape_part_masks : np.ndarray | list[np.ndarray] | None, optional
+        Logical part masks used to run shape cleanup independently before
+        unioning multi-part targets such as hands or feet.
+    face_xy : np.ndarray | None, optional
+        Full-frame face landmarks used only by debug rendering.
+    hands_result : Any, optional
+        MediaPipe hand-landmarker result used only by debug rendering.
+    sam_regions : list[SamRegion] | None, optional
+        Final SAM prompt regions, including expanded prompt boxes and any
+        target-specific prompt enrichment, used by debug rendering.
+    prompt_bbox_label : str, default='person'
+        Human-readable label for the prompt bbox in debug overlays.
+    preserve_all_components : bool, default=False
+        If true, the shared component-selection stage keeps every foreground
+        component before cleanup. This is separate from ``shape_part_masks``:
+        component preservation decides what survives before cleanup, while part
+        masks decide how cleanup is applied.
+    debug_region_masks : list[np.ndarray] | None, optional
+        Full-frame target-local prior masks used only by debug rendering.
+    debug_edge_masks : list[np.ndarray] | None, optional
+        Full-frame edge/barrier masks used only by debug rendering.
+    """
+    mask: np.ndarray
+    target_bbox: tuple[int, int, int, int]
+    prompt_bbox: tuple[int, int, int, int]
+    shape_part_masks: Optional[np.ndarray | list[np.ndarray]] = None
+    face_xy: Optional[np.ndarray] = None
+    hands_result: Any = None
+    sam_regions: Optional[list[SamRegion]] = None
+    prompt_bbox_label: str = 'person'
+    preserve_all_components: bool = False
+    debug_region_masks: Optional[list[np.ndarray]] = None
+    debug_edge_masks: Optional[list[np.ndarray]] = None
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -140,15 +426,18 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         'hands',
         'left-hand',
         'right-hand',
+        'arms',
+        'left-arm',
+        'right-arm',
         'feet',
         'left-foot',
         'right-foot',
     ):
         raise ValueError(
             f"'{node_id}': invalid target={target!r} (expected 'person', "
-            "'head', 'hands', 'left-hand', 'right-hand', 'feet', "
-            "'left-foot' or 'right-foot'; use FaceCrop for face, eye, and "
-            "eyebrow targets)"
+            "'head', 'hands', 'left-hand', 'right-hand', 'arms', "
+            "'left-arm', 'right-arm', 'feet', 'left-foot' or "
+            "'right-foot'; use FaceCrop for face, eye, and eyebrow targets)"
         )
 
     sam_model = str(model.get('sam_model', 'facebook/sam-vit-large'))
@@ -178,6 +467,9 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         'hands',
         'left-hand',
         'right-hand',
+        'arms',
+        'left-arm',
+        'right-arm',
         'feet',
         'left-foot',
         'right-foot',
@@ -225,104 +517,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     )
 
 
-@dataclass(frozen=True)
-class SamMaskCandidate:
-    """
-    SAM mask candidate with metadata used by guided mask selection.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Full-frame boolean candidate mask.
-
-    sam_score : float
-        SAM predicted-IoU score associated with the raw mask.
-
-    source : str
-        Prompt strategy that produced the raw mask, such as ``'strict'``,
-        ``'complete'``, ``'foot'`` or ``'refined-foot'``.
-
-    inverted : bool, default=False
-        Whether this candidate is the local inverse of the raw SAM mask.
-    """
-    mask: np.ndarray
-    sam_score: float
-    source: str
-    inverted: bool = False
-
-
-def _build_sam_candidates_from_raw_masks(
-    masks: np.ndarray,
-    scores: Optional[np.ndarray],
-    *,
-    bbox: tuple[int, int, int, int],
-    source: str,
-    node_id: str,
-    include_inverted: bool = True,
-) -> list[SamMaskCandidate]:
-    """
-    Convert raw SAM outputs into scored mask candidates.
-
-    Parameters
-    ----------
-    masks : np.ndarray
-        SAM candidate masks, expected as ``(N, H, W)`` boolean-like array.
-    scores : np.ndarray or None
-        Optional predicted-IoU scores aligned with ``masks``. Missing scores are
-        treated as ``0.0``.
-    bbox : tuple[int, int, int, int]
-        End-exclusive prompt bbox used to compute local inverses.
-    source : str
-        Label describing the prompt strategy that produced these masks.
-    node_id : str
-        Node id used to build actionable error messages.
-    include_inverted : bool, default=True
-        If true, add the local inverse of each raw mask inside ``bbox`` as an
-        additional candidate.
-
-    Returns
-    -------
-    list[SamMaskCandidate]
-        Full-frame boolean candidate masks with selection metadata.
-
-    Raises
-    ------
-    RuntimeError
-        If SAM returned no masks.
-    """
-    if masks is None or len(masks) == 0:
-        raise RuntimeError(
-            f"SubjectCrop node '{node_id}': SAM returned no masks."
-        )
-
-    candidates: list[SamMaskCandidate] = []
-
-    for i, mask in enumerate(masks):
-        mi = mask.astype(bool)
-        score_i = (
-            float(scores[i])
-            if scores is not None and i < len(scores)
-            else 0.0
-        )
-
-        candidates.append(SamMaskCandidate(
-            mask=mi,
-            sam_score=score_i,
-            source=source,
-            inverted=False,
-        ))
-
-        if include_inverted:
-            candidates.append(SamMaskCandidate(
-                mask=invert_mask_inside_box(mi, bbox),
-                sam_score=score_i,
-                source=source,
-                inverted=True,
-            ))
-
-    return candidates
-
-
 def _build_person_sam_candidates(
     *,
     img_rgb: np.ndarray,
@@ -332,7 +526,7 @@ def _build_person_sam_candidates(
     model: Any,
     device: str,
     node_id: str,
-    use_landmarks: bool = True,
+    use_landmark_prompts: bool = True,
 ) -> list[SamMaskCandidate]:
     """
     Build person SAM candidates using strict and complete prompting.
@@ -366,7 +560,7 @@ def _build_person_sam_candidates(
     prompt_runs: list[tuple[str, Optional[list[list[float]]],
                             Optional[list[int]]]] = []
 
-    if use_landmarks:
+    if use_landmark_prompts:
         point_coords, point_labels = positive_points_for_sam(
             xy=pose_xy,
             bbox=bbox,
@@ -388,7 +582,7 @@ def _build_person_sam_candidates(
             point_labels=run_point_labels,
         )
 
-        candidates.extend(_build_sam_candidates_from_raw_masks(
+        candidates.extend(build_sam_candidates_from_raw_masks(
             masks,
             scores,
             bbox=bbox,
@@ -400,71 +594,12 @@ def _build_person_sam_candidates(
     return candidates
 
 
-def _quantize_score(value: float, *, bins: int = 10) -> int:
-    """
-    Quantize a normalized score into an integer bucket.
-
-    Quantization prevents tiny score differences from dominating later
-    tie-breakers such as area preference or prompt source.
-
-    Parameters
-    ----------
-    value : float
-        Score expected in ``[0, 1]``. Values outside the range are clipped.
-
-    bins : int, default=10
-        Number of score intervals. The returned bucket is in ``[0, bins]``.
-
-    Returns
-    -------
-    int
-        Quantized score bucket.
-    """
-    clipped = min(1.0, max(0.0, float(value)))
-    return int(round(clipped * float(bins)))
-
-
-def _union_bboxes(
-    boxes: list[tuple[int, int, int, int]],
-) -> tuple[int, int, int, int]:
-    """
-    Return the smallest bbox containing all input boxes.
-
-    Parameters
-    ----------
-    boxes : list[tuple[int, int, int, int]]
-        Non-empty list of end-exclusive ``(x1, y1, x2, y2)`` boxes.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        End-exclusive union bbox.
-
-    Raises
-    ------
-    RuntimeError
-        If ``boxes`` is empty or the union is invalid.
-    """
-    if not boxes:
-        raise RuntimeError('Cannot union an empty bbox list.')
-
-    x1 = min(b[0] for b in boxes)
-    y1 = min(b[1] for b in boxes)
-    x2 = max(b[2] for b in boxes)
-    y2 = max(b[3] for b in boxes)
-
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError('Invalid bbox union.')
-
-    return x1, y1, x2, y2
-
-
-def _rebuild_foot_regions_with_chromatic_prompt_points(
+def _enrich_foot_sam_regions_with_chromatic_points(
     *,
     img_rgb: np.ndarray,
     pose_xy: np.ndarray,
-    foot_sam_regions: list[FootSamRegion],
-) -> list[FootSamRegion]:
+    foot_regions: list[SamRegion],
+) -> list[SamRegion]:
     """
     Rebuild foot SAM regions with image-aware positive prompt points.
 
@@ -484,7 +619,7 @@ def _rebuild_foot_regions_with_chromatic_prompt_points(
     are exactly where material/color transitions happen and are therefore
     ambiguous prompts.
 
-    This helper returns rebuilt ``FootSamRegion`` objects. Existing bbox/probe
+    This helper returns rebuilt ``SamRegion`` objects. Existing bbox/probe
     geometry is preserved, while ``point_coords`` / ``point_labels`` are
     regenerated through ``foot_sam_region_with_prompt_bbox`` so debug overlays
     and SAM receive the same final prompt.
@@ -495,19 +630,19 @@ def _rebuild_foot_regions_with_chromatic_prompt_points(
         Source RGB image.
     pose_xy : np.ndarray
         MediaPipe pose landmarks in image coordinates.
-    foot_sam_regions : list[FootSamRegion]
+    foot_regions : list[SamRegion]
         Foot prompt regions with base ankle/foot_index prompts.
 
     Returns
     -------
-    list[FootSamRegion]
+    list[SamRegion]
         Regions with chromatic positive points appended when any valid
         chromatic segment centers are found. If no enrichment is possible, the
         original region list is returned unchanged.
     """
     additional_positive_points_by_side: dict[str, list[list[float]]] = {}
 
-    for region in foot_sam_regions:
+    for region in foot_regions:
         positive_points = [
             point
             for point, label in zip(
@@ -544,7 +679,7 @@ def _rebuild_foot_regions_with_chromatic_prompt_points(
         ]
 
     if not additional_positive_points_by_side:
-        return foot_sam_regions
+        return foot_regions
 
     return [
         foot_sam_region_with_prompt_bbox(
@@ -553,356 +688,103 @@ def _rebuild_foot_regions_with_chromatic_prompt_points(
             prompt_bbox=region.prompt_bbox,
             additional_positive_points_by_side=additional_positive_points_by_side,
         )
-        for region in foot_sam_regions
+        for region in foot_regions
     ]
 
 
-def _clip_foot_mask_to_bbox(
-    mask: np.ndarray,
-    bbox: tuple[int, int, int, int],
-) -> np.ndarray:
-    """
-    Keep foot mask pixels only inside an end-exclusive bbox.
-
-    Foot probing intentionally compares masks only inside the local foot prompt
-    bbox (the cyan debug box), never inside the full person box. This prevents a
-    probe on the lower leg from being judged by unrelated body pixels.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Full-frame boolean mask returned by SAM.
-    bbox : tuple[int, int, int, int]
-        End-exclusive foot prompt bbox that defines the local foot domain.
-
-    Returns
-    -------
-    np.ndarray
-        Boolean mask with the same shape as ``mask`` and all pixels outside
-        ``bbox`` set to ``False``.
-    """
-    x1, y1, x2, y2 = bbox
-    out = np.zeros_like(mask, dtype=bool)
-    out[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
-    return out
-
-
-def _foot_mask_coverage(
-    reference: np.ndarray,
-    candidate: np.ndarray,
-) -> float:
-    """
-    Return how much of ``reference`` is covered by ``candidate``.
-
-    This is intentionally not IoU. For the leg-probe heuristic, the question is:
-    "does the mask produced by a lower-leg point cover the foot mask?" If the
-    probe mask is very large, IoU could be low even when it fully contains the
-    foot, while coverage still reports the continuity we care about.
-
-    A high coverage value indicates containment/continuity, but does not imply
-    that the candidate mask is spatially precise or compact.
-
-    Parameters
-    ----------
-    reference : np.ndarray
-        Boolean mask treated as the denominator, usually the foot mask.
-    candidate : np.ndarray
-        Boolean mask whose overlap with ``reference`` is measured, usually the
-        leg-probe mask.
-
-    Returns
-    -------
-    float
-        ``area(reference & candidate) / area(reference)``. Returns ``0.0`` when
-        ``reference`` is empty.
-    """
-    ref_area = int(np.count_nonzero(reference))
-    if ref_area <= 0:
-        return 0.0
-
-    inter = int(np.count_nonzero(reference & candidate))
-    return float(inter) / float(ref_area)
-
-
-def _points_inside_count(
-    mask: np.ndarray,
-    points: Optional[list[list[float]]],
-) -> tuple[int, int]:
-    """
-    Count how many point prompts fall inside a candidate mask.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Full-frame boolean mask.
-    points : list[list[float]] or None
-        Full-image point coordinates to evaluate.
-
-    Returns
-    -------
-    tuple[int, int]
-        ``(inside, valid)`` where ``inside`` is the number of valid points
-        covered by the mask and ``valid`` is the number of usable points.
-    """
-    if not points:
-        return 0, 0
-
-    mask_h, mask_w = mask.shape
-    inside = 0
-    valid = 0
-
-    for point in points:
-        if len(point) < 2:
-            continue
-
-        px, py = point[:2]
-
-        if px < 0 or py < 0:
-            continue
-
-        px_i = int(px)
-        py_i = int(py)
-
-        if not (0 <= px_i < mask_w and 0 <= py_i < mask_h):
-            continue
-
-        valid += 1
-
-        if mask[py_i, px_i]:
-            inside += 1
-
-    return inside, valid
-
-
-def _select_best_guided_sam_mask(
-    candidates: list[SamMaskCandidate],
+def _enrich_arm_sam_regions_with_chromatic_points(
     *,
-    bbox: tuple[int, int, int, int],
-    required_points: Optional[list[list[float]]] = None,
-    forbidden_points: Optional[list[list[float]]] = None,
-    min_required_fraction: Optional[float] = 0.8,
-    target_norm_area: float = 0.25,
-    preferred_source: Optional[str] = None,
-    context: str = 'SAM mask',
-) -> np.ndarray:
+    img_rgb: np.ndarray,
+    pose_xy: np.ndarray,
+    arm_regions: list[SamRegion],
+    prior_masks: list[np.ndarray],
+) -> list[SamRegion]:
     """
-    Select the most suitable SAM mask using target-specific point constraints.
+    Add image-aware chromatic positive prompt points to arm SAM regions.
 
-    SAM predicted-IoU estimates mask quality according to the model, but it does
-    not necessarily reflect whether a candidate corresponds to the target
-    intended by the caller. This selector therefore combines SAM scores with
-    target-specific positive and negative anchors:
-
-    - ``required_points`` identify locations that should belong to the selected
-      target;
-    - ``forbidden_points`` identify locations that should remain outside the
-      selected target.
-
-    Required-point filtering
-    ------------------------
-    When ``min_required_fraction`` is not ``None`` and valid required points are
-    available, each candidate is evaluated by the fraction of required points
-    it contains.
-
-    If at least one candidate reaches the requested fraction, candidates that
-    do not reach it are discarded.
-
-    The filter is intentionally non-fatal. If no candidate reaches the requested
-    fraction, selection falls back to the complete candidate set rather than
-    failing or ranking candidates by partial required-point coverage. This
-    preserves useful fallback behavior when landmarks or generated masks are
-    noisy, incomplete, or slightly misaligned.
-
-    When ``min_required_fraction`` is ``None``, required-point filtering is
-    disabled.
-
-    Forbidden-point filtering
-    -------------------------
-    Forbidden points are treated as exclusion constraints.
-
-    If at least one remaining candidate excludes every valid forbidden point,
-    candidates containing one or more forbidden points are discarded.
-
-    If every remaining candidate contains at least one forbidden point, the
-    filter is also non-fatal: all candidates remain eligible, but candidates
-    containing fewer forbidden points are preferred during ranking.
-
-    Candidate ranking
-    -----------------
-    After optional point filtering, candidates are ranked using the following
-    criteria, in order:
-
-    1. quantized SAM predicted-IoU score;
-    2. proximity to the preferred normalized candidate area;
-    3. fewer contained forbidden points when no candidate satisfies all
-       forbidden-point constraints;
-    4. preference for non-inverted candidates;
-    5. preference for ``preferred_source`` when provided.
-
-    Candidate area is measured inside ``bbox`` and normalized relative to the
-    current candidate pool. A ``target_norm_area`` of ``0.0`` favors the
-    smallest candidate, ``1.0`` favors the largest candidate, and intermediate
-    values favor candidates between those extremes.
+    The base arm regions are built from pose geometry in ``human.py``. This
+    helper samples the RGB image along each arm landmark segment, splits the
+    segment into chromatically coherent runs, and appends each retained run
+    center as an extra positive SAM point when it lies inside the corresponding
+    arm prior. This helps SAM receive hints on visually distinct parts of the
+    same arm, such as sleeve, skin, shadow, or fabric transitions.
 
     Parameters
     ----------
-    candidates : list[SamMaskCandidate]
-        Candidate masks and associated SAM metadata.
-
-    bbox : tuple[int, int, int, int]
-        End-exclusive SAM prompt bbox ``(x1, y1, x2, y2)`` used to measure and
-        normalize candidate areas.
-
-    required_points : list[list[float]] or None, optional
-        Positive target anchors in full-image coordinates. These points are
-        evaluated only during candidate selection; they do not participate in
-        candidate generation or SAM prompt construction.
-
-    forbidden_points : list[list[float]] or None, optional
-        Negative target anchors in full-image coordinates. Candidates excluding
-        all valid forbidden points are preferred whenever such candidates exist.
-
-    min_required_fraction : float or None, default=0.8
-        Minimum fraction of valid ``required_points`` that a candidate must
-        contain to pass required-point filtering.
-
-        If at least one candidate reaches this fraction, only passing candidates
-        remain eligible. If no candidate reaches it, the complete candidate set
-        is retained.
-
-        If ``None``, required-point filtering is skipped.
-
-    target_norm_area : float, default=0.25
-        Preferred normalized candidate area within the current candidate pool.
-        Must be in ``[0, 1]``.
-
-    preferred_source : str or None, optional
-        Prompt-source label to prefer as the final ranking criterion.
-
-    context : str, default='SAM mask'
-        Human-readable target description used in error messages.
+    img_rgb : np.ndarray
+        Full-frame RGB source image.
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-frame image coordinates.
+    arm_regions : list[SamRegion]
+        Base arm regions whose prompt points should be enriched.
+    prior_masks : list[np.ndarray]
+        Full-frame boolean arm prior masks aligned with ``arm_regions``.
 
     Returns
     -------
-    np.ndarray
-        Selected full-frame boolean mask.
-
-    Raises
-    ------
-    RuntimeError
-        If ``candidates`` is empty or no candidate can be selected.
-
-    ValueError
-        If ``target_norm_area`` or a non-``None``
-        ``min_required_fraction`` lies outside ``[0, 1]``.
+    list[SamRegion]
+        Rebuilt arm regions with additional positive prompt points appended
+        when chromatic samples are available. If no samples are retained, the
+        original ``arm_regions`` list is returned unchanged.
     """
-    if not candidates:
-        raise RuntimeError(f'Cannot select best {context}: no candidates.')
+    additional_positive_points_by_side: dict[str, list[list[float]]] = {}
 
-    if not (0.0 <= float(target_norm_area) <= 1.0):
-        raise ValueError(
-            f'target_norm_area must be in [0, 1], got {target_norm_area!r}.'
-        )
+    for region, prior_mask in zip(arm_regions, prior_masks):
+        points: list[list[float]] = []
+        h, w = prior_mask.shape[:2]
 
-    if (
-        min_required_fraction is not None
-        and not (0.0 <= float(min_required_fraction) <= 1.0)
-    ):
-        raise ValueError(
-            'min_required_fraction must be in [0, 1] or None, '
-            f'got {min_required_fraction!r}.'
-        )
+        for start, end in arm_segments_from_landmarks(
+            pose_xy,
+            side=region.side,
+        ):
+            if float(np.linalg.norm(end - start)) < 4.0:
+                continue
 
-    x1, y1, x2, y2 = bbox
+            try:
+                chromatic_segments = split_segment_by_chromatic_runs(
+                    img_rgb,
+                    (float(start[0]), float(start[1])),
+                    (float(end[0]), float(end[1])),
+                    lab_distance_threshold=ARM_CHROMATIC_LAB_DISTANCE_THRESHOLD,
+                    min_segment_len_px=ARM_CHROMATIC_MIN_SEGMENT_LEN_PX,
+                )
+            except ValueError:
+                continue
 
-    measured: list[tuple[SamMaskCandidate, int, int]] = []
-    required_filtered: list[tuple[SamMaskCandidate, int, int]] = []
+            for segment in chromatic_segments:
+                px = int(round(float(segment.center_xy[0])))
+                py = int(round(float(segment.center_xy[1])))
+                if 0 <= px < w and 0 <= py < h and prior_mask[py, px]:
+                    points.append([
+                        float(segment.center_xy[0]),
+                        float(segment.center_xy[1]),
+                    ])
 
-    for candidate in candidates:
-        area = int(candidate.mask[y1:y2, x1:x2].sum())
-        req_inside, req_valid = _points_inside_count(
-            candidate.mask,
-            required_points,
-        )
+        if points:
+            additional_positive_points_by_side[region.side] = points
 
-        # Negative/forbidden points are supposed to remain outside the mask.
-        # This count is therefore a violation count, not a positive score:
-        #   0  -> candidate respects all forbidden points
-        #   >0 -> candidate includes at least one point we wanted excluded
-        # We keep the count on each row so it can first filter the pool, then
-        # act as a softer penalty if every candidate violates a forbidden point.
-        forbidden_inside, _ = _points_inside_count(
-            candidate.mask,
-            forbidden_points,
-        )
+    if not additional_positive_points_by_side:
+        return arm_regions
 
-        row = (candidate, area, forbidden_inside)
-        measured.append(row)
+    enriched_regions: list[SamRegion] = []
+    for region in arm_regions:
+        point_coords = list(region.point_coords or [])
+        point_labels = list(region.point_labels or [])
 
-        if min_required_fraction is not None and req_valid > 0:
-            min_inside = max(
-                1,
-                int(math.ceil(float(req_valid) * min_required_fraction)),
-            )
+        for point in additional_positive_points_by_side.get(region.side, []):
+            point_coords.append(point)
+            point_labels.append(1)
 
-            if req_inside >= min_inside:
-                required_filtered.append(row)
+        enriched_regions.append(SamRegion(
+            side=region.side,
+            base_bbox=region.base_bbox,
+            prompt_bbox=region.prompt_bbox,
+            point_coords=point_coords or None,
+            point_labels=point_labels or None,
+            probe_point=region.probe_point,
+        ))
 
-    pool = (
-        required_filtered
-        if min_required_fraction is not None and required_filtered
-        else measured
-    )
-
-    if forbidden_points:
-        # Prefer masks that exclude every forbidden point. This is the strong
-        # negative-point behavior: when SAM gives us at least one candidate that
-        # respects all negatives, candidates that include a negative point are
-        # treated as wrong target hypotheses and removed from consideration.
-        without_forbidden = [
-            row for row in pool
-            if row[2] == 0
-        ]
-        if without_forbidden:
-            pool = without_forbidden
-
-    areas = np.asarray(
-        [area for _, area, _ in pool],
-        dtype=np.float32,
-    )
-
-    min_area = float(np.min(areas))
-    max_area = float(np.max(areas))
-    area_span = max(1.0, max_area - min_area)
-
-    best_candidate = None
-    best_key = None
-
-    for candidate, area, forbidden_inside in pool:
-        norm_area = (float(area) - min_area) / area_span
-        area_distance = abs(norm_area - float(target_norm_area))
-
-        key = (
-            _quantize_score(candidate.sam_score, bins=10),
-            -float(area_distance),
-            # If all remaining candidates include at least one forbidden point,
-            # still prefer the least-bad mask by penalizing higher violation
-            # counts. A smaller forbidden_inside value produces a larger key.
-            -int(forbidden_inside),
-            not candidate.inverted,
-            candidate.source == preferred_source
-            if preferred_source is not None
-            else False,
-        )
-
-        if best_key is None or key > best_key:
-            best_key = key
-            best_candidate = candidate
-
-    if best_candidate is None:
-        raise RuntimeError(f'Failed to select best {context}.')
-
-    return best_candidate.mask
+    return enriched_regions
 
 
 def _select_best_person_sam_mask(
@@ -1047,7 +929,7 @@ def _select_best_person_sam_mask(
 
         required_points.append([float(px), float(py)])
 
-    return _select_best_guided_sam_mask(
+    return select_best_guided_sam_mask(
         candidates,
         bbox=bbox,
         required_points=required_points,
@@ -1124,7 +1006,7 @@ def _select_best_foot_sam_mask(
             else:
                 negative_points.append(point)
 
-    return _select_best_guided_sam_mask(
+    return select_best_guided_sam_mask(
         candidates,
         bbox=bbox,
         required_points=positive_points,
@@ -1134,6 +1016,1678 @@ def _select_best_foot_sam_mask(
         preferred_source=preferred_source,
         context='foot SAM mask',
     )
+
+
+def _select_best_arm_sam_mask(
+    candidates: list[SamMaskCandidate],
+    *,
+    bbox: tuple[int, int, int, int],
+    point_coords: Optional[list[list[float]]],
+    point_labels: Optional[list[int]],
+    preferred_source: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Select an arm SAM candidate using positive/negative prompt consistency.
+
+    Arm prompts can include many positives: anatomical landmarks plus optional
+    chromatic samples along the limb. Requiring every positive can be too strict
+    when SAM slightly misses a color-run sample, so this selector requires all
+    positives for sparse prompts and a strong majority for richer prompts.
+    Negative points, when present, are treated as forbidden anchors.
+
+    Parameters
+    ----------
+    candidates : list[SamMaskCandidate]
+        Candidate masks returned by SAM, optionally including local inverses.
+    bbox : tuple[int, int, int, int]
+        Local bbox used to normalize candidate area during ranking.
+    point_coords : list[list[float]] | None
+        SAM point coordinates in the same coordinate system as the candidates.
+    point_labels : list[int] | None
+        Labels aligned with ``point_coords``. ``1`` means positive and ``0``
+        means negative.
+    preferred_source : str | None, optional
+        Candidate source label used as a final tie-breaker.
+
+    Returns
+    -------
+    np.ndarray
+        Selected boolean SAM mask.
+    """
+    positive_points: list[list[float]] = []
+    negative_points: list[list[float]] = []
+
+    if point_coords and point_labels:
+        for point, label in zip(point_coords, point_labels):
+            if int(label) == 1:
+                positive_points.append(point)
+            else:
+                negative_points.append(point)
+
+    min_fraction = 0.65 if len(positive_points) > 2 else 1.0
+
+    return select_best_guided_sam_mask(
+        candidates,
+        bbox=bbox,
+        required_points=positive_points,
+        forbidden_points=negative_points,
+        min_required_fraction=min_fraction,
+        target_norm_area=0.35,
+        preferred_source=preferred_source,
+        context='arm SAM mask',
+    )
+
+
+def _refine_arm_mask_with_canny_barriers(
+    *,
+    local_rgb: np.ndarray,
+    local_sam_mask: np.ndarray,
+    local_skeleton_mask: np.ndarray,
+    local_synthetic_barrier_mask: np.ndarray,
+    local_shoulder_circle_mask: np.ndarray,
+    local_shoulder_quadrant_mask: np.ndarray,
+    tube_radius: float,
+    point_coords: list[list[float]],
+    point_labels: list[int],
+    flood_seed_coords: list[list[float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Refine a local SAM arm mask using multi-channel Canny barriers and
+    seeded flood-fill.
+
+    The SAM mask remains the primary segmentation domain. Edge detection does
+    not create a replacement mask from the complete crop. Instead, visual and
+    synthetic barriers subdivide the SAM mask, and only regions reachable from
+    dedicated arm flood-fill seeds are retained.
+
+    The visual barrier pipeline operates in LAB color space:
+
+    1. compute luminance and chromatic Canny edges from the original local RGB
+       crop;
+    2. retain luminance and chromatic edges only inside their configured
+       distance from the arm skeleton;
+    3. reconnect pairs of interrupted edge endpoints when their local outgoing
+       tangents are mutually compatible;
+    4. extend remaining endpoints belonging to sufficiently long contours when
+       their local tangent is approximately parallel to the nearby arm skeleton;
+    5. remove small disconnected edge components;
+    6. optionally close and dilate the remaining visual edges to create stronger
+       flood-fill barriers;
+    7. combine the visual barriers with explicit synthetic shoulder and wrist
+       barriers;
+    8. flood-fill inside the SAM mask from positive arm seed points outside the
+       trusted shoulder circle;
+    9. restore the reachable-side portion of the visual barriers;
+    10. expand the accepted flood-filled region by the estimated barrier thickness,
+        while remaining inside the original SAM mask;
+    11. restore SAM-selected shoulder support inside:
+        - the geometric shoulder circle;
+        - the external shoulder quadrant;
+    12. validate positive-point coverage and the refined-to-SAM area ratio.
+
+    Endpoint bridging and extension solve different failure modes. Bridging
+    reconnects two compatible contour fragments separated by a short gap.
+    Extension continues a single reliable contour when Canny loses the opposite
+    fragment entirely, for example across a weakly contrasted fabric fold.
+
+    The coarse arm prior used to neutralize the image before SAM is deliberately
+    not accepted by this function. It must never be reintroduced after the
+    flood-fill stage.
+
+    Parameters
+    ----------
+    local_rgb : np.ndarray
+        Original local RGB crop used for edge detection. This image must not be
+        neutralized with the arm prior, because the refinement stage needs the
+        real visual boundaries of the arm, clothing, torso, hair, and
+        surrounding image content.
+
+    local_sam_mask : np.ndarray
+        Boolean local SAM mask selected for the arm. Flood-fill and final mask
+        restoration remain constrained to this segmentation domain.
+
+    local_skeleton_mask : np.ndarray
+        Boolean local shoulder-to-elbow-to-wrist centerline mask. It is used to
+        filter visual edges by distance and to validate whether an endpoint
+        extension follows a plausible longitudinal arm direction.
+
+    local_synthetic_barrier_mask : np.ndarray
+        Boolean local mask containing only explicit synthetic shoulder and wrist
+        barrier lines. These pixels restrict flood-fill and are never restored
+        directly as target geometry.
+
+    local_shoulder_circle_mask : np.ndarray
+        Boolean local filled circle centered on the shoulder. The circle defines
+        a shoulder restoration domain, but only pixels already selected by SAM
+        inside it are restored after flood-fill.
+
+    local_shoulder_quadrant_mask : np.ndarray
+        Boolean local mask representing the external shoulder quadrant. Only
+        pixels already selected by SAM inside this domain are restored.
+
+    tube_radius : float
+        Radius used to build the coarse arm tube. It defines the maximum useful
+        distance between visual edges and the arm skeleton. Chromatic edges may
+        use a stricter fraction of this distance.
+
+    point_coords : list[list[float]]
+        Local SAM point coordinates used both for candidate selection and final
+        positive-point coverage validation.
+
+    point_labels : list[int]
+        Labels aligned with ``point_coords``. Positive prompts use label ``1``
+        and negative prompts use label ``0``.
+
+    flood_seed_coords : list[list[float]]
+        Positive local points used exclusively as flood-fill seeds. Unlike the
+        complete SAM prompt set, these coordinates exclude points inside the
+        trusted shoulder circle because shoulder support is restored explicitly
+        after flood-fill. They normally include elbow, wrist, and chromatic
+        samples along the arm that lie outside the shoulder circle.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(refined_mask, barrier_mask)``.
+
+        ``refined_mask`` is the accepted refined local arm mask. The original
+        SAM mask is returned when refinement cannot be applied safely or fails
+        validation.
+
+        ``barrier_mask`` is the final local union of visual Canny-derived
+        barriers and synthetic shoulder/wrist barriers. It is returned for debug
+        rendering even when the original SAM mask is retained.
+
+    Notes
+    -----
+    The refinement deliberately favors arm completeness over pixel-perfect edge
+    placement. Flood-fill is used primarily to identify the correct SAM-connected
+    arm component rather than to determine the final contour with pixel accuracy.
+    A small expansion then recovers the arm margin lost to the visual barriers
+    while remaining strictly constrained by the original SAM mask.
+
+    Endpoint extension follows the same philosophy. It is intentionally
+    conservative and is limited to sufficiently long observed contours, bounded by
+    a maximum synthetic length, constrained to the permitted domain, and accepted
+    only when its local tangent is approximately parallel to the nearby arm
+    skeleton.
+    """
+    import cv2
+
+    sam_mask = local_sam_mask.astype(bool)
+    skeleton_mask = local_skeleton_mask.astype(bool)
+    synthetic_barriers = local_synthetic_barrier_mask.astype(bool)
+    shoulder_circle = local_shoulder_circle_mask.astype(bool)
+    shoulder_quadrant = local_shoulder_quadrant_mask.astype(bool)
+
+    empty_barriers = np.zeros_like(sam_mask, dtype=bool)
+
+    sam_area = int(np.count_nonzero(sam_mask))
+    if sam_area <= 0:
+        return sam_mask, empty_barriers
+
+    positive_inside_sam, positive_valid = labeled_points_inside_mask(
+        sam_mask,
+        point_coords,
+        point_labels,
+    )
+
+    required_positive_count = (
+        positive_valid
+        if positive_valid <= 2
+        else int(math.ceil(0.65 * positive_valid))
+    )
+
+    # Keep the same positive-point tolerance used by arm SAM candidate
+    # selection. Sparse prompts remain strict, while richer prompts may miss
+    # a minority of chromatic samples without disabling Canny refinement.
+    if positive_inside_sam < required_positive_count:
+        return sam_mask, empty_barriers
+
+    if not np.any(skeleton_mask):
+        return sam_mask, empty_barriers
+
+    # -------------------------------------------------------------
+    # Multi-channel Canny edge detection
+    # -------------------------------------------------------------
+    distance_to_skeleton = cv2.distanceTransform(
+        (~skeleton_mask).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+    )
+
+    max_edge_distance = max(
+        2.0,
+        float(tube_radius),
+    )
+
+    lab = cv2.cvtColor(
+        local_rgb,
+        cv2.COLOR_RGB2LAB,
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=ARM_CANNY_CLAHE_CLIP_LIMIT,
+        tileGridSize=(
+            ARM_CANNY_CLAHE_TILE_SIZE,
+            ARM_CANNY_CLAHE_TILE_SIZE,
+        ),
+    )
+
+    l_channel = clahe.apply(
+        lab[:, :, 0],
+    )
+    l_channel = cv2.GaussianBlur(
+        l_channel,
+        (5, 5),
+        0,
+    )
+
+    a_channel = cv2.GaussianBlur(
+        lab[:, :, 1],
+        (5, 5),
+        0,
+    )
+    b_channel = cv2.GaussianBlur(
+        lab[:, :, 2],
+        (5, 5),
+        0,
+    )
+
+    edges_l = cv2.Canny(
+        l_channel,
+        ARM_CANNY_L_LOW_THRESHOLD,
+        ARM_CANNY_L_HIGH_THRESHOLD,
+    ) > 0
+
+    edges_a = cv2.Canny(
+        a_channel,
+        ARM_CANNY_AB_LOW_THRESHOLD,
+        ARM_CANNY_AB_HIGH_THRESHOLD,
+    ) > 0
+
+    edges_b = cv2.Canny(
+        b_channel,
+        ARM_CANNY_AB_LOW_THRESHOLD,
+        ARM_CANNY_AB_HIGH_THRESHOLD,
+    ) > 0
+
+    l_domain = (
+        distance_to_skeleton
+        <= max_edge_distance
+    )
+
+    ab_domain = (
+        distance_to_skeleton
+        <= ARM_CANNY_AB_DISTANCE_RATIO * max_edge_distance
+    )
+
+    edges_l &= l_domain
+    edges_a &= ab_domain
+    edges_b &= ab_domain
+
+    canny = (
+        edges_l
+        | edges_a
+        | edges_b
+    )
+
+    # Creating barriers far outside SAM cannot help the flood-fill. A small
+    # dilation still permits reconnecting borders immediately adjacent to SAM.
+    sam_bridge_domain = cv2.dilate(
+        sam_mask.astype(np.uint8) * 255,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (5, 5),
+        ),
+        iterations=1,
+    ) > 0
+
+    bridge_domain = (
+        l_domain
+        & sam_bridge_domain
+    )
+
+    canny = bridge_consistent_edge_endpoints(
+        canny,
+        allowed_domain=bridge_domain,
+        max_gap=ARM_CANNY_MAX_BRIDGE_GAP,
+        tangent_radius=ARM_CANNY_BRIDGE_TANGENT_RADIUS,
+        min_facing_alignment=ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT,
+        min_parallelism=ARM_CANNY_BRIDGE_MIN_PARALLELISM,
+        min_allowed_fraction=ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION,
+        bridge_thickness=1,
+    )
+
+    canny = extend_consistent_edge_endpoints(
+        canny,
+        arm_skeleton_mask=skeleton_mask,
+        allowed_domain=bridge_domain,
+        min_component_length=(
+            ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH
+        ),
+        max_component_length=(
+            ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH
+        ),
+        max_extension_length=(
+            ARM_CANNY_EXTENSION_MAX_LENGTH
+        ),
+        tangent_radius=(
+            ARM_CANNY_EXTENSION_TANGENT_RADIUS
+        ),
+        skeleton_tangent_radius=(
+            ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS
+        ),
+        min_skeleton_parallelism=(
+            ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM
+        ),
+        snap_radius=(
+            ARM_CANNY_EXTENSION_SNAP_RADIUS
+        ),
+        bridge_thickness=1,
+    )
+    # -------------------------------------------------------------
+    # Strengthen visual edges.
+    # -------------------------------------------------------------
+    visual_barriers = canny
+
+    if ARM_CANNY_EDGE_CLOSE_RADIUS > 0:
+        kernel_size = 2 * ARM_CANNY_EDGE_CLOSE_RADIUS + 1
+        close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        visual_barriers = cv2.morphologyEx(
+            visual_barriers.astype(np.uint8) * 255,
+            cv2.MORPH_CLOSE,
+            close_kernel,
+        ) > 0
+
+    if ARM_CANNY_EDGE_DILATE_RADIUS > 0:
+        kernel_size = 2 * ARM_CANNY_EDGE_DILATE_RADIUS + 1
+        dilate_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+        visual_barriers = cv2.dilate(
+            visual_barriers.astype(np.uint8) * 255,
+            dilate_kernel,
+            iterations=1,
+        ) > 0
+
+    # Remove small isolated Canny fragments. Synthetic barriers are not passed
+    # through this cleanup because they are explicit trusted closures.
+    visual_barriers = remove_small_components_unless_touching(
+        visual_barriers,
+        reference_mask=synthetic_barriers,
+        min_area=ARM_CANNY_MIN_EDGE_COMPONENT_AREA,
+    )
+
+    barriers = visual_barriers | synthetic_barriers
+
+    # -------------------------------------------------------------
+    # Flood-fill only inside the SAM mask.
+    #
+    # This is the central distinction from the previous implementation:
+    # Canny cuts SAM into reachable regions instead of creating a completely
+    # new mask from the entire local crop.
+    # -------------------------------------------------------------
+    walkable = sam_mask & ~barriers
+
+    reachable = reachable_components_from_labeled_points(
+        walkable,
+        flood_seed_coords,
+        [1] * len(flood_seed_coords),
+    )
+
+    if not np.any(reachable):
+        return sam_mask, barriers
+
+    # -------------------------------------------------------------
+    # Restore the reachable-side half of thickened visual barriers.
+    #
+    # Flood-fill excludes the complete barrier thickness, so the reachable region
+    # ends on the inner edge of each barrier and may become noticeably contracted.
+    #
+    # Each visual-barrier pixel is assigned to the closest side:
+    #
+    # - pixels closer to the reachable arm region are restored;
+    # - pixels closer to the rejected SAM region remain excluded.
+    #
+    # This approximately restores the mask up to the estimated contour centerline
+    # without dilating through the barrier into another SAM component.
+    #
+    # Synthetic shoulder and wrist barriers are deliberately excluded from this
+    # restoration. They are logical flood-fill closures rather than detected image
+    # boundaries.
+    # -------------------------------------------------------------
+    restored_edge_pixels = np.zeros_like(
+        reachable,
+        dtype=bool,
+    )
+
+    if (
+        ARM_CANNY_RESTORE_EDGE_RADIUS > 0
+        and np.any(visual_barriers)
+    ):
+        distance_to_reachable = cv2.distanceTransform(
+            (~reachable).astype(np.uint8),
+            cv2.DIST_L2,
+            5,
+        )
+
+        rejected_region = (
+            sam_mask
+            & ~reachable
+            & ~barriers
+        )
+
+        if np.any(rejected_region):
+            distance_to_rejected = cv2.distanceTransform(
+                (~rejected_region).astype(np.uint8),
+                cv2.DIST_L2,
+                5,
+            )
+        else:
+            distance_to_rejected = np.full(
+                reachable.shape,
+                np.inf,
+                dtype=np.float32,
+            )
+
+        restored_edge_pixels = (
+            visual_barriers
+            & sam_mask
+            & (
+                distance_to_reachable
+                <= float(ARM_CANNY_RESTORE_EDGE_RADIUS)
+            )
+            & (
+                distance_to_reachable
+                <= distance_to_rejected
+            )
+        )
+
+    flood_part = (
+        reachable
+        | restored_edge_pixels
+    )
+
+    # -------------------------------------------------------------
+    # Recover the arm margin consumed by flood-fill barriers.
+    #
+    # Even after restoring the reachable-side barrier pixels, the accepted region
+    # still tends to terminate inside the true arm contour because flood-fill
+    # cannot cross the visual barriers.
+    #
+    # Expand the accepted region by a small configurable radius while remaining
+    # strictly inside the original SAM mask. This produces a more realistic arm
+    # outline without allowing leakage into neighboring regions.
+    # -------------------------------------------------------------
+    if ARM_CANNY_FLOOD_EXPANSION_RADIUS > 0:
+        kernel_size = (
+            2 * ARM_CANNY_FLOOD_EXPANSION_RADIUS + 1
+        )
+
+        expansion_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (kernel_size, kernel_size),
+        )
+
+        flood_part = cv2.dilate(
+            flood_part.astype(np.uint8) * 255,
+            expansion_kernel,
+            iterations=1,
+        ) > 0
+
+        flood_part &= sam_mask
+
+    # -------------------------------------------------------------
+    # Restore shoulder support selected by SAM.
+    #
+    # The shoulder circle and external quadrant define the geometric domains
+    # where SAM-selected shoulder pixels may be restored after flood-fill.
+    # Neither mask may introduce pixels that were rejected by SAM.
+    # -------------------------------------------------------------
+    shoulder_restore = (
+        sam_mask
+        & (
+            shoulder_circle
+            | shoulder_quadrant
+        )
+    )
+
+    candidate = (
+        flood_part
+        | shoulder_restore
+    )
+
+    candidate &= sam_mask
+
+    # -------------------------------------------------------------
+    # Validation
+    # -------------------------------------------------------------
+    positive_inside_candidate, _ = labeled_points_inside_mask(
+        candidate,
+        point_coords,
+        point_labels,
+    )
+
+    if positive_inside_candidate < required_positive_count:
+        return sam_mask, barriers
+
+    candidate_area = int(np.count_nonzero(candidate))
+    if candidate_area <= 0:
+        return sam_mask, barriers
+
+    area_ratio = float(candidate_area) / float(max(1, sam_area))
+
+    if area_ratio < ARM_CANNY_ACCEPT_MIN_AREA_RATIO:
+        return sam_mask, barriers
+
+    if area_ratio > ARM_CANNY_ACCEPT_MAX_AREA_RATIO:
+        return sam_mask, barriers
+
+    return candidate, barriers
+
+
+def _predict_arm_mask_on_prior_crop(
+    ctx: SegmentationContext,
+    *,
+    arm_geometry: ArmRegionGeometry,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run SAM on one local arm-prior crop and refine the selected mask with
+    Canny and synthetic flood-fill barriers.
+
+    The arm geometry object keeps the different masks conceptually separate:
+
+    - ``prior_mask`` determines which source-image pixels remain visible before
+      SAM; pixels outside it are replaced with a neutral color;
+    - ``skeleton_mask`` limits relevant Canny edges to the expected arm axis;
+    - ``synthetic_barrier_mask`` contains only explicit shoulder and wrist
+      flood-fill closures;
+    - ``shoulder_circle_mask`` is trusted geometric support restored after
+      flood-fill;
+    - ``shoulder_quadrant_mask`` restricts which SAM-selected shoulder pixels
+      may be restored.
+
+    SAM is run on ``sam_region.prompt_bbox`` using point prompts only. All
+    full-frame masks are cropped to that same coordinate frame before
+    refinement, then the accepted local result and barrier mask are pasted back
+    into full-frame coordinates.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing the source image, SAM handles,
+        device, and image dimensions.
+    arm_geometry : ArmRegionGeometry
+        Geometry, prompts, and masks for one anatomical arm.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(mask, edge_mask)`` where both arrays are full-frame boolean masks.
+        ``mask`` is the selected and optionally refined arm mask.
+        ``edge_mask`` contains the final Canny and synthetic barriers for debug
+        rendering.
+    """
+    region = arm_geometry.sam_region
+
+    # Use the prompt bbox as the actual image domain shown to SAM. The base bbox
+    # describes target geometry, while the prompt bbox may include additional
+    # context around it.
+    x1, y1, x2, y2 = region.prompt_bbox
+
+    local_height = int(y2 - y1)
+    local_width = int(x2 - x1)
+
+    if local_width <= 0 or local_height <= 0:
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': invalid arm prompt bbox "
+            f'{region.prompt_bbox!r}.'
+        )
+
+    local_prior = arm_geometry.prior_mask[
+        y1:y2,
+        x1:x2,
+    ].astype(bool)
+
+    local_skeleton_mask = arm_geometry.skeleton_mask[
+        y1:y2,
+        x1:x2,
+    ].astype(bool)
+
+    local_synthetic_barrier_mask = arm_geometry.synthetic_barrier_mask[
+        y1:y2,
+        x1:x2,
+    ].astype(bool)
+
+    local_shoulder_circle_mask = arm_geometry.shoulder_circle_mask[
+        y1:y2,
+        x1:x2,
+    ].astype(bool)
+
+    local_shoulder_quadrant_mask = arm_geometry.shoulder_quadrant_mask[
+        y1:y2,
+        x1:x2,
+    ].astype(bool)
+
+    if not np.any(local_prior):
+        return (
+            arm_geometry.prior_mask.copy(),
+            np.zeros_like(arm_geometry.prior_mask, dtype=bool),
+        )
+
+    local_source_rgb = np.ascontiguousarray(
+        ctx.img_rgb[y1:y2, x1:x2, :].copy()
+    )
+
+    # Show SAM only pixels inside the coarse arm prior. The prior is deliberately
+    # generous and is not used as the final mask.
+    prior_pixels = local_source_rgb[local_prior]
+
+    if prior_pixels.size == 0:
+        return (
+            arm_geometry.prior_mask.copy(),
+            np.zeros_like(arm_geometry.prior_mask, dtype=bool),
+        )
+
+    neutral_color = np.median(
+        prior_pixels,
+        axis=0,
+    ).astype(np.uint8)
+
+    local_sam_rgb = local_source_rgb.copy()
+    local_sam_rgb[~local_prior] = neutral_color
+
+    # Convert full-frame prompt points into coordinates relative to the local
+    # SAM crop.
+    local_points: list[list[float]] = []
+    local_labels: list[int] = []
+
+    for point, label in zip(
+        region.point_coords or [],
+        region.point_labels or [],
+    ):
+        if len(point) < 2:
+            continue
+
+        local_x = float(point[0]) - float(x1)
+        local_y = float(point[1]) - float(y1)
+
+        if not (
+            0.0 <= local_x < float(local_width)
+            and 0.0 <= local_y < float(local_height)
+        ):
+            continue
+
+        local_points.append([local_x, local_y])
+        local_labels.append(int(label))
+
+    if not any(label == 1 for label in local_labels):
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': arm region "
+            f'{region.side!r} has no valid local positive SAM prompts.'
+        )
+
+    masks, scores = predict_sam_mask(
+        img_rgb=local_sam_rgb,
+        bbox=None,
+        processor=ctx.sam_processor,
+        model=ctx.sam_model,
+        device=ctx.cfg.device,
+        point_coords=local_points,
+        point_labels=local_labels,
+    )
+
+    local_bbox = (
+        0,
+        0,
+        local_width,
+        local_height,
+    )
+
+    candidates = build_sam_candidates_from_raw_masks(
+        masks,
+        scores,
+        bbox=local_bbox,
+        source='arm-prior-crop',
+        node_id=ctx.node_id,
+        include_inverted=True,
+    )
+
+    local_sam_mask = _select_best_arm_sam_mask(
+        candidates,
+        bbox=local_bbox,
+        point_coords=local_points,
+        point_labels=local_labels,
+        preferred_source='arm-prior-crop',
+    ).astype(bool)
+
+    flood_seed_coords: list[list[float]] = []
+
+    for point, label in zip(local_points, local_labels):
+        if int(label) != 1:
+            continue
+
+        px = int(round(float(point[0])))
+        py = int(round(float(point[1])))
+
+        if not (
+            0 <= px < local_width
+            and 0 <= py < local_height
+        ):
+            continue
+
+        # Positive points inside the trusted shoulder circle are useful for SAM,
+        # but must not seed the arm flood-fill. The shoulder region is restored
+        # explicitly after flood-fill.
+        if local_shoulder_circle_mask[py, px]:
+            continue
+
+        flood_seed_coords.append([
+            float(point[0]),
+            float(point[1]),
+        ])
+
+    if not flood_seed_coords:
+        full_mask = np.zeros(
+            (ctx.height, ctx.width),
+            dtype=bool,
+        )
+        full_mask[y1:y2, x1:x2] = local_sam_mask
+
+        full_barriers = np.zeros(
+            (ctx.height, ctx.width),
+            dtype=bool,
+        )
+        full_barriers[y1:y2, x1:x2] = (
+            local_synthetic_barrier_mask
+        )
+
+        return full_mask, full_barriers
+
+    local_refined_mask, local_barriers = (
+        _refine_arm_mask_with_canny_barriers(
+            local_rgb=local_source_rgb,
+            local_sam_mask=local_sam_mask,
+            local_skeleton_mask=local_skeleton_mask,
+            local_synthetic_barrier_mask=local_synthetic_barrier_mask,
+            local_shoulder_circle_mask=local_shoulder_circle_mask,
+            local_shoulder_quadrant_mask=local_shoulder_quadrant_mask,
+            tube_radius=arm_geometry.tube_radius,
+            point_coords=local_points,
+            point_labels=local_labels,
+            flood_seed_coords=flood_seed_coords,
+        )
+    )
+
+    full_mask = np.zeros(
+        (ctx.height, ctx.width),
+        dtype=bool,
+    )
+    full_mask[y1:y2, x1:x2] = local_refined_mask[
+        :local_height,
+        :local_width,
+    ]
+
+    full_barriers = np.zeros(
+        (ctx.height, ctx.width),
+        dtype=bool,
+    )
+    full_barriers[y1:y2, x1:x2] = local_barriers[
+        :local_height,
+        :local_width,
+    ]
+
+    return full_mask, full_barriers
+
+
+def _resolve_person_bbox(
+    ctx: SegmentationContext,
+) -> tuple[int, int, int, int]:
+    """
+    Resolve the person bbox using YOLO proposals constrained by pose landmarks.
+
+    This is a shared primitive rather than a target pipeline: head, hands and
+    feet still use the resolved person bbox as SAM context even when their final
+    target geometry is smaller and target-local.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks, YOLO
+        configuration and node metadata.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive full-frame person bbox ``(x1, y1, x2, y2)`` selected from
+        YOLO person proposals, or a pose-derived fallback bbox when proposals do
+        not align with the detected pose.
+    """
+    yolo = get_yolo(model_name=ctx.cfg.yolo_model, device=ctx.cfg.device)
+    res = yolo.predict(
+        ctx.img_rgb,
+        conf=float(ctx.cfg.conf),
+        verbose=False,
+        device=ctx.cfg.device,
+    )[0]
+
+    return resolve_person_bbox_xyxy(
+        res,
+        ctx.node_id,
+        pose_xy=ctx.pose_xy,
+        image_shape=ctx.img_rgb.shape,
+    )
+
+
+def _expand_prompt_bbox(
+    ctx: SegmentationContext,
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """
+    Apply the node-level prompt expansion to a SAM prompt bbox.
+
+    ``prompt_expansion`` is a segmentation-only control: it changes the area
+    shown to SAM while leaving final crop padding to ``box_margin`` and target
+    geometry. Keeping this in one helper makes the target pipelines explicit
+    about where the prompt domain changes.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image dimensions and configuration.
+    bbox : tuple[int, int, int, int]
+        End-exclusive bbox to expand.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Expanded and image-clipped bbox, or ``bbox`` unchanged when
+        ``prompt_expansion`` is disabled.
+    """
+    if ctx.cfg.prompt_expansion <= 0:
+        return bbox
+
+    return expand_clip_bbox(
+        *bbox,
+        ctx.width,
+        ctx.height,
+        ctx.cfg.prompt_expansion,
+    )
+
+
+def _segment_person_silhouette(
+    ctx: SegmentationContext,
+    *,
+    person_bbox: tuple[int, int, int, int],
+    use_landmark_prompts: Optional[bool] = None,
+) -> np.ndarray:
+    """
+    Segment a person silhouette inside a resolved person prompt bbox.
+
+    This helper captures the reusable "segment the subject" operation used by
+    the person pipeline and by target pipelines that need person-level guidance.
+    It builds strict and complete SAM candidates, then selects a conservative
+    mask using pose-landmark consistency.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks, SAM
+        handles and configuration.
+    person_bbox : tuple[int, int, int, int]
+        End-exclusive bbox passed to SAM as the person prompt domain.
+    use_landmark_prompts : bool | None, optional
+        Whether strict SAM prompting should include positive pose points. If
+        ``None``, the value follows ``cfg.min_landmark_fraction``. This does
+        not disable landmark-based candidate validation; prompt construction and
+        candidate validation are intentionally separate concerns.
+
+    Returns
+    -------
+    np.ndarray
+        Full-frame boolean mask for the selected person silhouette.
+    """
+    if use_landmark_prompts is None:
+        use_landmark_prompts = ctx.cfg.min_landmark_fraction is not None
+
+    candidates = _build_person_sam_candidates(
+        img_rgb=ctx.img_rgb,
+        bbox=person_bbox,
+        pose_xy=ctx.pose_xy,
+        processor=ctx.sam_processor,
+        model=ctx.sam_model,
+        device=ctx.cfg.device,
+        node_id=ctx.node_id,
+        use_landmark_prompts=use_landmark_prompts,
+    )
+
+    return _select_best_person_sam_mask(
+        candidates,
+        bbox=person_bbox,
+        pose_xy=ctx.pose_xy,
+        min_landmark_fraction=ctx.cfg.min_landmark_fraction,
+    ).astype(bool)
+
+
+def _segment_subject_with_single_sam_prompt(
+    ctx: SegmentationContext,
+    *,
+    prompt_bbox: tuple[int, int, int, int],
+    point_coords: Optional[list[list[float]]] = None,
+    point_labels: Optional[list[int]] = None,
+) -> np.ndarray:
+    """
+    Segment a prompted subject by selecting the highest-scored SAM mask.
+
+    This preserves the previous non-person behavior for head and hands: ask SAM
+    once in the person prompt domain, take SAM's best-scored mask, then let the
+    target pipeline apply polarity checks and target-local geometry.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, SAM handles and
+        configuration.
+    prompt_bbox : tuple[int, int, int, int]
+        End-exclusive bbox passed to SAM.
+    point_coords : list[list[float]] | None, optional
+        Optional full-frame SAM point prompts.
+    point_labels : list[int] | None, optional
+        Optional SAM point labels aligned with ``point_coords``.
+
+    Returns
+    -------
+    np.ndarray
+        Full-frame boolean mask selected from SAM's raw candidates.
+
+    Raises
+    ------
+    RuntimeError
+        If SAM returns no masks or no candidate can be selected.
+    """
+    masks, scores = predict_sam_mask(
+        img_rgb=ctx.img_rgb,
+        bbox=prompt_bbox,
+        processor=ctx.sam_processor,
+        model=ctx.sam_model,
+        device=ctx.cfg.device,
+        point_coords=point_coords,
+        point_labels=point_labels,
+    )
+
+    if masks is None or len(masks) == 0:
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': SAM returned no masks."
+        )
+
+    best_mask = None
+    best_key = None
+
+    for i in range(len(masks)):
+        mi = masks[i].astype(bool)
+        score_i = (
+            float(scores[i])
+            if scores is not None and i < len(scores)
+            else 0.0
+        )
+
+        if best_key is None or score_i > best_key:
+            best_key = score_i
+            best_mask = mi
+
+    if best_mask is None:
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': failed to select a SAM mask."
+        )
+
+    return best_mask.astype(bool)
+
+
+def _ensure_subject_mask_polarity(
+    ctx: SegmentationContext,
+    *,
+    mask: np.ndarray,
+    prompt_bbox: tuple[int, int, int, int],
+) -> np.ndarray:
+    """
+    Invert likely-background SAM masks inside the prompt bbox.
+
+    SAM may occasionally return the local background instead of the prompted
+    subject. For target pipelines that first segment the whole person and then
+    apply target-local geometry, pose landmark coverage is a cheap sanity check:
+    if too few valid pose points fall inside the mask, the local inverse is more
+    likely to represent the subject.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing pose landmarks.
+    mask : np.ndarray
+        Full-frame boolean candidate mask to validate.
+    prompt_bbox : tuple[int, int, int, int]
+        End-exclusive prompt bbox inside which inversion is allowed.
+
+    Returns
+    -------
+    np.ndarray
+        ``mask`` unchanged when polarity appears correct, otherwise the mask
+        inverted only inside ``prompt_bbox``.
+    """
+    valid = (
+        (ctx.pose_xy[:, 0] >= 0) &
+        (ctx.pose_xy[:, 1] >= 0)
+    )
+    pts = ctx.pose_xy[valid]
+
+    if len(pts) <= 0:
+        return mask
+
+    inside = 0
+    mask_h, mask_w = mask.shape
+
+    for px, py in pts:
+        px = int(px)
+        py = int(py)
+
+        if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
+            inside += 1
+
+    min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
+
+    if inside >= min_inside:
+        return mask
+
+    return invert_mask_inside_box(mask=mask, box=prompt_bbox)
+
+
+# Target segmentation pipelines.
+#
+# Each function in this section owns the full segmentation flow for one logical
+# target family. The pipeline resolves any target-specific geometry, performs the
+# SAM calls it needs, applies target-local restrictions, and returns a uniform
+# ``TargetSegmentationResult`` for the shared cleanup/output stage.
+def _segment_person(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Segment the full visible person target.
+
+    The person pipeline is the simplest target-specific path: resolve the person
+    bbox, optionally expand the SAM prompt domain, and select the best full-body
+    silhouette. For this target the prompt bbox and target bbox are identical.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks and SAM
+        dependencies.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Full-frame person mask with matching ``target_bbox`` and
+        ``prompt_bbox``.
+    """
+    person_bbox = _resolve_person_bbox(ctx)
+    prompt_bbox = _expand_prompt_bbox(ctx, person_bbox)
+    mask = _segment_person_silhouette(
+        ctx,
+        person_bbox=prompt_bbox,
+    )
+
+    return TargetSegmentationResult(
+        mask=mask,
+        target_bbox=prompt_bbox,
+        prompt_bbox=prompt_bbox,
+    )
+
+
+def _segment_head(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Segment the head target using person-level SAM guidance.
+
+    The head pipeline deliberately separates segmentation guidance from output
+    geometry. SAM sees the person prompt bbox so it can find the correct subject;
+    the final mask is then clipped to a face-derived square head bbox so crop
+    geometry stays head-local and hair-friendly.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks, SAM
+        dependencies and face-landmarker configuration.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Head-local mask, target head bbox, person prompt bbox, and full-frame
+        face landmarks for debug rendering.
+    """
+    person_bbox = _resolve_person_bbox(ctx)
+    person_prompt_bbox = _expand_prompt_bbox(ctx, person_bbox)
+
+    landmarker = get_mediapipe_face_landmarker(
+        model_asset_path=ctx.cfg.face_landmarker_task,
+        device=ctx.cfg.device,
+    )
+
+    head_area_rgb, a_x, a_y = crop_head_area_from_pose(
+        img_rgb=ctx.img_rgb,
+        pose_xy=ctx.pose_xy,
+        expansion=FACE_SEARCH_AREA_EXPANSION,
+    )
+
+    face_xy = mp_face_landmarks(
+        img_rgb=head_area_rgb,
+        face_landmarker=landmarker,
+    )
+    debug_face_xy = face_xy.copy()
+    debug_face_xy[:, 0] += a_x
+    debug_face_xy[:, 1] += a_y
+
+    r_x1, r_y1, r_x2, r_y2 = face_bbox_xyxy_from_landmarks(
+        face_xy,
+        image_shape=head_area_rgb.shape,
+    )
+
+    fx1 = r_x1 + a_x
+    fy1 = r_y1 + a_y
+    fx2 = r_x2 + a_x
+    fy2 = r_y2 + a_y
+
+    head_bbox = square_head_bbox_from_face_bbox(
+        fx1,
+        fy1,
+        fx2,
+        fy2,
+        ctx.width,
+        ctx.height,
+        expansion=ctx.cfg.expansion,
+    )
+
+    mask = _segment_subject_with_single_sam_prompt(
+        ctx,
+        prompt_bbox=person_prompt_bbox,
+    )
+    mask = _ensure_subject_mask_polarity(
+        ctx,
+        mask=mask,
+        prompt_bbox=person_prompt_bbox,
+    )
+
+    hx1, hy1, hx2, hy2 = head_bbox
+    head_region_mask = np.zeros((ctx.height, ctx.width), dtype=bool)
+    head_region_mask[hy1:hy2, hx1:hx2] = True
+
+    return TargetSegmentationResult(
+        mask=mask & head_region_mask,
+        target_bbox=head_bbox,
+        prompt_bbox=person_prompt_bbox,
+        face_xy=debug_face_xy,
+    )
+
+
+def _segment_hands(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Segment hand targets using hand geometry and person-level SAM guidance.
+
+    The hand pipeline keeps the existing semantics: SAM segments the selected
+    person in the person prompt bbox, while MediaPipe hand landmarks define the
+    target-local hand bbox and mask. Intersecting both masks preserves
+    subject-vs-background separation without letting the crop grow beyond the
+    requested hand target.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks, SAM
+        dependencies and hand-landmarker configuration.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Hand-local mask, hand bbox, person prompt bbox, hand part mask for
+        independent cleanup, and hand-landmarker result for debug rendering.
+    """
+    person_bbox = _resolve_person_bbox(ctx)
+    person_prompt_bbox = _expand_prompt_bbox(ctx, person_bbox)
+
+    hand_landmarker = get_mediapipe_hand_landmarker(
+        model_asset_path=ctx.cfg.hand_landmarker_task,
+        device=ctx.cfg.device,
+    )
+
+    hands_res = mp_hand_landmarks_full(
+        img_rgb=ctx.img_rgb,
+        hand_landmarker=hand_landmarker,
+    )
+
+    hand_which = {
+        'hands': 'both',
+        'left-hand': 'left',
+        'right-hand': 'right',
+    }[ctx.cfg.target]
+
+    hand_bbox = hands_bbox_xyxy_from_landmarks(
+        hands_res,
+        ctx.img_rgb.shape,
+        which=hand_which,
+        expansion=max(1.0, float(ctx.cfg.expansion)),
+    )
+
+    hand_mask = hands_mask_from_landmarks(
+        hands_res,
+        ctx.img_rgb.shape,
+        which=hand_which,
+        expansion=max(1.0, float(ctx.cfg.expansion)),
+    )
+
+    point_coords, point_labels = positive_points_for_sam(
+        xy=ctx.pose_xy,
+        bbox=person_prompt_bbox,
+    )
+    subject_mask = _segment_subject_with_single_sam_prompt(
+        ctx,
+        prompt_bbox=person_prompt_bbox,
+        point_coords=point_coords,
+        point_labels=point_labels,
+    )
+    subject_mask = _ensure_subject_mask_polarity(
+        ctx,
+        mask=subject_mask,
+        prompt_bbox=person_prompt_bbox,
+    )
+
+    return TargetSegmentationResult(
+        mask=subject_mask & hand_mask,
+        target_bbox=hand_bbox,
+        prompt_bbox=person_prompt_bbox,
+        shape_part_masks=hand_mask,
+        hands_result=hands_res,
+        preserve_all_components=True,
+    )
+
+
+def _segment_arms(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Segment one or both arms using pose-guided geometry, local SAM inference,
+    Canny barriers, and seeded flood-fill refinement.
+
+    The arm pipeline treats each selected arm as an independent segmentation
+    region. It first segments the complete person silhouette, then derives a
+    coarse arm prior from shoulder, elbow, and wrist landmarks. The prior is
+    used to neutralize unrelated image content before running SAM on a local
+    crop.
+
+    Each selected SAM mask is subsequently refined against the original,
+    non-neutralized image. Canny edges close to the expected arm skeleton are
+    strengthened and combined with synthetic barriers at the shoulder and
+    wrist. A flood-fill seeded by positive arm points outside the trusted
+    shoulder circle retains only arm-connected regions.
+
+    The shoulder is handled separately from the main flood-fill result:
+
+    - the geometric shoulder circle is restored explicitly;
+    - SAM-selected pixels inside the external shoulder quadrant are preserved;
+    - positive prompts inside the shoulder circle are excluded from flood-fill
+      seeds so they cannot bypass the synthetic shoulder barrier.
+
+    Chromatic prompt enrichment adds positive points along visually coherent
+    runs between the arm landmarks. This helps SAM follow transitions between
+    skin, sleeves, cuffs, shadows, and patterned fabric.
+
+    When multiple arms are requested, each arm is segmented and refined
+    independently. Their masks are then combined, while the per-arm masks are
+    preserved for independent shape cleanup and debug rendering.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing the source image, MediaPipe pose
+        landmarks, validated node configuration, image dimensions, and loaded
+        SAM processor and model.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Arm segmentation result containing:
+
+        - the union of all selected full-frame arm masks;
+        - the union of the arm base bounding boxes as ``target_bbox``;
+        - the union of the local SAM crop boxes as ``prompt_bbox``;
+        - one full-frame mask per arm in ``shape_part_masks``;
+        - the enriched SAM regions used for inference and debug rendering;
+        - the coarse arm priors and final edge/barrier masks as debug data.
+
+        ``preserve_all_components`` is enabled because valid arm masks may
+        contain multiple disconnected regions, especially around loose
+        clothing, occlusions, or separate visible fabric and skin areas.
+
+    Raises
+    ------
+    RuntimeError
+        If the person silhouette cannot be segmented, no usable arm geometry
+        can be derived from the pose landmarks, or a selected arm has no valid
+        local positive SAM prompts.
+
+    ValueError
+        If the configured arm target cannot be mapped to a supported arm
+        selection mode.
+
+    Notes
+    -----
+    The coarse arm prior is used only to control which pixels are visible to
+    SAM. It is not used directly as the final arm mask.
+
+    Canny operates on the original local RGB crop rather than the neutralized
+    SAM input so that real boundaries between arm, clothing, torso, and
+    surrounding content remain available during refinement.
+
+    Side-specific targets use image/viewer perspective. Anatomical side
+    resolution is handled internally by the arm geometry helpers.
+    """
+    person_bbox = _resolve_person_bbox(ctx)
+    person_prompt_bbox = _expand_prompt_bbox(ctx, person_bbox)
+    silhouette = _segment_person_silhouette(
+        ctx,
+        person_bbox=person_prompt_bbox,
+    )
+
+    arm_which = {
+        'arms': 'both',
+        'left-arm': 'left',
+        'right-arm': 'right',
+    }[ctx.cfg.target]
+
+    arm_geometries = arm_regions_from_landmarks(
+        pose_xy=ctx.pose_xy,
+        image_shape=ctx.img_rgb.shape,
+        silhouette=silhouette,
+        which=arm_which,
+        expansion=max(1.0, float(ctx.cfg.expansion)),
+    )
+    arm_regions = [
+        geometry.sam_region
+        for geometry in arm_geometries
+    ]
+
+    prior_masks = [
+        geometry.prior_mask
+        for geometry in arm_geometries
+    ]
+
+    enriched_regions = _enrich_arm_sam_regions_with_chromatic_points(
+        img_rgb=ctx.img_rgb,
+        pose_xy=ctx.pose_xy,
+        arm_regions=arm_regions,
+        prior_masks=prior_masks,
+    )
+
+    arm_geometries = [
+        replace(
+            geometry,
+            sam_region=enriched_region,
+        )
+        for geometry, enriched_region in zip(
+            arm_geometries,
+            enriched_regions,
+        )
+    ]
+
+    mask = np.zeros((ctx.height, ctx.width), dtype=bool)
+    arm_region_masks: list[np.ndarray] = []
+    arm_edge_masks: list[np.ndarray] = []
+
+    for arm_geometry in arm_geometries:
+        region_mask, edge_mask = _predict_arm_mask_on_prior_crop(
+            ctx,
+            arm_geometry=arm_geometry,
+        )
+
+        if not np.any(region_mask):
+            region_mask = arm_geometry.prior_mask.copy()
+
+        arm_region_masks.append(region_mask)
+        arm_edge_masks.append(edge_mask)
+        mask |= region_mask
+
+    return TargetSegmentationResult(
+        mask=mask,
+        target_bbox=union_bboxes_xyxy([
+            geometry.sam_region.base_bbox
+            for geometry in arm_geometries
+        ]),
+        prompt_bbox=union_bboxes_xyxy([
+            geometry.sam_region.prompt_bbox
+            for geometry in arm_geometries
+        ]),
+        shape_part_masks=arm_region_masks,
+        sam_regions=[
+            geometry.sam_region
+            for geometry in arm_geometries
+        ],
+        prompt_bbox_label='arm-prompt',
+        preserve_all_components=True,
+        debug_region_masks=[
+            geometry.prior_mask
+            for geometry in arm_geometries
+        ],
+        debug_edge_masks=arm_edge_masks,
+    )
+
+
+def _segment_feet(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Segment foot targets independently by foot prompt region.
+
+    Feet are handled per region because each foot may need different prompt
+    geometry, chromatic prompt enrichment, leg-probe refinement and cleanup.
+    Each region is segmented independently and clipped to its prompt bbox before
+    the regional masks are unioned.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context containing image data, pose landmarks, SAM
+        dependencies and foot-related configuration.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Unioned foot mask, unioned target bbox from base foot regions, unioned
+        SAM prompt bbox, per-foot masks for independent cleanup, and final foot
+        regions for debug rendering.
+    """
+    person_bbox = _resolve_person_bbox(ctx)
+
+    foot_which = {
+        'feet': 'both',
+        'left-foot': 'left',
+        'right-foot': 'right',
+    }[ctx.cfg.target]
+
+    foot_regions = foot_sam_regions_from_landmarks(
+        ctx.pose_xy,
+        ctx.img_rgb.shape,
+        which=foot_which,
+        expansion=max(1.0, float(ctx.cfg.expansion)),
+        person_bbox=person_bbox,
+    )
+
+    if ctx.cfg.prompt_expansion > 0:
+        foot_regions = [
+            foot_sam_region_with_prompt_bbox(
+                region,
+                ctx.pose_xy,
+                prompt_bbox=expand_clip_bbox(
+                    *region.prompt_bbox,
+                    ctx.width,
+                    ctx.height,
+                    ctx.cfg.prompt_expansion,
+                ),
+            )
+            for region in foot_regions
+        ]
+
+    foot_regions = _enrich_foot_sam_regions_with_chromatic_points(
+        img_rgb=ctx.img_rgb,
+        pose_xy=ctx.pose_xy,
+        foot_regions=foot_regions,
+    )
+
+    mask = np.zeros((ctx.height, ctx.width), dtype=bool)
+    foot_region_masks: list[np.ndarray] = []
+
+    for region in foot_regions:
+        masks, scores = predict_sam_mask(
+            img_rgb=ctx.img_rgb,
+            bbox=region.prompt_bbox,
+            processor=ctx.sam_processor,
+            model=ctx.sam_model,
+            device=ctx.cfg.device,
+            point_coords=region.point_coords,
+            point_labels=region.point_labels,
+        )
+
+        foot_candidates = build_sam_candidates_from_raw_masks(
+            masks,
+            scores,
+            bbox=region.prompt_bbox,
+            source='foot',
+            node_id=ctx.node_id,
+            include_inverted=True,
+        )
+        region_mask = _select_best_foot_sam_mask(
+            foot_candidates,
+            bbox=region.prompt_bbox,
+            point_coords=region.point_coords,
+            point_labels=region.point_labels,
+            preferred_source='foot',
+        )
+
+        region_mask = clip_mask_to_bbox(region_mask, region.prompt_bbox)
+
+        if region.probe_point is not None:
+            probe_masks, probe_scores = predict_sam_mask(
+                img_rgb=ctx.img_rgb,
+                bbox=region.prompt_bbox,
+                processor=ctx.sam_processor,
+                model=ctx.sam_model,
+                device=ctx.cfg.device,
+                point_coords=[region.probe_point],
+                point_labels=[1],
+            )
+            probe_candidates = build_sam_candidates_from_raw_masks(
+                probe_masks,
+                probe_scores,
+                bbox=region.prompt_bbox,
+                source='leg-probe',
+                node_id=ctx.node_id,
+                include_inverted=True,
+            )
+            probe_mask = select_best_guided_sam_mask(
+                probe_candidates,
+                bbox=region.prompt_bbox,
+                required_points=[region.probe_point],
+                forbidden_points=None,
+                min_required_fraction=1.0,
+                target_norm_area=0.5,
+                preferred_source='leg-probe',
+                context='foot leg-probe SAM mask',
+            )
+            probe_mask = clip_mask_to_bbox(
+                probe_mask,
+                region.prompt_bbox,
+            )
+            probe_coverage = reference_mask_coverage(region_mask, probe_mask)
+
+            if probe_coverage < FOOT_LEG_PROBE_COVERAGE_THRESHOLD:
+                refined_points = list(region.point_coords or [])
+                refined_labels = list(region.point_labels or [])
+                refined_points.append(region.probe_point)
+                refined_labels.append(0)
+
+                refined_masks, refined_scores = predict_sam_mask(
+                    img_rgb=ctx.img_rgb,
+                    bbox=region.prompt_bbox,
+                    processor=ctx.sam_processor,
+                    model=ctx.sam_model,
+                    device=ctx.cfg.device,
+                    point_coords=refined_points,
+                    point_labels=refined_labels,
+                )
+                refined_candidates = build_sam_candidates_from_raw_masks(
+                    refined_masks,
+                    refined_scores,
+                    bbox=region.prompt_bbox,
+                    source='refined-foot',
+                    node_id=ctx.node_id,
+                    include_inverted=True,
+                )
+                region_mask = _select_best_foot_sam_mask(
+                    refined_candidates,
+                    bbox=region.prompt_bbox,
+                    point_coords=refined_points,
+                    point_labels=refined_labels,
+                    preferred_source='refined-foot',
+                )
+                region_mask = clip_mask_to_bbox(
+                    region_mask,
+                    region.prompt_bbox,
+                )
+
+        foot_region_masks.append(region_mask)
+        mask |= region_mask
+
+    return TargetSegmentationResult(
+        mask=mask,
+        target_bbox=union_bboxes_xyxy([
+            region.base_bbox for region in foot_regions
+        ]),
+        prompt_bbox=union_bboxes_xyxy([
+            region.prompt_bbox for region in foot_regions
+        ]),
+        shape_part_masks=foot_region_masks,
+        sam_regions=foot_regions,
+        prompt_bbox_label='foot-prompt',
+        preserve_all_components=True,
+    )
+
+
+def _segment_target(ctx: SegmentationContext) -> TargetSegmentationResult:
+    """
+    Dispatch to the target-specific segmentation pipeline.
+
+    Parameters
+    ----------
+    ctx : SegmentationContext
+        Shared runtime context. ``ctx.cfg.target`` selects the target pipeline.
+
+    Returns
+    -------
+    TargetSegmentationResult
+        Uniform segmentation result produced by the selected target pipeline.
+
+    Raises
+    ------
+    ValueError
+        If ``ctx.cfg.target`` is not one of the validated SubjectCrop targets.
+    """
+    if ctx.cfg.target == 'person':
+        return _segment_person(ctx)
+    if ctx.cfg.target == 'head':
+        return _segment_head(ctx)
+    if ctx.cfg.target in ('hands', 'left-hand', 'right-hand'):
+        return _segment_hands(ctx)
+    if ctx.cfg.target in ('arms', 'left-arm', 'right-arm'):
+        return _segment_arms(ctx)
+    if ctx.cfg.target in ('feet', 'left-foot', 'right-foot'):
+        return _segment_feet(ctx)
+
+    raise ValueError(f"'{ctx.node_id}': invalid target={ctx.cfg.target!r}")
 
 
 @dataclass
@@ -1156,6 +2710,9 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - ``hands``: one or more visible hand crops/masks;
     - ``left-hand``: hand appearing on the left side of the image;
     - ``right-hand``: hand appearing on the right side of the image;
+    - ``arms``: one or more visible arm crops/masks, from shoulder to wrist;
+    - ``left-arm``: arm appearing on the left side of the image;
+    - ``right-arm``: arm appearing on the right side of the image;
     - ``feet``: one or more visible foot crops/masks;
     - ``left-foot``: foot appearing on the left side of the image;
     - ``right-foot``: foot appearing on the right side of the image.
@@ -1172,6 +2729,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - producing full-frame inpaint masks for SDXL pipelines;
     - extracting head regions for FaceID / IP-Adapter refinement;
     - extracting hand regions for localized hand repair/refinement;
+    - extracting arm regions for localized pose, sleeve or skin refinement;
     - extracting foot regions for localized foot repair/refinement;
     - refining a small region by cropping, processing it separately, and
       reinserting it at the original coordinates.
@@ -1180,6 +2738,8 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
 
     - ``left-hand`` refers to the hand on the left side of the image;
     - ``right-hand`` refers to the hand on the right side of the image.
+    - ``left-arm`` refers to the arm on the left side of the image;
+    - ``right-arm`` refers to the arm on the right side of the image.
     - ``left-foot`` refers to the foot on the left side of the image;
     - ``right-foot`` refers to the foot on the right side of the image.
 
@@ -1214,6 +2774,8 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - Hands and feet use target-local segmentation, where the requested extremity
       defines the primary segmentation geometry while the resolved person is used
       only as contextual guidance.
+    - Arms use a target-local shoulder/arm ROI clipped to the person silhouette
+      before and after SAM segmentation.
 
     ``target='person'``
     - MediaPipe Pose landmarks are computed for the full image.
@@ -1367,7 +2929,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             ``target='right-hand'``.
 
     ``params`` : dict
-        ``target`` : {'person', 'head', 'hands', 'left-hand', 'right-hand', 'feet', 'left-foot', 'right-foot'}, optional
+        ``target`` : {'person', 'head', 'hands', 'left-hand', 'right-hand', 'arms', 'left-arm', 'right-arm', 'feet', 'left-foot', 'right-foot'}, optional
             Region to extract. Default: ``'person'``.
 
         ``mode`` : {'default', 'mask', 'negative-mask'}, optional
@@ -1490,6 +3052,8 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
              controls the derived square head crop size;
             - for hand targets:
               expands the landmark-derived hand bbox / mask;
+            - for arm targets:
+              expands the pose-derived shoulder cap and arm tube radius;
             - for foot targets:
               expands the derived foot-local search regions;
             - for ``target='person'``:
@@ -1653,9 +3217,10 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
     - ``dilate_radius``, ``close_radius`` and ``smoothing_radius`` are applied
       to the positive target mask before output. In ``mode='default'``, the
       crop bbox is derived from this post-processed mask.
-    - ``target='hands'`` and ``target='feet'`` may preserve multiple disconnected
-      target components inside the same crop.
-    - Side-specific hand and foot targets always follow image/viewer perspective.
+    - ``target='hands'``, ``target='arms'`` and ``target='feet'`` may preserve
+      multiple disconnected target components inside the same crop.
+    - Side-specific hand, arm and foot targets always follow image/viewer
+      perspective.
     - MediaPipe handedness labels follow anatomical subject perspective and are
       mapped internally to preserve the image/viewer convention.
     - This node does not require a local ``sam_checkpoint`` /
@@ -1710,12 +3275,6 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         h, w = img_bgr.shape[:2]
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        hand_mask: Optional[np.ndarray] = None
-        foot_mask: Optional[np.ndarray] = None
-        shape_part_masks: Optional[np.ndarray | list[np.ndarray]] = None
-        foot_sam_regions: Optional[list[FootSamRegion]] = None
-        debug_face_xy: Optional[np.ndarray] = None
-        debug_hands_res = None
         debug_mask: Optional[np.ndarray] = None
 
         pose_landmarker = get_mediapipe_pose_landmarker(
@@ -1727,236 +3286,6 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             pose_landmarker=pose_landmarker,
         )
 
-        if cfg.target == 'person':
-            # YOLO proposes person bbox candidates; resolve_person_bbox_xyxy()
-            # accepts a YOLO box only when it is consistent with MediaPipe pose,
-            # otherwise it falls back to a pose-derived bbox.
-            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-            res = yolo.predict(
-                img_rgb,
-                conf=float(cfg.conf),
-                verbose=False,
-                device=cfg.device
-            )[0]
-
-            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
-                res,
-                node_id,
-                pose_xy=pose_xy,
-                image_shape=img_rgb.shape,
-            )
-
-        elif cfg.target == 'head':
-            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-            res = yolo.predict(
-                img_rgb,
-                conf=float(cfg.conf),
-                verbose=False,
-                device=cfg.device,
-            )[0]
-
-            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
-                res,
-                node_id,
-                pose_xy=pose_xy,
-                image_shape=img_rgb.shape,
-            )
-
-            landmarker = get_mediapipe_face_landmarker(
-                model_asset_path=cfg.face_landmarker_task,
-                device=cfg.device,
-            )
-
-            head_area_rgb, a_x, a_y = crop_head_area_from_pose(
-                img_rgb=img_rgb,
-                pose_xy=pose_xy,
-                expansion=FACE_SEARCH_AREA_EXPANSION,
-            )
-
-            face_xy = mp_face_landmarks(
-                img_rgb=head_area_rgb,
-                face_landmarker=landmarker,
-            )
-            debug_face_xy = face_xy.copy()
-            debug_face_xy[:, 0] += a_x
-            debug_face_xy[:, 1] += a_y
-
-            r_x1, r_y1, r_x2, r_y2 = face_bbox_xyxy_from_landmarks(
-                face_xy,
-                image_shape=head_area_rgb.shape
-            )
-
-            fx1 = r_x1 + a_x
-            fy1 = r_y1 + a_y
-            fx2 = r_x2 + a_x
-            fy2 = r_y2 + a_y
-
-            fx1, fy1, fx2, fy2 = square_head_bbox_from_face_bbox(
-                fx1, fy1, fx2, fy2, w, h,
-                expansion=cfg.expansion,
-            )
-
-        elif cfg.target in ('hands', 'left-hand', 'right-hand'):
-            # --------------------------------------------------
-            # Resolve the subject bbox first.
-            # This bbox is used only to guide SAM toward the correct person.
-            # --------------------------------------------------
-
-            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-            res = yolo.predict(
-                img_rgb,
-                conf=float(cfg.conf),
-                verbose=False,
-                device=cfg.device,
-            )[0]
-
-            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
-                res,
-                node_id,
-                pose_xy=pose_xy,
-                image_shape=img_rgb.shape,
-            )
-
-            # --------------------------------------------------
-            # Resolve the hand-local geometry from hand landmarks.
-            #
-            # - h* bbox defines the final crop region
-            # - hand_mask is later intersected with the SAM subject mask
-            #   so the final alpha stays hand-focused and background-free
-            # --------------------------------------------------
-            hand_landmarker = get_mediapipe_hand_landmarker(
-                model_asset_path=cfg.hand_landmarker_task,
-                device=cfg.device,
-            )
-
-            hands_res = mp_hand_landmarks_full(
-                img_rgb=img_rgb,
-                hand_landmarker=hand_landmarker,
-            )
-            debug_hands_res = hands_res
-
-            hand_which = {
-                'hands': 'both',
-                'left-hand': 'left',
-                'right-hand': 'right',
-            }[cfg.target]
-
-            hx1, hy1, hx2, hy2 = hands_bbox_xyxy_from_landmarks(
-                hands_res,
-                img_rgb.shape,
-                which=hand_which,
-                expansion=max(1.0, float(cfg.expansion)),
-            )
-
-            hand_mask = hands_mask_from_landmarks(
-                hands_res,
-                img_rgb.shape,
-                which=hand_which,
-                expansion=max(1.0, float(cfg.expansion)),
-            )
-
-        elif cfg.target in ('feet', 'left-foot', 'right-foot'):
-            # --------------------------------------------------
-            # Resolve the subject bbox first.
-            # This bbox is used only to guide SAM toward the correct person.
-            # --------------------------------------------------
-
-            yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-            res = yolo.predict(
-                img_rgb,
-                conf=float(cfg.conf),
-                verbose=False,
-                device=cfg.device,
-            )[0]
-
-            bx1, by1, bx2, by2 = resolve_person_bbox_xyxy(
-                res,
-                node_id,
-                pose_xy=pose_xy,
-                image_shape=img_rgb.shape,
-            )
-
-            foot_which = {
-                'feet': 'both',
-                'left-foot': 'left',
-                'right-foot': 'right',
-            }[cfg.target]
-
-            person_bbox_for_feet = (bx1, by1, bx2, by2)
-
-            foot_sam_regions = feet_sam_regions_from_landmarks(
-                pose_xy,
-                img_rgb.shape,
-                which=foot_which,
-                expansion=max(1.0, float(cfg.expansion)),
-                person_bbox=person_bbox_for_feet,
-            )
-
-            fx1, fy1, fx2, fy2 = _union_bboxes([
-                region.base_bbox for region in foot_sam_regions
-            ])
-            bx1, by1, bx2, by2 = _union_bboxes([
-                region.prompt_bbox for region in foot_sam_regions
-            ])
-
-        else:
-            raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
-
-        # Optionally expand the SAM prompt bbox. This is an advanced segmentation
-        # knob and is intentionally separate from output crop margin.
-        if cfg.prompt_expansion > 0 and cfg.target in (
-            'feet',
-            'left-foot',
-            'right-foot',
-        ):
-            if foot_sam_regions is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': foot regions not computed."
-                )
-
-            foot_sam_regions = [
-                foot_sam_region_with_prompt_bbox(
-                    region,
-                    pose_xy,
-                    prompt_bbox=expand_clip_bbox(
-                        *region.prompt_bbox, w, h, cfg.prompt_expansion
-                    ),
-                )
-                for region in foot_sam_regions
-            ]
-            bx1, by1, bx2, by2 = _union_bboxes([
-                region.prompt_bbox for region in foot_sam_regions
-            ])
-
-        elif cfg.prompt_expansion > 0:
-            bx1, by1, bx2, by2 = expand_clip_bbox(
-                bx1, by1, bx2, by2, w, h, cfg.prompt_expansion
-            )
-
-        if cfg.target in ('feet', 'left-foot', 'right-foot'):
-            if foot_sam_regions is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': foot regions not computed."
-                )
-
-            # Rebuild the foot regions after the final prompt bboxes are known:
-            # keep the bbox/probe geometry unchanged, but regenerate the SAM
-            # point prompts with extra positives derived from chromatic/texture
-            # consistency along the ankle->foot_index axis.
-            foot_sam_regions = _rebuild_foot_regions_with_chromatic_prompt_points(
-                img_rgb=img_rgb,
-                pose_xy=pose_xy,
-                foot_sam_regions=foot_sam_regions,
-            )
-
-            foot_mask = np.zeros((h, w), dtype=bool)
-            for region in foot_sam_regions:
-                rx1, ry1, rx2, ry2 = region.prompt_bbox
-                foot_mask[ry1:ry2, rx1:rx2] = True
-
-        # -----------------------------
-        # Mask generation
-        # -----------------------------
         sam_model_id = cfg.sam_model
         processor, sam_model = get_sam(
             model_id=sam_model_id,
@@ -1964,284 +3293,25 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             dtype=cfg.dtype,
         )
 
-        if cfg.target == 'person':
-            # For full-body crops, neither strict nor complete prompting is universally
-            # better:
-            #
-            # - strict candidates are cleaner but can miss weak silhouette regions
-            # - complete candidates can preserve more silhouette but may attach artifacts
-            #
-            # We evaluate both families and select a conservative candidate using SAM
-            # score, normalized area, and weak tie-breakers.
-            candidates = _build_person_sam_candidates(
-                img_rgb=img_rgb,
-                bbox=(bx1, by1, bx2, by2),
-                pose_xy=pose_xy,
-                processor=processor,
-                model=sam_model,
-                device=cfg.device,
-                node_id=node_id,
-                use_landmarks=(cfg.min_landmark_fraction is not None),
-            )
+        ctx = SegmentationContext(
+            node_id=node_id,
+            cfg=cfg,
+            img_rgb=img_rgb,
+            pose_xy=pose_xy,
+            width=w,
+            height=h,
+            sam_processor=processor,
+            sam_model=sam_model,
+        )
+        segmentation = _segment_target(ctx)
 
-            mask = _select_best_person_sam_mask(
-                candidates,
-                bbox=(bx1, by1, bx2, by2),
-                pose_xy=pose_xy,
-                min_landmark_fraction=cfg.min_landmark_fraction,
-            ).astype(bool)
-
-        elif cfg.target in ('feet', 'left-foot', 'right-foot'):
-            if foot_sam_regions is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': foot regions not computed."
-                )
-
-            mask = np.zeros((h, w), dtype=bool)
-            foot_region_masks: list[np.ndarray] = []
-
-            for region in foot_sam_regions:
-                masks, scores = predict_sam_mask(
-                    img_rgb=img_rgb,
-                    bbox=region.prompt_bbox,
-                    processor=processor,
-                    model=sam_model,
-                    device=cfg.device,
-                    point_coords=region.point_coords,
-                    point_labels=region.point_labels,
-                )
-
-                foot_candidates = _build_sam_candidates_from_raw_masks(
-                    masks,
-                    scores,
-                    bbox=region.prompt_bbox,
-                    source='foot',
-                    node_id=node_id,
-                    include_inverted=True,
-                )
-                region_mask = _select_best_foot_sam_mask(
-                    foot_candidates,
-                    bbox=region.prompt_bbox,
-                    point_coords=region.point_coords,
-                    point_labels=region.point_labels,
-                    preferred_source='foot',
-                )
-
-                region_mask = _clip_foot_mask_to_bbox(
-                    region_mask,
-                    region.prompt_bbox,
-                )
-
-                if region.leg_probe_point is not None:
-                    # Probe pass:
-                    # Ask SAM what it segments when prompted only by the point above
-                    # the ankle, inside the same local foot bbox. If this probe mask
-                    # substantially covers the foot mask, lower leg and foot are
-                    # visually continuous (bare skin, sandals, flip-flops), so the
-                    # probe would be a harmful negative. If coverage is low, there is
-                    # likely a real discontinuity (pants/socks/shoes), so we rerun the
-                    # foot prompt with the probe point as a negative.
-                    probe_masks, probe_scores = predict_sam_mask(
-                        img_rgb=img_rgb,
-                        bbox=region.prompt_bbox,
-                        processor=processor,
-                        model=sam_model,
-                        device=cfg.device,
-                        point_coords=[region.leg_probe_point],
-                        point_labels=[1],
-                    )
-                    probe_candidates = _build_sam_candidates_from_raw_masks(
-                        probe_masks,
-                        probe_scores,
-                        bbox=region.prompt_bbox,
-                        source='leg-probe',
-                        node_id=node_id,
-                        include_inverted=True,
-                    )
-                    probe_mask = _select_best_guided_sam_mask(
-                        probe_candidates,
-                        bbox=region.prompt_bbox,
-                        required_points=[region.leg_probe_point],
-                        forbidden_points=None,
-                        min_required_fraction=1.0,
-                        target_norm_area=0.5,
-                        preferred_source='leg-probe',
-                        context='foot leg-probe SAM mask',
-                    )
-                    probe_mask = _clip_foot_mask_to_bbox(
-                        probe_mask,
-                        region.prompt_bbox,
-                    )
-                    probe_coverage = _foot_mask_coverage(region_mask, probe_mask)
-
-                    if probe_coverage < FOOT_LEG_PROBE_COVERAGE_THRESHOLD:
-                        refined_points = list(region.point_coords or [])
-                        refined_labels = list(region.point_labels or [])
-                        refined_points.append(region.leg_probe_point)
-                        refined_labels.append(0)
-
-                        refined_masks, refined_scores = predict_sam_mask(
-                            img_rgb=img_rgb,
-                            bbox=region.prompt_bbox,
-                            processor=processor,
-                            model=sam_model,
-                            device=cfg.device,
-                            point_coords=refined_points,
-                            point_labels=refined_labels,
-                        )
-                        refined_candidates = _build_sam_candidates_from_raw_masks(
-                            refined_masks,
-                            refined_scores,
-                            bbox=region.prompt_bbox,
-                            source='refined-foot',
-                            node_id=node_id,
-                            include_inverted=True,
-                        )
-                        region_mask = _select_best_foot_sam_mask(
-                            refined_candidates,
-                            bbox=region.prompt_bbox,
-                            point_coords=refined_points,
-                            point_labels=refined_labels,
-                            preferred_source='refined-foot',
-                        )
-                        region_mask = _clip_foot_mask_to_bbox(
-                            region_mask,
-                            region.prompt_bbox,
-                        )
-
-                foot_region_masks.append(region_mask)
-                mask |= region_mask
-
-            shape_part_masks = foot_region_masks
-
-        else:
-            point_coords = None
-            point_labels = None
-
-            if cfg.target in ('hands', 'left-hand', 'right-hand'):
-                # Use body pose points intentionally: SAM is asked to segment the selected
-                # person inside the person bbox. The target-local landmark mask is applied
-                # later to restrict the result to the requested hand region.
-                point_coords, point_labels = positive_points_for_sam(
-                    xy=pose_xy,
-                    bbox=(bx1, by1, bx2, by2),
-                )
-
-            masks, scores = predict_sam_mask(
-                img_rgb=img_rgb,
-                bbox=(bx1, by1, bx2, by2),
-                processor=processor,
-                model=sam_model,
-                device=cfg.device,
-                point_coords=point_coords,
-                point_labels=point_labels,
-            )
-
-            if masks is None or len(masks) == 0:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': SAM returned no masks."
-                )
-
-            best_mask = None
-            best_key = None
-
-            for i in range(len(masks)):
-                mi = masks[i].astype(bool)
-
-                score_i = (
-                    float(scores[i])
-                    if scores is not None and i < len(scores)
-                    else 0.0
-                )
-
-                if best_key is None or score_i > best_key:
-                    best_key = score_i
-                    best_mask = mi
-
-            if best_mask is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': failed to select a SAM mask."
-                )
-
-            mask = best_mask.astype(bool)
-
-        if cfg.target != 'person' and cfg.target not in (
-            'feet',
-            'left-foot',
-            'right-foot',
-        ):
-            valid = (
-                (pose_xy[:, 0] >= 0) &
-                (pose_xy[:, 1] >= 0)
-            )
-
-            pts = pose_xy[valid]
-
-            if len(pts) > 0:
-                inside = 0
-                mask_h, mask_w = mask.shape
-
-                for px, py in pts:
-                    px = int(px)
-                    py = int(py)
-
-                    if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
-                        inside += 1
-
-                min_inside = max(1, int(math.ceil(len(pts) * 0.5)))
-
-                if inside < min_inside:
-                    # SAM may occasionally return the local background instead of the prompted
-                    # subject region. For non-person targets, we use pose landmark coverage as a
-                    # cheap polarity sanity check: if too few pose points fall inside the mask, we
-                    # invert the mask inside the prompt bbox.
-                    mask = invert_mask_inside_box(
-                        mask=mask,
-                        box=(bx1, by1, bx2, by2)
-                    )
-
-        if cfg.target in ('hands', 'left-hand', 'right-hand'):
-            if hand_mask is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': hand_mask not computed."
-                )
-            # Keep only the hand-local part of the SAM subject mask.
-            # SAM separates subject vs background; the landmark mask constrains the
-            # result to the selected hand region(s).
-            mask = mask & hand_mask
-            shape_part_masks = hand_mask
-
-        if cfg.target == 'head':
-            head_region_mask = np.zeros((h, w), dtype=bool)
-            head_region_mask[fy1:fy2, fx1:fx2] = True
-
-            # SAM is guided by the resolved person bbox for robustness, so its
-            # raw mask can cover the whole subject. Restrict it back to the
-            # target-local head box before deriving crop geometry from the mask.
-            mask = mask & head_region_mask
-
-        if cfg.target in ('feet', 'left-foot', 'right-foot'):
-            if foot_mask is None:
-                raise RuntimeError(
-                    f"SubjectCrop node '{node_id}': foot_mask not computed."
-                )
-            # Keep only the foot-local part of the SAM subject mask.
-            # The expanded foot bbox is intentionally broad; SAM supplies the
-            # subject-vs-background boundary inside it.
-            mask = mask & foot_mask
+        mask = segmentation.mask.astype(bool)
+        shape_part_masks = segmentation.shape_part_masks
+        hint_x1, hint_y1, hint_x2, hint_y2 = segmentation.target_bbox
 
         # --------------------------------------------------
         # Build the final positive mask and derive output geometry from it.
         # --------------------------------------------------
-
-        if cfg.target == 'head':
-            hint_x1, hint_y1, hint_x2, hint_y2 = fx1, fy1, fx2, fy2
-        elif cfg.target in ('hands', 'left-hand', 'right-hand'):
-            hint_x1, hint_y1, hint_x2, hint_y2 = hx1, hy1, hx2, hy2
-        elif cfg.target in ('feet', 'left-foot', 'right-foot'):
-            hint_x1, hint_y1, hint_x2, hint_y2 = bx1, by1, bx2, by2
-        else:
-            hint_x1, hint_y1, hint_x2, hint_y2 = bx1, by1, bx2, by2
 
         cm = mask.astype(np.uint8)
         num, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -2249,16 +3319,10 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         )
 
         if num > 1:
-            if cfg.target in (
-                'hands',
-                'left-hand',
-                'right-hand',
-                'feet',
-                'left-foot',
-                'right-foot',
-            ):
-                # Keep all target-local components. This preserves paired hands,
-                # paired feet, and small disconnected extremity fragments.
+            if segmentation.preserve_all_components:
+                # Preserve target-local components selected by the target
+                # pipeline, such as paired hands/feet or small disconnected
+                # extremity fragments.
                 mask = (labels != 0)
 
             else:
@@ -2298,7 +3362,7 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
 
         if cfg.mode == 'default' and cfg.crop_mode is not None:
             if cfg.crop_mode.mode != 'full_frame':
-                crop_x1, crop_y1, crop_x2, crop_y2 = tight_alpha_bbox(
+                crop_x1, crop_y1, crop_x2, crop_y2 = tight_mask_bbox(
                     shape_mask.astype(np.uint8)
                 )
                 crop_x1, crop_y1, crop_x2, crop_y2 = expand_clip_bbox_by_size_expr(
@@ -2388,28 +3452,20 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
         # Optional debug bbox overlay
         dbg_path = None
         if cfg.save_debug:
-            dbg_x1, dbg_y1, dbg_x2, dbg_y2 = bx1, by1, bx2, by2
-            prompt_bbox_label = 'person'
-            if cfg.target == 'head':
-                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
-            elif cfg.target in ('hands', 'left-hand', 'right-hand'):
-                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = hx1, hy1, hx2, hy2
-            elif cfg.target in ('feet', 'left-foot', 'right-foot'):
-                dbg_x1, dbg_y1, dbg_x2, dbg_y2 = fx1, fy1, fx2, fy2
-                prompt_bbox_label = 'foot-prompt'
-
             dbg_path = write_crop_debug_overlay(
                 img_rgb=img_rgb,
                 out_path=out_path,
                 target=cfg.target,
                 pose_xy=pose_xy,
-                sam_prompt_bbox=(bx1, by1, bx2, by2),
-                target_bbox=(dbg_x1, dbg_y1, dbg_x2, dbg_y2),
-                hands_res=debug_hands_res,
-                face_xy=debug_face_xy,
+                sam_prompt_bbox=segmentation.prompt_bbox,
+                target_bbox=segmentation.target_bbox,
+                hands_res=segmentation.hands_result,
+                face_xy=segmentation.face_xy,
                 mask=debug_mask,
-                foot_sam_regions=foot_sam_regions,
-                prompt_bbox_label=prompt_bbox_label,
+                sam_regions=segmentation.sam_regions,
+                prompt_bbox_label=segmentation.prompt_bbox_label,
+                region_masks=segmentation.debug_region_masks,
+                edge_masks=segmentation.debug_edge_masks,
             )
 
         b_width = int(out_x2 - out_x1)

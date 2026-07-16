@@ -15,10 +15,10 @@ from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
-                                             remove_small_components,
                                              resolve_min_component_area,
                                              round_up,
                                              validate_min_component_area)
+from morphalo.nodes.preprocess.utils.mask_ops import remove_small_components
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
 

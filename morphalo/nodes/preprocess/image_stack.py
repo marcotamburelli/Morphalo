@@ -9,12 +9,13 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils import (Point, PositionSpec, ResizeMode,
+from morphalo.nodes.preprocess.utils import (PositionSpec, ResizeMode,
                                              SizeExpr, SpatialTransform,
                                              merge_spatial_transform,
                                              read_spatial_transform,
                                              resolve_size_expr,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import Point
 
 CornerDelta = tuple[SizeExpr, SizeExpr] | None
 

@@ -16,24 +16,21 @@ from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.segmentation import predict_sam_mask
-from morphalo.nodes.preprocess.segmentation_helper import (
-    select_image_side_mask_candidate)
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask,
-                                             cleanup_shape_mask_by_parts,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox_by_size_expr,
-                                             expand_clip_bbox,
-                                             invert_mask_inside_box,
-                                             offset_bbox_xyxy,
-                                             offset_landmarks_xy,
                                              parse_crop_mode,
                                              positive_points_for_sam,
-                                             prepare_output_mask,
                                              read_shape_cleanup_config,
-                                             tight_alpha_bbox,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import (
+    expand_clip_bbox, expand_clip_bbox_by_size_expr, offset_bbox_xyxy,
+    offset_landmarks_xy, tight_mask_bbox)
+from morphalo.nodes.preprocess.utils.mask_ops import (
+    cleanup_shape_mask, cleanup_shape_mask_by_parts, invert_mask_inside_box,
+    prepare_output_mask)
+from morphalo.nodes.preprocess.utils.mask_selection import \
+    select_image_side_mask_candidate
+from morphalo.nodes.preprocess.utils.sam import predict_sam_mask
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.face_region import (eye_mask_from_landmarks,
                                                eyebrow_mask_from_landmarks,
@@ -935,7 +932,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                 )
                 shape_part_masks = feature_mask
 
-            bx1, by1, bx2, by2 = tight_alpha_bbox(
+            bx1, by1, bx2, by2 = tight_mask_bbox(
                 feature_mask.astype(np.uint8)
             )
 
@@ -1090,7 +1087,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
         if cfg.mode == 'default' and cfg.crop_mode is not None:
             if cfg.crop_mode.mode != 'full_frame':
-                crop_x1, crop_y1, crop_x2, crop_y2 = tight_alpha_bbox(
+                crop_x1, crop_y1, crop_x2, crop_y2 = tight_mask_bbox(
                     shape_mask.astype(np.uint8)
                 )
                 crop_x1, crop_y1, crop_x2, crop_y2 = expand_clip_bbox_by_size_expr(

@@ -4,6 +4,10 @@ from typing import Optional
 
 import numpy as np
 
+from morphalo.nodes.preprocess.utils.geometry import (expand_clip_bbox,
+                                                      segment_capsule_mask,
+                                                      tight_mask_bbox)
+
 
 @dataclass(frozen=True)
 class PoseLandmarksResult:
@@ -1546,53 +1550,106 @@ _FOOT_LENGTH_MIN_PX = 18.0
 _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_RATIO = 0.16
 _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MIN_PX = 10.0
 _FOOT_CROSSED_LEG_ANKLE_NEAR_AXIS_MAX_PX = 32.0
+_ARM_LANDMARKS = {
+    'anatomical-left': {
+        'shoulder': 11,
+        'elbow': 13,
+        'wrist': 15,
+    },
+    'anatomical-right': {
+        'shoulder': 12,
+        'elbow': 14,
+        'wrist': 16,
+    },
+}
+_ARM_SHOULDER_RADIUS_EXPANSION = 1.15
 
 
 @dataclass(frozen=True)
-class FootSamRegion:
+class SamRegion:
     """
-    Foot-local SAM prompt region.
+    Target-local SAM prompt region.
 
-    ``base_bbox`` is the landmark/proportion-derived foot box. ``prompt_bbox``
-    may be expanded toward the person bbox and is intended only as SAM search
-    space.
+    This is a generic region contract for target pipelines that segment one or
+    more local regions independently before unioning their masks. Foot
+    segmentation is the first caller, but the same shape can support future arm
+    or leg regions.
 
-    ``point_coords`` / ``point_labels`` are the normal foot prompt:
-    ankle and foot_index are positive; optional image-aware positive points may
-    be inserted by the caller; an optional point from the opposite foot can be
-    negative when it is clearly outside ``base_bbox``.
+    ``base_bbox`` is the target-local geometry used for crop/debug purposes.
+    ``prompt_bbox`` is the local SAM search area and may be wider than
+    ``base_bbox`` when contextual pixels improve segmentation.
 
-    ``leg_probe_point`` is deliberately kept separate. It is a point above the
-    ankle, toward the knee, placed inside ``prompt_bbox``. Callers can use it as
-    a positive probe to test whether SAM sees visual continuity between lower
-    leg and foot before deciding whether to reuse it as a negative point.
+    ``point_coords`` / ``point_labels`` are the normal SAM prompt for the
+    region. For feet, ankle and foot_index are positive points, optional
+    image-aware positives may be inserted by the caller, and an optional point
+    from the opposite foot can be negative when it is clearly outside
+    ``base_bbox``.
+
+    ``probe_point`` is deliberately kept separate from the normal prompt.
+    Callers can use it for a target-specific probe pass before deciding whether
+    it should become a negative prompt. For feet, this is the adaptive
+    lower-leg continuity probe.
 
     Parameters
     ----------
     side : str
-        Anatomical side label, either ``'anatomical-left'`` or
-        ``'anatomical-right'``.
+        Region side or identity label. For foot regions this is usually
+        ``'anatomical-left'`` or ``'anatomical-right'``.
     base_bbox : tuple[int, int, int, int]
-        Landmark/proportion-derived foot bbox before expansion toward the
-        person bbox. This is the red target/base box in the foot debug overlay.
+        Target-local bbox before prompt expansion. This is the red target/base
+        box in debug overlays.
     prompt_bbox : tuple[int, int, int, int]
-        Foot-local bbox passed to SAM. It may be expanded toward the person bbox
-        and is the cyan prompt/search box in the foot debug overlay.
+        Local bbox passed to SAM. This is the cyan prompt/search box in debug
+        overlays.
     point_coords : list[list[float]] or None
-        SAM point coordinates for the normal foot prompt.
+        SAM point coordinates for the normal region prompt.
     point_labels : list[int] or None
         SAM point labels aligned with ``point_coords``. ``1`` means positive and
         ``0`` means negative.
-    leg_probe_point : list[float] or None
-        Optional lower-leg point inside ``prompt_bbox`` used for the adaptive
-        leg-continuity probe.
+    probe_point : list[float] or None
+        Optional target-specific probe point inside ``prompt_bbox``.
     """
     side: str
     base_bbox: tuple[int, int, int, int]
     prompt_bbox: tuple[int, int, int, int]
     point_coords: Optional[list[list[float]]]
     point_labels: Optional[list[int]]
-    leg_probe_point: Optional[list[float]]
+    probe_point: Optional[list[float]]
+
+
+@dataclass(frozen=True)
+class ArmRegionGeometry:
+    """
+    Geometry required to segment and refine one arm region.
+
+    Parameters
+    ----------
+    sam_region : SamRegion
+        SAM crop and point prompts for the arm.
+    prior_mask : np.ndarray
+        Coarse full-frame mask used only to neutralize pixels before SAM.
+    skeleton_mask : np.ndarray
+        Thin full-frame shoulder-elbow-wrist centerline used to filter Canny
+        edges by distance from the expected arm axis.
+    synthetic_barrier_mask : np.ndarray
+        Thin full-frame artificial barriers closing the arm at shoulder and
+        wrist. These pixels are used only as flood-fill barriers.
+    shoulder_circle_mask : np.ndarray
+        Filled full-frame shoulder restoration domain. Only pixels selected by SAM
+        inside this circle are restored after flood-fill.
+    shoulder_quadrant_mask : np.ndarray
+        Full-frame external shoulder quadrant. Only the portion also selected
+        by SAM is restored after flood-fill.
+    tube_radius : float
+        Radius used to construct the coarse arm tube.
+    """
+    sam_region: SamRegion
+    prior_mask: np.ndarray
+    skeleton_mask: np.ndarray
+    synthetic_barrier_mask: np.ndarray
+    shoulder_circle_mask: np.ndarray
+    shoulder_quadrant_mask: np.ndarray
+    tube_radius: float
 
 
 def _valid_pose_point(pose_xy: np.ndarray, idx: int) -> Optional[np.ndarray]:
@@ -1621,6 +1678,765 @@ def _valid_pose_point(pose_xy: np.ndarray, idx: int) -> Optional[np.ndarray]:
         return None
 
     return p.astype(np.float32, copy=False)
+
+
+def _select_arm_sides(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+) -> list[str]:
+    """
+    Select anatomical arm sides using image/viewer target semantics.
+    """
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    sides = list(_ARM_LANDMARKS.keys())
+    if which == 'both':
+        return sides
+
+    visible: list[tuple[float, str]] = []
+    for side, ids in _ARM_LANDMARKS.items():
+        shoulder = _valid_pose_point(pose_xy, ids['shoulder'])
+        if shoulder is not None:
+            visible.append((float(shoulder[0]), side))
+
+    if not visible:
+        raise RuntimeError('No valid shoulder landmarks for arm target.')
+
+    visible.sort(key=lambda item: item[0])
+    if len(visible) >= 2:
+        return [visible[0][1] if which == 'left' else visible[-1][1]]
+
+    _, w = image_shape[:2]
+    center_x, side = visible[0]
+    if which == 'left' and center_x <= 0.5 * float(w):
+        return [side]
+    if which == 'right' and center_x >= 0.5 * float(w):
+        return [side]
+
+    raise RuntimeError(
+        f'Could not reliably select {which} arm from a single visible shoulder.'
+    )
+
+
+def arm_segments_from_landmarks(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Return valid pose landmark segments for one anatomical arm side.
+    """
+    if side not in _ARM_LANDMARKS:
+        raise ValueError(f'Unknown arm side {side!r}.')
+
+    ids = _ARM_LANDMARKS[side]
+    shoulder = _valid_pose_point(pose_xy, ids['shoulder'])
+    elbow = _valid_pose_point(pose_xy, ids['elbow'])
+    wrist = _valid_pose_point(pose_xy, ids['wrist'])
+
+    if shoulder is None:
+        return []
+
+    chain = [shoulder]
+    if elbow is not None:
+        chain.append(elbow)
+    if wrist is not None:
+        chain.append(wrist)
+
+    segments: list[tuple[np.ndarray, np.ndarray]] = []
+    for start, end in zip(chain, chain[1:]):
+        if float(np.linalg.norm(end - start)) >= 2.0:
+            segments.append((start, end))
+
+    return segments
+
+
+def _estimate_shoulder_radius(
+    silhouette: np.ndarray,
+    *,
+    shoulder: np.ndarray,
+    other_shoulder: np.ndarray,
+    elbow: Optional[np.ndarray],
+    image_shape: tuple[int, ...],
+) -> float:
+    """
+    Estimate shoulder-cap radius by probing the person silhouette outward.
+    """
+    h, w = image_shape[:2]
+    shoulder_width = float(np.linalg.norm(shoulder - other_shoulder))
+    fallback = max(12.0, shoulder_width * 0.35)
+
+    external = shoulder - other_shoulder
+    external_len = float(np.linalg.norm(external))
+    if external_len < 1.0:
+        return fallback
+
+    external = external / external_len
+    max_probe = max(fallback * 2.0, shoulder_width * 0.9)
+    last_inside: Optional[float] = None
+
+    for dist in np.linspace(0.0, max_probe, num=max(8, int(max_probe))):
+        p = shoulder + external * float(dist)
+        px = int(round(float(p[0])))
+        py = int(round(float(p[1])))
+        if px < 0 or px >= w or py < 0 or py >= h:
+            break
+
+        if silhouette[py, px]:
+            last_inside = float(dist)
+        elif last_inside is not None:
+            break
+
+    if last_inside is None or last_inside < 2.0:
+        return fallback
+
+    upper_arm_len = (
+        float(np.linalg.norm(elbow - shoulder))
+        if elbow is not None
+        else shoulder_width * 0.75
+    )
+    min_radius = max(8.0, shoulder_width * 0.18)
+    max_radius = max(
+        min_radius + 1.0,
+        min(shoulder_width * 0.70, upper_arm_len * 0.75),
+    )
+    expanded = last_inside * _ARM_SHOULDER_RADIUS_EXPANSION
+    return float(np.clip(expanded, min_radius, max_radius))
+
+
+def _arm_sam_points_for_side(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+    prior_mask: np.ndarray,
+    prompt_bbox: tuple[int, int, int, int],
+    additional_positive_points: Optional[list[list[float]]] = None,
+) -> tuple[Optional[list[list[float]]], Optional[list[int]]]:
+    """
+    Build SAM point prompts for one arm region.
+    """
+    ids = _ARM_LANDMARKS[side]
+    points: list[list[float]] = []
+    labels: list[int] = []
+    h, w = prior_mask.shape[:2]
+
+    for name in ('shoulder', 'elbow', 'wrist'):
+        p = _valid_pose_point(pose_xy, ids[name])
+        if p is None:
+            continue
+        px = int(round(float(p[0])))
+        py = int(round(float(p[1])))
+        if 0 <= px < w and 0 <= py < h and prior_mask[py, px]:
+            points.append([float(p[0]), float(p[1])])
+            labels.append(1)
+
+    if additional_positive_points:
+        for point in additional_positive_points:
+            if len(point) < 2:
+                continue
+            px, py = point[:2]
+            px_i = int(round(float(px)))
+            py_i = int(round(float(py)))
+            if 0 <= px_i < w and 0 <= py_i < h and prior_mask[py_i, px_i]:
+                points.append([float(px), float(py)])
+                labels.append(1)
+
+    shoulder = _valid_pose_point(pose_xy, ids['shoulder'])
+    if shoulder is not None:
+        other_side = (
+            'anatomical-right'
+            if side == 'anatomical-left'
+            else 'anatomical-left'
+        )
+        other_shoulder = _valid_pose_point(
+            pose_xy,
+            _ARM_LANDMARKS[other_side]['shoulder'],
+        )
+        left_shoulder = _valid_pose_point(
+            pose_xy,
+            _ARM_LANDMARKS['anatomical-left']['shoulder'],
+        )
+        right_shoulder = _valid_pose_point(
+            pose_xy,
+            _ARM_LANDMARKS['anatomical-right']['shoulder'],
+        )
+        negative_candidates = []
+        if other_shoulder is not None:
+            negative_candidates.append(other_shoulder)
+        if left_shoulder is not None and right_shoulder is not None:
+            negative_candidates.append((left_shoulder + right_shoulder) * 0.5)
+
+        px1, py1, px2, py2 = prompt_bbox
+        for p in negative_candidates:
+            px = int(round(float(p[0])))
+            py = int(round(float(p[1])))
+            if not (px1 <= px < px2 and py1 <= py < py2):
+                continue
+            if 0 <= px < w and 0 <= py < h and prior_mask[py, px]:
+                continue
+            points.append([float(p[0]), float(p[1])])
+            labels.append(0)
+
+    if not any(label == 1 for label in labels):
+        ys, xs = np.where(prior_mask)
+        if xs.size > 0:
+            points.append([float(xs.mean()), float(ys.mean())])
+            labels.append(1)
+
+    if not points:
+        return None, None
+
+    return points, labels
+
+
+def arm_regions_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    silhouette: np.ndarray,
+    which: str,
+    expansion: float = 1.0,
+    additional_positive_points_by_side: Optional[
+        dict[str, list[list[float]]]
+    ] = None,
+) -> list[ArmRegionGeometry]:
+    """
+    Build the geometry required to segment one or more arm regions.
+
+    The function converts MediaPipe shoulder, elbow, and wrist landmarks into
+    independent arm-local segmentation geometries.
+
+    For each selected arm, it builds:
+
+    - a coarse filled prior used only to neutralize pixels before SAM;
+    - a thin shoulder-to-elbow-to-wrist skeleton;
+    - thin synthetic barriers closing the arm at the shoulder and wrist;
+    - a filled shoulder circle that can be restored after Canny refinement;
+    - an external shoulder quadrant used to restore only the portion selected
+      by SAM;
+    - a generic ``SamRegion`` containing the local crop and point prompts.
+
+    The coarse prior is not a final arm mask and must not be restored after
+    flood-fill. It exists only to restrict the visual content shown to SAM.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-image coordinates. Missing landmarks
+        must be encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only height and width are used.
+    silhouette : np.ndarray
+        Full-frame boolean person silhouette.
+    which : {'left', 'right', 'both'}
+        Requested arm selection in image/viewer perspective.
+    expansion : float, default=1.0
+        Multiplicative expansion applied to the estimated arm radius.
+        Values below ``1.0`` are treated as ``1.0``.
+    additional_positive_points_by_side : dict or None, optional
+        Additional positive SAM points keyed by anatomical side.
+
+    Returns
+    -------
+    list[ArmRegionGeometry]
+        One complete geometry object for every selected arm.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If the shoulder landmarks or arm geometry are insufficient.
+    """
+    import cv2
+
+    h, w = image_shape[:2]
+    silhouette_bool = silhouette.astype(bool)
+
+    selected_sides = _select_arm_sides(
+        pose_xy,
+        image_shape,
+        which=which,
+    )
+
+    left_shoulder = _valid_pose_point(
+        pose_xy,
+        _ARM_LANDMARKS['anatomical-left']['shoulder'],
+    )
+    right_shoulder = _valid_pose_point(
+        pose_xy,
+        _ARM_LANDMARKS['anatomical-right']['shoulder'],
+    )
+
+    if left_shoulder is None or right_shoulder is None:
+        raise RuntimeError(
+            'Arm targets require both shoulder landmarks.'
+        )
+
+    shoulder_axis = right_shoulder - left_shoulder
+    shoulder_width = float(np.linalg.norm(shoulder_axis))
+
+    if shoulder_width < 4.0:
+        raise RuntimeError(
+            'Shoulder landmarks are too close for arm geometry.'
+        )
+
+    shoulder_axis_len = max(shoulder_width, 1e-6)
+    shoulder_mid = 0.5 * (left_shoulder + right_shoulder)
+
+    head_point = _valid_pose_point(pose_xy, 0)
+    if head_point is None:
+        head_point = shoulder_mid + np.asarray(
+            [0.0, -shoulder_width],
+            dtype=np.float32,
+        )
+
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    # Determine which side of the shoulder axis contains the head.
+    head_cross = (
+        float(shoulder_axis[0])
+        * float(head_point[1] - shoulder_mid[1])
+        - float(shoulder_axis[1])
+        * float(head_point[0] - shoulder_mid[0])
+    )
+    head_side = 1.0 if head_cross >= 0.0 else -1.0
+
+    rel_mid_x = xx - float(shoulder_mid[0])
+    rel_mid_y = yy - float(shoulder_mid[1])
+    grid_cross_from_shoulders = (
+        float(shoulder_axis[0]) * rel_mid_y
+        - float(shoulder_axis[1]) * rel_mid_x
+    )
+
+    arm_geometries: list[ArmRegionGeometry] = []
+
+    for side in selected_sides:
+        ids = _ARM_LANDMARKS[side]
+
+        shoulder = _valid_pose_point(
+            pose_xy,
+            ids['shoulder'],
+        )
+        elbow = _valid_pose_point(
+            pose_xy,
+            ids['elbow'],
+        )
+        wrist = _valid_pose_point(
+            pose_xy,
+            ids['wrist'],
+        )
+
+        if shoulder is None:
+            continue
+
+        other_shoulder = (
+            right_shoulder
+            if side == 'anatomical-left'
+            else left_shoulder
+        )
+
+        segments = arm_segments_from_landmarks(
+            pose_xy,
+            side=side,
+        )
+        if not segments:
+            continue
+
+        radius = _estimate_shoulder_radius(
+            silhouette_bool,
+            shoulder=shoulder,
+            other_shoulder=other_shoulder,
+            elbow=elbow,
+            image_shape=image_shape,
+        )
+        radius *= max(1.0, float(expansion))
+
+        # -------------------------------------------------------------
+        # Arm tube
+        # -------------------------------------------------------------
+        tube_mask = np.zeros((h, w), dtype=bool)
+
+        for start, end in segments:
+            tube_mask |= segment_capsule_mask(
+                image_shape,
+                start,
+                end,
+                radius,
+            )
+
+        # -------------------------------------------------------------
+        # Thin centerline used to filter Canny components by distance.
+        # -------------------------------------------------------------
+        skeleton_u8 = np.zeros((h, w), dtype=np.uint8)
+
+        for start, end in segments:
+            start_xy = tuple(
+                int(value)
+                for value in np.rint(start)
+            )
+            end_xy = tuple(
+                int(value)
+                for value in np.rint(end)
+            )
+
+            cv2.line(
+                skeleton_u8,
+                start_xy,
+                end_xy,
+                255,
+                thickness=1,
+                lineType=cv2.LINE_8,
+            )
+
+        for point in (shoulder, elbow, wrist):
+            if point is None:
+                continue
+
+            point_xy = tuple(
+                int(value)
+                for value in np.rint(point)
+            )
+
+            cv2.circle(
+                skeleton_u8,
+                point_xy,
+                1,
+                255,
+                thickness=-1,
+                lineType=cv2.LINE_8,
+            )
+
+        skeleton_mask = skeleton_u8 > 0
+
+        # -------------------------------------------------------------
+        # Filled shoulder circle.
+        #
+        # This is trusted geometric support and may be restored after the
+        # Canny/flood-fill stage.
+        # -------------------------------------------------------------
+        shoulder_circle_mask = (
+            np.hypot(
+                xx - float(shoulder[0]),
+                yy - float(shoulder[1]),
+            )
+            <= radius
+        )
+
+        # -------------------------------------------------------------
+        # External shoulder quadrant.
+        #
+        # First keep the half-plane on the head side of the shoulder line.
+        # Then keep the outward side of the perpendicular passing through the
+        # selected shoulder.
+        # -------------------------------------------------------------
+        head_halfplane = (
+            head_side * grid_cross_from_shoulders
+        ) >= -0.35 * radius * shoulder_axis_len
+
+        outward_vector = shoulder - other_shoulder
+        outward_length = float(np.linalg.norm(outward_vector))
+
+        if outward_length < 1e-6:
+            continue
+
+        outward_unit = outward_vector / outward_length
+
+        rel_shoulder_x = xx - float(shoulder[0])
+        rel_shoulder_y = yy - float(shoulder[1])
+
+        outward_projection = (
+            rel_shoulder_x * float(outward_unit[0])
+            + rel_shoulder_y * float(outward_unit[1])
+        )
+
+        outward_halfplane = (
+            outward_projection >= -0.35 * radius
+        )
+
+        shoulder_quadrant = (
+            head_halfplane
+            & outward_halfplane
+        )
+
+        # Only actual person-silhouette pixels in the shoulder quadrant may be
+        # restored from the SAM result later.
+        shoulder_quadrant_mask = (
+            silhouette_bool
+            & shoulder_quadrant
+        )
+
+        # -------------------------------------------------------------
+        # Additional torso-side rejection used only for the coarse SAM prior.
+        # -------------------------------------------------------------
+        first_segment_start, first_segment_end = segments[0]
+        upper_arm_axis = first_segment_end - first_segment_start
+        upper_arm_axis_len = float(np.linalg.norm(upper_arm_axis))
+
+        torso_center = shoulder_mid
+
+        if upper_arm_axis_len >= 2.0:
+            cross_to_torso = (
+                float(upper_arm_axis[0])
+                * float(torso_center[1] - shoulder[1])
+                - float(upper_arm_axis[1])
+                * float(torso_center[0] - shoulder[0])
+            )
+
+            cross_grid = (
+                float(upper_arm_axis[0]) * rel_shoulder_y
+                - float(upper_arm_axis[1]) * rel_shoulder_x
+            )
+
+            if abs(cross_to_torso) > 1e-3:
+                torso_side = (
+                    1.0
+                    if cross_to_torso > 0.0
+                    else -1.0
+                )
+
+                arm_outer_halfplane = (
+                    torso_side * cross_grid
+                    <= radius * upper_arm_axis_len
+                )
+            else:
+                arm_outer_halfplane = np.ones(
+                    (h, w),
+                    dtype=bool,
+                )
+        else:
+            arm_outer_halfplane = np.ones(
+                (h, w),
+                dtype=bool,
+            )
+
+        silhouette_branch = (
+            shoulder_quadrant_mask
+            & arm_outer_halfplane
+        )
+
+        # -------------------------------------------------------------
+        # Coarse prior shown to SAM.
+        #
+        # This mask is used only to neutralize pixels outside the plausible arm
+        # region. It must not be restored after flood-fill.
+        # -------------------------------------------------------------
+        arm_support_mask = (
+            silhouette_bool
+            & (
+                tube_mask
+                | shoulder_circle_mask
+            )
+        )
+
+        sam_prior_mask = (
+            silhouette_branch
+            | arm_support_mask
+        )
+
+        # Remove geometry extending past the wrist.
+        if wrist is not None and elbow is not None:
+            forearm_vector = wrist - elbow
+            forearm_length = float(
+                np.linalg.norm(forearm_vector)
+            )
+
+            if forearm_length >= 2.0:
+                forearm_unit = (
+                    forearm_vector / forearm_length
+                )
+
+                after_wrist = (
+                    (
+                        xx - float(wrist[0])
+                    ) * float(forearm_unit[0])
+                    + (
+                        yy - float(wrist[1])
+                    ) * float(forearm_unit[1])
+                ) > radius * 0.20
+
+                sam_prior_mask &= ~after_wrist
+
+                # Restore only the portion of the shoulder circle that belongs to the
+                # segmented person silhouette.
+                sam_prior_mask |= (
+                    shoulder_circle_mask
+                    & silhouette_bool
+                )
+
+        if not np.any(sam_prior_mask):
+            continue
+
+        # -------------------------------------------------------------
+        # Synthetic flood-fill barriers.
+        #
+        # These are thin lines only. They are never restored as mask regions.
+        # -------------------------------------------------------------
+        synthetic_barriers_u8 = np.zeros(
+            (h, w),
+            dtype=np.uint8,
+        )
+
+        # Shoulder barrier:
+        #
+        # Close the arm flood-fill domain with the circumference of the same
+        # shoulder circle that will later be restored as trusted geometric support.
+        # The filled circle and its boundary have deliberately different roles:
+        #
+        # - the circumference is a flood-fill barrier;
+        # - the filled circle is added back to the refined arm mask afterward.
+        shoulder_center_xy = tuple(
+            int(value)
+            for value in np.rint(shoulder)
+        )
+        shoulder_radius_px = max(
+            1,
+            int(round(radius)),
+        )
+
+        cv2.circle(
+            synthetic_barriers_u8,
+            shoulder_center_xy,
+            shoulder_radius_px,
+            255,
+            thickness=1,
+            lineType=cv2.LINE_8,
+        )
+
+        # Wrist barrier: perpendicular to the final forearm segment.
+        if elbow is not None and wrist is not None:
+            forearm_vector = wrist - elbow
+            forearm_length = float(
+                np.linalg.norm(forearm_vector)
+            )
+
+            if forearm_length >= 2.0:
+                forearm_unit = (
+                    forearm_vector / forearm_length
+                )
+                forearm_normal = np.asarray(
+                    [
+                        -forearm_unit[1],
+                        forearm_unit[0],
+                    ],
+                    dtype=np.float32,
+                )
+
+                wrist_barrier_start = (
+                    wrist - forearm_normal * radius
+                )
+                wrist_barrier_end = (
+                    wrist + forearm_normal * radius
+                )
+
+                cv2.line(
+                    synthetic_barriers_u8,
+                    tuple(
+                        int(value)
+                        for value in np.rint(
+                            wrist_barrier_start
+                        )
+                    ),
+                    tuple(
+                        int(value)
+                        for value in np.rint(
+                            wrist_barrier_end
+                        )
+                    ),
+                    255,
+                    thickness=1,
+                    lineType=cv2.LINE_8,
+                )
+
+        synthetic_barrier_mask = (
+            synthetic_barriers_u8 > 0
+        )
+
+        # -------------------------------------------------------------
+        # SAM region and point prompts.
+        # -------------------------------------------------------------
+        base_bbox = tight_mask_bbox(
+            sam_prior_mask.astype(np.uint8)
+        )
+
+        prompt_bbox = expand_clip_bbox(
+            *base_bbox,
+            w,
+            h,
+            max(
+                0.08,
+                min(
+                    0.30,
+                    0.12 * max(
+                        1.0,
+                        float(expansion),
+                    ),
+                ),
+            ),
+        )
+
+        point_coords, point_labels = (
+            _arm_sam_points_for_side(
+                pose_xy,
+                side=side,
+                prior_mask=sam_prior_mask,
+                prompt_bbox=prompt_bbox,
+                additional_positive_points=(
+                    additional_positive_points_by_side
+                    or {}
+                ).get(side),
+            )
+        )
+
+        sam_region = SamRegion(
+            side=side,
+            base_bbox=base_bbox,
+            prompt_bbox=prompt_bbox,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            probe_point=None,
+        )
+
+        arm_geometries.append(
+            ArmRegionGeometry(
+                sam_region=sam_region,
+                prior_mask=sam_prior_mask,
+                skeleton_mask=skeleton_mask,
+                synthetic_barrier_mask=(
+                    synthetic_barrier_mask
+                ),
+                shoulder_circle_mask=(
+                    shoulder_circle_mask
+                ),
+                shoulder_quadrant_mask=(
+                    shoulder_quadrant_mask
+                ),
+                tube_radius=float(radius),
+            )
+        )
+
+    if not arm_geometries:
+        missing_landmarks = [
+            name
+            for name, point in (
+                ('shoulder', shoulder),
+                ('elbow', elbow),
+                ('wrist', wrist),
+            )
+            if point is None
+        ]
+
+        raise RuntimeError(
+            f'Could not derive {side} arm geometry: '
+            f'missing usable landmarks {missing_landmarks!r}.'
+        )
+
+    return arm_geometries
 
 
 def _point_segment_distance(
@@ -1691,7 +2507,8 @@ def _segments_intersect_2d(
     def on_segment(p: np.ndarray, q: np.ndarray, r: np.ndarray) -> bool:
         return (
             min(float(p[0]), float(r[0])) <= float(q[0]) <= max(float(p[0]), float(r[0])) and
-            min(float(p[1]), float(r[1])) <= float(q[1]) <= max(float(p[1]), float(r[1]))
+            min(float(p[1]), float(r[1])) <= float(
+                q[1]) <= max(float(p[1]), float(r[1]))
         )
 
     o1 = orient(a1, a2, b1)
@@ -2449,7 +3266,7 @@ def _foot_sam_points_for_side(
     leg, where skin continuity can confuse the segmentation.
 
     The lower-leg point is *not* added here. It is exposed separately as a probe
-    by ``_foot_leg_probe_point_for_side`` so callers can decide dynamically
+    by ``_foot_probe_point_for_side`` so callers can decide dynamically
     whether it should become a negative prompt.
 
     Parameters
@@ -2654,7 +3471,7 @@ def _foot_sam_points_for_side(
     return points, labels
 
 
-def _foot_leg_probe_point_for_side(
+def _foot_probe_point_for_side(
     pose_xy: np.ndarray,
     *,
     side: str,
@@ -2748,15 +3565,16 @@ def _foot_leg_probe_point_for_side(
     return [float(probe[0]), float(probe[1])]
 
 
-def feet_sam_regions_from_landmarks(
+def foot_sam_regions_from_landmarks(
     pose_xy: np.ndarray,
     image_shape: tuple[int, ...],
     *,
     which: str,
     expansion: float = 1.8,
     person_bbox: Optional[tuple[int, int, int, int]] = None,
-    additional_positive_points_by_side: Optional[dict[str, list[list[float]]]] = None,
-) -> list[FootSamRegion]:
+    additional_positive_points_by_side: Optional[dict[str,
+                                                      list[list[float]]]] = None,
+) -> list[SamRegion]:
     """
     Build foot-local SAM regions.
 
@@ -2783,9 +3601,9 @@ def feet_sam_regions_from_landmarks(
 
     Returns
     -------
-    list[FootSamRegion]
+    list[SamRegion]
         One region per selected foot, each containing base bbox, prompt bbox,
-        normal SAM points and optional leg probe point.
+        normal SAM points and optional lower-leg probe point.
 
     Raises
     ------
@@ -2802,7 +3620,7 @@ def feet_sam_regions_from_landmarks(
         person_bbox=None,
     )
 
-    regions: list[FootSamRegion] = []
+    regions: list[SamRegion] = []
 
     for side, base_bbox, _ in selected:
         prompt_bbox = _expand_foot_box_toward_person_edge(
@@ -2820,40 +3638,47 @@ def feet_sam_regions_from_landmarks(
                 additional_positive_points_by_side or {}
             ).get(side),
         )
-        leg_probe_point = _foot_leg_probe_point_for_side(
+        probe_point = _foot_probe_point_for_side(
             pose_xy,
             side=side,
             prompt_bbox=prompt_bbox,
         )
-        regions.append(FootSamRegion(
+        regions.append(SamRegion(
             side=side,
             base_bbox=base_bbox,
             prompt_bbox=prompt_bbox,
             point_coords=point_coords,
             point_labels=point_labels,
-            leg_probe_point=leg_probe_point,
+            probe_point=probe_point,
         ))
 
     return regions
 
 
 def foot_sam_region_with_prompt_bbox(
-    region: FootSamRegion,
+    region: SamRegion,
     pose_xy: np.ndarray,
     prompt_bbox: tuple[int, int, int, int],
-    additional_positive_points_by_side: Optional[dict[str, list[list[float]]]] = None,
-) -> FootSamRegion:
+    additional_positive_points_by_side: Optional[dict[str,
+                                                      list[list[float]]]] = None,
+) -> SamRegion:
     """
-    Return ``region`` with an updated prompt bbox and recomputed SAM points.
+    Return a foot ``SamRegion`` with an updated prompt bbox.
 
-    ``SubjectCrop`` may expand prompt bboxes with ``box_margin`` after the
-    initial region is built. The leg probe point depends on the exact prompt box,
-    so it must be recomputed instead of copied.
+    This helper returns the generic ``SamRegion`` container, but its semantics
+    are foot-specific: it recomputes prompt points with
+    ``_foot_sam_points_for_side`` and the adaptive probe with
+    ``_foot_probe_point_for_side``. It should therefore not be reused for other
+    target families such as arms or legs.
+
+    ``SubjectCrop`` may expand foot prompt bboxes after the initial region is
+    built. Foot prompt points can depend on the exact prompt box, so they must
+    be recomputed instead of copied.
 
     Parameters
     ----------
-    region : FootSamRegion
-        Existing foot region.
+    region : SamRegion
+        Existing foot SAM region.
     pose_xy : np.ndarray
         MediaPipe pose landmarks in image coordinates.
     prompt_bbox : tuple[int, int, int, int]
@@ -2863,9 +3688,10 @@ def foot_sam_region_with_prompt_bbox(
 
     Returns
     -------
-    FootSamRegion
-        Updated region preserving ``side`` and ``base_bbox`` while recomputing
-        normal prompt points and ``leg_probe_point`` for ``prompt_bbox``.
+    SamRegion
+        Updated foot region preserving ``side`` and ``base_bbox`` while
+        recomputing normal foot prompt points and ``probe_point`` for
+        ``prompt_bbox``.
     """
     point_coords, point_labels = _foot_sam_points_for_side(
         pose_xy,
@@ -2876,19 +3702,19 @@ def foot_sam_region_with_prompt_bbox(
             additional_positive_points_by_side or {}
         ).get(region.side),
     )
-    leg_probe_point = _foot_leg_probe_point_for_side(
+    probe_point = _foot_probe_point_for_side(
         pose_xy,
         side=region.side,
         prompt_bbox=prompt_bbox,
     )
 
-    return FootSamRegion(
+    return SamRegion(
         side=region.side,
         base_bbox=region.base_bbox,
         prompt_bbox=prompt_bbox,
         point_coords=point_coords,
         point_labels=point_labels,
-        leg_probe_point=leg_probe_point,
+        probe_point=probe_point,
     )
 
 
@@ -2903,7 +3729,7 @@ def feet_sam_points_from_landmarks(
     """
     Build aggregated SAM point prompts for one or both feet.
 
-    This is a compatibility wrapper around ``feet_sam_regions_from_landmarks``
+    This is a compatibility wrapper around ``foot_sam_regions_from_landmarks``
     for callers that only need point prompts and do not need per-foot prompt
     bboxes. The returned points are the normal foot prompts from each selected
     region:
@@ -2915,7 +3741,7 @@ def feet_sam_points_from_landmarks(
       negatives when they are clearly outside the current foot's base bbox.
 
     The lower-leg probe point is deliberately *not* returned here. It is stored
-    on each ``FootSamRegion`` because callers must first compare the foot mask
+    on each ``SamRegion`` because callers must first compare the foot mask
     with a separate leg-probe mask before deciding whether that point is safe to
     reuse as a negative prompt.
 
@@ -2948,7 +3774,7 @@ def feet_sam_points_from_landmarks(
     RuntimeError
         If no suitable foot region can be derived.
     """
-    regions = feet_sam_regions_from_landmarks(
+    regions = foot_sam_regions_from_landmarks(
         pose_xy,
         image_shape,
         which=which,

@@ -188,3 +188,39 @@ def select_image_side_mask_candidate(
         },
         image_side=image_side,
     )
+
+def reference_mask_coverage(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> float:
+    """
+    Return how much of ``reference`` is covered by ``candidate``.
+
+    This is intentionally not IoU. For the leg-probe heuristic, the question is:
+    "does the mask produced by a lower-leg point cover the foot mask?" If the
+    probe mask is very large, IoU could be low even when it fully contains the
+    foot, while coverage still reports the continuity we care about.
+
+    A high coverage value indicates containment/continuity, but does not imply
+    that the candidate mask is spatially precise or compact.
+
+    Parameters
+    ----------
+    reference : np.ndarray
+        Boolean mask treated as the denominator, usually the foot mask.
+    candidate : np.ndarray
+        Boolean mask whose overlap with ``reference`` is measured, usually the
+        leg-probe mask.
+
+    Returns
+    -------
+    float
+        ``area(reference & candidate) / area(reference)``. Returns ``0.0`` when
+        ``reference`` is empty.
+    """
+    ref_area = int(np.count_nonzero(reference))
+    if ref_area <= 0:
+        return 0.0
+
+    inter = int(np.count_nonzero(reference & candidate))
+    return float(inter) / float(ref_area)

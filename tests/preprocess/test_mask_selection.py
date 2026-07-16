@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from morphalo.nodes.preprocess.segmentation_helper import (
+from morphalo.nodes.preprocess.utils.mask_selection import (
     mask_bbox_center_x,
     select_image_side_mask_candidate,
 )

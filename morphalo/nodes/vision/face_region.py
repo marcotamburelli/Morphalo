@@ -1,6 +1,7 @@
 import numpy as np
 
-from morphalo.nodes.preprocess.utils import offset_bbox_xyxy, offset_landmarks_xy
+from morphalo.nodes.preprocess.utils.geometry import (offset_bbox_xyxy,
+                                                      offset_landmarks_xy)
 
 
 def mp_face_landmarks(

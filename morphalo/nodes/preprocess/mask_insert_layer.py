@@ -12,12 +12,12 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.mask_geometry import (
-    estimate_mask_centerline_alignment_angle,
-    estimate_mask_quad_alignment_angle)
 from morphalo.nodes.preprocess.utils import (SizeExpr, resolve_size_expr,
                                              validate_percentage_size_expr,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.mask_geometry import (
+    estimate_mask_centerline_alignment_angle,
+    estimate_mask_quad_alignment_angle)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 Anchor = Literal[

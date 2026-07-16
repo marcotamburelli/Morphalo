@@ -4,7 +4,7 @@ from morphalo.nodes.vision.human import (
     _foot_ankle_contaminated_by_crossed_leg,
     _foot_sam_points_for_side,
     feet_sam_points_from_landmarks,
-    feet_sam_regions_from_landmarks,
+    foot_sam_regions_from_landmarks,
 )
 
 
@@ -32,7 +32,7 @@ def test_feet_sam_regions_keep_both_feet_separate():
     pose_xy[28] = (80, 80)  # right ankle
     pose_xy[32] = (70, 80)  # right foot_index
 
-    regions = feet_sam_regions_from_landmarks(
+    regions = foot_sam_regions_from_landmarks(
         pose_xy,
         (100, 100, 3),
         which='both',
@@ -65,7 +65,7 @@ def test_feet_sam_region_keeps_leg_probe_separate_when_knee_is_available():
     pose_xy[27] = (50, 60)  # left ankle
     pose_xy[31] = (70, 65)  # left foot_index
 
-    regions = feet_sam_regions_from_landmarks(
+    regions = foot_sam_regions_from_landmarks(
         pose_xy,
         (100, 100, 3),
         which='both',
@@ -77,7 +77,7 @@ def test_feet_sam_region_keeps_leg_probe_separate_when_knee_is_available():
         [70.0, 65.0],
     ]
     assert regions[0].point_labels == [1, 1]
-    assert regions[0].leg_probe_point == [50.0, 51.0]
+    assert regions[0].probe_point == [50.0, 51.0]
 
 
 def test_feet_sam_regions_skip_other_foot_negative_outside_prompt_bbox():
@@ -87,7 +87,7 @@ def test_feet_sam_regions_skip_other_foot_negative_outside_prompt_bbox():
     pose_xy[28] = (80, 80)  # right ankle
     pose_xy[32] = (70, 80)  # right foot_index
 
-    regions = feet_sam_regions_from_landmarks(
+    regions = foot_sam_regions_from_landmarks(
         pose_xy,
         (100, 100, 3),
         which='both',
@@ -106,7 +106,7 @@ def test_feet_sam_regions_accept_additional_positive_points_by_side():
     pose_xy[27] = (20, 80)  # left ankle
     pose_xy[31] = (30, 80)  # left foot_index
 
-    regions = feet_sam_regions_from_landmarks(
+    regions = foot_sam_regions_from_landmarks(
         pose_xy,
         (100, 100, 3),
         which='both',

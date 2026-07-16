@@ -11,14 +11,14 @@ from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox_by_size_expr,
                                              parse_crop_mode,
-                                             prepare_output_mask,
                                              read_shape_cleanup_config,
-                                             tight_alpha_bbox,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import (
+    expand_clip_bbox_by_size_expr, tight_mask_bbox)
+from morphalo.nodes.preprocess.utils.mask_ops import (cleanup_shape_mask,
+                                                      prepare_output_mask)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 
@@ -954,7 +954,7 @@ class ColorDrivenCrop(NodeRef):
                     )
 
                 alpha = selected_mask.astype(np.uint8) * 255
-                x1, y1, x2, y2 = tight_alpha_bbox(alpha)
+                x1, y1, x2, y2 = tight_mask_bbox(alpha)
                 x1, y1, x2, y2 = expand_clip_bbox_by_size_expr(
                     x1,
                     y1,

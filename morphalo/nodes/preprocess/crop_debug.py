@@ -116,21 +116,23 @@ def _draw_foot_landmarks(img: np.ndarray, pose_xy: np.ndarray) -> None:
             cv2.line(img, p1, p2, color, 2, cv2.LINE_AA)
 
 
-def _draw_foot_sam_regions(img: np.ndarray, foot_sam_regions: Any) -> None:
+def _draw_sam_regions(img: np.ndarray, sam_regions: Any) -> None:
     """
-    Draw foot-specific SAM prompt diagnostics.
+    Draw target-local SAM prompt diagnostics.
 
-    MediaPipe ankle/foot_index landmarks are already visible, but the actual
-    SAM prompt can include extra generated points: foot midpoint positives,
-    foot-axis negatives, opposite-foot negatives and the adaptive leg probe.
-    Drawing them here makes prompt mistakes visible without reading sidecars.
+    ``SamRegion`` is a generic debug contract for local target regions. The
+    current caller is the foot pipeline, where MediaPipe ankle/foot_index
+    landmarks are already visible, but the actual SAM prompt can include extra
+    generated positives, foot-axis negatives, opposite-foot negatives and the
+    adaptive probe point. Drawing them here makes prompt mistakes visible
+    without reading sidecars.
     """
     import cv2
 
-    if not foot_sam_regions:
+    if not sam_regions:
         return
 
-    for region in foot_sam_regions:
+    for region in sam_regions:
         point_coords = getattr(region, 'point_coords', None) or []
         point_labels = getattr(region, 'point_labels', None) or []
 
@@ -152,7 +154,7 @@ def _draw_foot_sam_regions(img: np.ndarray, foot_sam_regions: Any) -> None:
                 thickness=1,
             )
 
-        probe = getattr(region, 'leg_probe_point', None)
+        probe = getattr(region, 'probe_point', None)
         if probe is None:
             continue
 
@@ -164,7 +166,7 @@ def _draw_foot_sam_regions(img: np.ndarray, foot_sam_regions: Any) -> None:
         cv2.circle(img, (px, py), 8, (0, 0, 0), 1)
         _draw_label(
             img,
-            'leg probe',
+            'probe',
             (px + 7, py - 7),
             color,
             scale=0.45,
@@ -250,6 +252,85 @@ def _draw_mask_overlay(
     ).astype(np.uint8)
 
 
+def _draw_region_mask_contours(
+    img: np.ndarray,
+    region_masks: Any,
+    *,
+    color: tuple[int, int, int] = (255, 128, 0),
+) -> None:
+    """
+    Draw prior/ROI mask contours without filling the debug image.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        RGB debug image modified in place.
+    region_masks : Any
+        Iterable of full-frame boolean/binary masks. Masks with mismatched
+        shape are ignored.
+    color : tuple[int, int, int], default=(255, 128, 0)
+        RGB contour color.
+
+    Returns
+    -------
+    None
+    """
+    import cv2
+
+    if not region_masks:
+        return
+
+    for region_mask in region_masks:
+        if region_mask is None:
+            continue
+        if region_mask.shape[:2] != img.shape[:2]:
+            continue
+
+        m = region_mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(
+            m,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(img, contours, -1, color, 2, cv2.LINE_AA)
+
+
+def _draw_edge_masks(
+    img: np.ndarray,
+    edge_masks: Any,
+    *,
+    color: tuple[int, int, int] = (0, 180, 255),
+) -> None:
+    """
+    Draw sparse edge/barrier masks as colored pixels.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        RGB debug image modified in place.
+    edge_masks : Any
+        Iterable of full-frame boolean/binary edge masks. Masks with mismatched
+        shape are ignored.
+    color : tuple[int, int, int], default=(0, 180, 255)
+        RGB color used for edge pixels.
+
+    Returns
+    -------
+    None
+    """
+    if not edge_masks:
+        return
+
+    for edge_mask in edge_masks:
+        if edge_mask is None:
+            continue
+        if edge_mask.shape[:2] != img.shape[:2]:
+            continue
+
+        m = edge_mask.astype(bool)
+        img[m] = color
+
+
 def write_crop_debug_overlay(
     *,
     img_rgb: np.ndarray,
@@ -261,17 +342,19 @@ def write_crop_debug_overlay(
     hands_res: Any = None,
     face_xy: Optional[np.ndarray] = None,
     mask: Optional[np.ndarray] = None,
-    foot_sam_regions: Any = None,
+    sam_regions: Any = None,
     prompt_bbox_label: str = 'person',
+    region_masks: Any = None,
+    edge_masks: Any = None,
 ) -> Path:
     """
     Write a crop debug image with bboxes, pose, and optional local landmarks.
 
     The overlay always includes all valid pose landmarks. It additionally draws
-    hand landmarks, face landmarks, or mask overlays when the caller provides
-    those data. ``sam_prompt_bbox`` is the yellow/cyan prompt box used to guide
-    SAM; for non-person targets callers can override ``prompt_bbox_label`` to
-    describe the actual prompt domain.
+    hand landmarks, face landmarks, target-local SAM regions, or mask overlays
+    when the caller provides those data. ``sam_prompt_bbox`` is the yellow/cyan
+    prompt box used to guide SAM; for non-person targets callers can override
+    ``prompt_bbox_label`` to describe the actual prompt domain.
     """
     import cv2
 
@@ -280,11 +363,15 @@ def write_crop_debug_overlay(
     tx1, ty1, tx2, ty2 = target_bbox
 
     _draw_mask_overlay(dbg, mask)
+    _draw_region_mask_contours(dbg, region_masks)
+    _draw_edge_masks(dbg, edge_masks)
     _draw_pose_landmarks(dbg, pose_xy)
 
     if target in ('feet', 'left-foot', 'right-foot'):
         _draw_foot_landmarks(dbg, pose_xy)
-        _draw_foot_sam_regions(dbg, foot_sam_regions)
+        _draw_sam_regions(dbg, sam_regions)
+    if target in ('arms', 'left-arm', 'right-arm'):
+        _draw_sam_regions(dbg, sam_regions)
     if hands_res is not None:
         _draw_hand_landmarks(dbg, hands_res)
     if face_xy is not None:

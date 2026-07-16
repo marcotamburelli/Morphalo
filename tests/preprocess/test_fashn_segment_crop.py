@@ -2,7 +2,7 @@ import numpy as np
 
 from morphalo.nodes.preprocess.fashn_segment_crop import _resolve_target_labels
 from morphalo.nodes.preprocess.fashn_segment_crop import _segment_part_masks
-from morphalo.nodes.preprocess.utils import cleanup_shape_mask_by_parts
+from morphalo.nodes.preprocess.utils.mask_ops import cleanup_shape_mask_by_parts
 
 
 def test_target_array_expands_aliases_and_keeps_first_seen_order():

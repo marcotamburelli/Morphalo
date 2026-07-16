@@ -15,11 +15,9 @@ from morphalo.nodes.preprocess.mask_insert_layer import (
     _place_overlay_on_local_canvas,
     _resize_overlay_to_box,
 )
-from morphalo.nodes.preprocess.utils import (
-    cleanup_shape_mask,
-    expand_clip_bbox_by_size_expr,
-    read_spatial_transform,
-)
+from morphalo.nodes.preprocess.utils import read_spatial_transform
+from morphalo.nodes.preprocess.utils.geometry import expand_clip_bbox_by_size_expr
+from morphalo.nodes.preprocess.utils.mask_ops import cleanup_shape_mask
 
 
 def _save_grid(path):

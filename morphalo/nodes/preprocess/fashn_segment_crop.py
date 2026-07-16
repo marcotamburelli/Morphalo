@@ -16,15 +16,15 @@ from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.crop_debug import write_mask_debug_overlay
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
-                                             cleanup_shape_mask_by_parts,
                                              expand_bbox_toward_ratio,
-                                             expand_clip_bbox_by_size_expr,
                                              parse_crop_mode,
-                                             prepare_output_mask,
                                              read_shape_cleanup_config,
                                              resolve_segment_target_labels,
-                                             tight_alpha_bbox,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.geometry import (
+    expand_clip_bbox_by_size_expr, tight_mask_bbox)
+from morphalo.nodes.preprocess.utils.mask_ops import (
+    cleanup_shape_mask_by_parts, prepare_output_mask)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 TargetSpec = str | list[str] | tuple[str, ...]
@@ -57,6 +57,7 @@ COMPOSITE_TARGETS: dict[str, tuple[str, ...]] = {
     'person': tuple(label for label in FASHN_LABELS if label != 'background'),
     'skin': ('face', 'arms', 'hands', 'legs', 'feet', 'torso'),
 }
+
 
 @dataclass
 class Config:
@@ -696,7 +697,7 @@ class FashnSegmentCrop(CudaPostRunMixin, NodeRef):
             )
 
         alpha_full = selected_mask.astype(np.uint8) * 255
-        bbox_x1, bbox_y1, bbox_x2, bbox_y2 = tight_alpha_bbox(alpha_full)
+        bbox_x1, bbox_y1, bbox_x2, bbox_y2 = tight_mask_bbox(alpha_full)
 
         out_path = make_node_output_path(
             out_dir=Path(output_dir),
