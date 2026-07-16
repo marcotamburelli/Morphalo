@@ -1563,6 +1563,19 @@ _ARM_LANDMARKS = {
     },
 }
 _ARM_SHOULDER_RADIUS_EXPANSION = 1.15
+_LEG_LANDMARKS = {
+    'anatomical-left': {
+        'hip': 23,
+        'knee': 25,
+        'ankle': 27,
+    },
+    'anatomical-right': {
+        'hip': 24,
+        'knee': 26,
+        'ankle': 28,
+    },
+}
+_LEG_HIP_RADIUS_EXPANSION = 1.10
 
 
 @dataclass(frozen=True)
@@ -1618,37 +1631,37 @@ class SamRegion:
 
 
 @dataclass(frozen=True)
-class ArmRegionGeometry:
+class LimbRegionGeometry:
     """
-    Geometry required to segment and refine one arm region.
+    Geometry required to segment and refine one limb region.
 
     Parameters
     ----------
     sam_region : SamRegion
-        SAM crop and point prompts for the arm.
+        SAM crop and point prompts for the limb.
     prior_mask : np.ndarray
         Coarse full-frame mask used only to neutralize pixels before SAM.
     skeleton_mask : np.ndarray
-        Thin full-frame shoulder-elbow-wrist centerline used to filter Canny
-        edges by distance from the expected arm axis.
+        Thin full-frame proximal-to-distal centerline used to filter Canny
+        edges by distance from the expected limb axis.
     synthetic_barrier_mask : np.ndarray
-        Thin full-frame artificial barriers closing the arm at shoulder and
-        wrist. These pixels are used only as flood-fill barriers.
-    shoulder_circle_mask : np.ndarray
-        Filled full-frame shoulder restoration domain. Only pixels selected by SAM
-        inside this circle are restored after flood-fill.
-    shoulder_quadrant_mask : np.ndarray
-        Full-frame external shoulder quadrant. Only the portion also selected
-        by SAM is restored after flood-fill.
+        Thin full-frame artificial barriers closing the limb at proximal and
+        distal joints. These pixels are used only as flood-fill barriers.
+    joint_circle_mask : np.ndarray
+        Filled full-frame proximal-joint restoration domain. Only pixels
+        selected by SAM inside this circle are restored after flood-fill.
+    joint_quadrant_mask : np.ndarray
+        Full-frame external proximal-joint quadrant. Only the portion also
+        selected by SAM is restored after flood-fill.
     tube_radius : float
-        Radius used to construct the coarse arm tube.
+        Radius used to construct the coarse limb tube.
     """
     sam_region: SamRegion
     prior_mask: np.ndarray
     skeleton_mask: np.ndarray
     synthetic_barrier_mask: np.ndarray
-    shoulder_circle_mask: np.ndarray
-    shoulder_quadrant_mask: np.ndarray
+    joint_circle_mask: np.ndarray
+    joint_quadrant_mask: np.ndarray
     tube_radius: float
 
 
@@ -1904,7 +1917,7 @@ def arm_regions_from_landmarks(
     additional_positive_points_by_side: Optional[
         dict[str, list[list[float]]]
     ] = None,
-) -> list[ArmRegionGeometry]:
+) -> list[LimbRegionGeometry]:
     """
     Build the geometry required to segment one or more arm regions.
 
@@ -1943,7 +1956,7 @@ def arm_regions_from_landmarks(
 
     Returns
     -------
-    list[ArmRegionGeometry]
+    list[LimbRegionGeometry]
         One complete geometry object for every selected arm.
 
     Raises
@@ -2014,7 +2027,7 @@ def arm_regions_from_landmarks(
         - float(shoulder_axis[1]) * rel_mid_x
     )
 
-    arm_geometries: list[ArmRegionGeometry] = []
+    arm_geometries: list[LimbRegionGeometry] = []
 
     for side in selected_sides:
         ids = _ARM_LANDMARKS[side]
@@ -2403,17 +2416,17 @@ def arm_regions_from_landmarks(
         )
 
         arm_geometries.append(
-            ArmRegionGeometry(
+            LimbRegionGeometry(
                 sam_region=sam_region,
                 prior_mask=sam_prior_mask,
                 skeleton_mask=skeleton_mask,
                 synthetic_barrier_mask=(
                     synthetic_barrier_mask
                 ),
-                shoulder_circle_mask=(
+                joint_circle_mask=(
                     shoulder_circle_mask
                 ),
-                shoulder_quadrant_mask=(
+                joint_quadrant_mask=(
                     shoulder_quadrant_mask
                 ),
                 tube_radius=float(radius),
@@ -2437,6 +2450,747 @@ def arm_regions_from_landmarks(
         )
 
     return arm_geometries
+
+
+def _select_leg_sides(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    which: str,
+) -> list[str]:
+    """
+    Select anatomical leg sides using image/viewer target semantics.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-image coordinates. Missing landmarks
+        must be encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only height and width are used.
+    which : {'left', 'right', 'both'}
+        Requested leg selection in image/viewer perspective.
+
+    Returns
+    -------
+    list[str]
+        Anatomical side identifiers selected for segmentation.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If no usable hip or knee landmarks are available, or if a side-specific
+        request cannot be resolved from a single visible leg.
+    """
+    if which not in ('left', 'right', 'both'):
+        raise ValueError(
+            f"Invalid which={which!r}; expected 'left', 'right', or 'both'."
+        )
+
+    sides = list(_LEG_LANDMARKS.keys())
+    if which == 'both':
+        return sides
+
+    visible: list[tuple[float, str]] = []
+    for side, ids in _LEG_LANDMARKS.items():
+        hip = _valid_pose_point(pose_xy, ids['hip'])
+        knee = _valid_pose_point(pose_xy, ids['knee'])
+        anchor = hip if hip is not None else knee
+        if anchor is not None:
+            visible.append((float(anchor[0]), side))
+
+    if not visible:
+        raise RuntimeError('No valid hip or knee landmarks for leg target.')
+
+    visible.sort(key=lambda item: item[0])
+    if len(visible) >= 2:
+        return [visible[0][1] if which == 'left' else visible[-1][1]]
+
+    _, w = image_shape[:2]
+    center_x, side = visible[0]
+    if which == 'left' and center_x <= 0.5 * float(w):
+        return [side]
+    if which == 'right' and center_x >= 0.5 * float(w):
+        return [side]
+
+    raise RuntimeError(
+        f'Could not reliably select {which} leg from a single visible leg.'
+    )
+
+
+def leg_segments_from_landmarks(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Return valid pose landmark segments for one anatomical leg side.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-image coordinates. Missing landmarks
+        must be encoded as ``(-1, -1)``.
+    side : str
+        Anatomical side key, either ``'anatomical-left'`` or
+        ``'anatomical-right'``.
+
+    Returns
+    -------
+    list[tuple[np.ndarray, np.ndarray]]
+        Consecutive valid landmark segments, normally ``hip -> knee`` and
+        ``knee -> ankle``. Missing distal landmarks are skipped; if the hip is
+        missing, the list is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``side`` is not a supported anatomical leg side.
+    """
+    if side not in _LEG_LANDMARKS:
+        raise ValueError(f'Unknown leg side {side!r}.')
+
+    ids = _LEG_LANDMARKS[side]
+    hip = _valid_pose_point(pose_xy, ids['hip'])
+    knee = _valid_pose_point(pose_xy, ids['knee'])
+    ankle = _valid_pose_point(pose_xy, ids['ankle'])
+
+    if hip is None:
+        return []
+
+    chain = [hip]
+    if knee is not None:
+        chain.append(knee)
+    if ankle is not None:
+        chain.append(ankle)
+
+    segments: list[tuple[np.ndarray, np.ndarray]] = []
+    for start, end in zip(chain, chain[1:]):
+        if float(np.linalg.norm(end - start)) >= 2.0:
+            segments.append((start, end))
+
+    return segments
+
+
+def _estimate_hip_radius(
+    silhouette: np.ndarray,
+    *,
+    hip: np.ndarray,
+    other_hip: np.ndarray,
+    knee: Optional[np.ndarray],
+    image_shape: tuple[int, ...],
+) -> float:
+    """
+    Estimate hip-cap radius by probing the person silhouette outward.
+
+    The radius starts from the image-space distance between the selected hip and
+    the opposite hip. The function probes outward from the selected hip until it
+    leaves the person silhouette, expands that observed distance slightly, and
+    clamps it to proportions derived from hip width and upper-leg length.
+
+    Parameters
+    ----------
+    silhouette : np.ndarray
+        Full-frame boolean person silhouette.
+    hip : np.ndarray
+        Selected hip point in image coordinates.
+    other_hip : np.ndarray
+        Opposite hip point in image coordinates.
+    knee : np.ndarray or None
+        Same-side knee point, used to bound the radius when available.
+    image_shape : tuple[int, ...]
+        Source image shape. Only height and width are used.
+
+    Returns
+    -------
+    float
+        Estimated hip-cap radius in pixels.
+    """
+    h, w = image_shape[:2]
+    hip_width = float(np.linalg.norm(hip - other_hip))
+    fallback = max(12.0, hip_width * 0.32)
+
+    external = hip - other_hip
+    external_len = float(np.linalg.norm(external))
+    if external_len < 1.0:
+        return fallback
+
+    external = external / external_len
+    max_probe = max(fallback * 2.0, hip_width * 0.85)
+    last_inside: Optional[float] = None
+
+    for dist in np.linspace(0.0, max_probe, num=max(8, int(max_probe))):
+        p = hip + external * float(dist)
+        px = int(round(float(p[0])))
+        py = int(round(float(p[1])))
+        if px < 0 or px >= w or py < 0 or py >= h:
+            break
+
+        if silhouette[py, px]:
+            last_inside = float(dist)
+        elif last_inside is not None:
+            break
+
+    if last_inside is None or last_inside < 2.0:
+        return fallback
+
+    upper_leg_len = (
+        float(np.linalg.norm(knee - hip))
+        if knee is not None
+        else hip_width * 1.1
+    )
+    min_radius = max(8.0, hip_width * 0.18)
+    max_radius = max(
+        min_radius + 1.0,
+        min(hip_width * 0.65, upper_leg_len * 0.45),
+    )
+    expanded = last_inside * _LEG_HIP_RADIUS_EXPANSION
+    return float(np.clip(expanded, min_radius, max_radius))
+
+
+def _leg_sam_points_for_side(
+    pose_xy: np.ndarray,
+    *,
+    side: str,
+    prior_mask: np.ndarray,
+    prompt_bbox: tuple[int, int, int, int],
+    additional_positive_points: Optional[list[list[float]]] = None,
+) -> tuple[Optional[list[list[float]]], Optional[list[int]]]:
+    """
+    Build SAM point prompts for one leg region.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-image coordinates. Missing landmarks
+        must be encoded as ``(-1, -1)``.
+    side : str
+        Anatomical side key, either ``'anatomical-left'`` or
+        ``'anatomical-right'``.
+    prior_mask : np.ndarray
+        Full-frame boolean leg prior used to validate prompt points.
+    prompt_bbox : tuple[int, int, int, int]
+        End-exclusive SAM prompt bbox. Negative pelvis prompts are retained
+        only when they fall inside this bbox and outside ``prior_mask``.
+    additional_positive_points : list[list[float]] or None, optional
+        Extra positive points, typically chromatic run centers sampled along the
+        leg skeleton.
+
+    Returns
+    -------
+    tuple[list[list[float]] | None, list[int] | None]
+        SAM point coordinates and labels. Returns ``(None, None)`` when no
+        usable positive or negative prompt can be built.
+    """
+    ids = _LEG_LANDMARKS[side]
+    points: list[list[float]] = []
+    labels: list[int] = []
+    h, w = prior_mask.shape[:2]
+
+    for name in ('hip', 'knee', 'ankle'):
+        p = _valid_pose_point(pose_xy, ids[name])
+        if p is None:
+            continue
+        px = int(round(float(p[0])))
+        py = int(round(float(p[1])))
+        if 0 <= px < w and 0 <= py < h and prior_mask[py, px]:
+            points.append([float(p[0]), float(p[1])])
+            labels.append(1)
+
+    if additional_positive_points:
+        for point in additional_positive_points:
+            if len(point) < 2:
+                continue
+            px, py = point[:2]
+            px_i = int(round(float(px)))
+            py_i = int(round(float(py)))
+            if 0 <= px_i < w and 0 <= py_i < h and prior_mask[py_i, px_i]:
+                points.append([float(px), float(py)])
+                labels.append(1)
+
+    other_side = (
+        'anatomical-right'
+        if side == 'anatomical-left'
+        else 'anatomical-left'
+    )
+    negative_candidates = []
+    other_hip = _valid_pose_point(
+        pose_xy,
+        _LEG_LANDMARKS[other_side]['hip'],
+    )
+    left_hip = _valid_pose_point(
+        pose_xy,
+        _LEG_LANDMARKS['anatomical-left']['hip'],
+    )
+    right_hip = _valid_pose_point(
+        pose_xy,
+        _LEG_LANDMARKS['anatomical-right']['hip'],
+    )
+    if other_hip is not None:
+        negative_candidates.append(other_hip)
+    if left_hip is not None and right_hip is not None:
+        negative_candidates.append((left_hip + right_hip) * 0.5)
+
+    px1, py1, px2, py2 = prompt_bbox
+    for p in negative_candidates:
+        px = int(round(float(p[0])))
+        py = int(round(float(p[1])))
+        if not (px1 <= px < px2 and py1 <= py < py2):
+            continue
+        if 0 <= px < w and 0 <= py < h and prior_mask[py, px]:
+            continue
+        points.append([float(p[0]), float(p[1])])
+        labels.append(0)
+
+    if not any(label == 1 for label in labels):
+        ys, xs = np.where(prior_mask)
+        if xs.size > 0:
+            points.append([float(xs.mean()), float(ys.mean())])
+            labels.append(1)
+
+    if not points:
+        return None, None
+
+    return points, labels
+
+
+def leg_regions_from_landmarks(
+    pose_xy: np.ndarray,
+    image_shape: tuple[int, ...],
+    *,
+    silhouette: np.ndarray,
+    which: str,
+    expansion: float = 1.0,
+    additional_positive_points_by_side: Optional[
+        dict[str, list[list[float]]]
+    ] = None,
+) -> list[LimbRegionGeometry]:
+    """
+    Build the geometry required to segment one or more leg regions.
+
+    The function converts MediaPipe hip, knee, and ankle landmarks into
+    independent leg-local segmentation geometries.
+
+    For each selected leg, it builds:
+
+    - a coarse filled prior used only to neutralize pixels before SAM;
+    - a thin hip-to-knee-to-ankle skeleton;
+    - thin synthetic barriers closing the leg at the hip and ankle;
+    - a filled hip circle that can be restored after Canny refinement;
+    - an external hip quadrant derived from the pelvis line, the side opposite
+      the torso, and the outward direction of the selected hip;
+    - a generic ``SamRegion`` containing the local crop and point prompts.
+
+    The coarse prior is not a final leg mask and must not be restored after
+    flood-fill. It exists only to restrict the visual content shown to SAM.
+
+    Parameters
+    ----------
+    pose_xy : np.ndarray
+        MediaPipe Pose landmarks in full-image coordinates. Missing landmarks
+        must be encoded as ``(-1, -1)``.
+    image_shape : tuple[int, ...]
+        Source image shape. Only height and width are used.
+    silhouette : np.ndarray
+        Full-frame boolean person silhouette.
+    which : {'left', 'right', 'both'}
+        Requested leg selection in image/viewer perspective.
+    expansion : float, default=1.0
+        Multiplicative expansion applied to the estimated leg radius. Values
+        below ``1.0`` are treated as ``1.0``.
+    additional_positive_points_by_side : dict or None, optional
+        Additional positive SAM points keyed by anatomical side.
+
+    Returns
+    -------
+    list[LimbRegionGeometry]
+        One complete geometry object for every selected leg.
+
+    Raises
+    ------
+    ValueError
+        If ``which`` is invalid.
+    RuntimeError
+        If the hip landmarks or leg geometry are insufficient.
+    """
+    import cv2
+
+    h, w = image_shape[:2]
+    silhouette_bool = silhouette.astype(bool)
+
+    selected_sides = _select_leg_sides(
+        pose_xy,
+        image_shape,
+        which=which,
+    )
+
+    left_hip = _valid_pose_point(
+        pose_xy,
+        _LEG_LANDMARKS['anatomical-left']['hip'],
+    )
+    right_hip = _valid_pose_point(
+        pose_xy,
+        _LEG_LANDMARKS['anatomical-right']['hip'],
+    )
+
+    if left_hip is None or right_hip is None:
+        raise RuntimeError(
+            'Leg targets require both hip landmarks.'
+        )
+
+    pelvis_axis = right_hip - left_hip
+    pelvis_width = float(np.linalg.norm(pelvis_axis))
+
+    if pelvis_width < 4.0:
+        raise RuntimeError(
+            'Hip landmarks are too close for leg geometry.'
+        )
+
+    pelvis_axis_len = max(pelvis_width, 1e-6)
+    pelvis_mid = 0.5 * (left_hip + right_hip)
+
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    rel_mid_x = xx - float(pelvis_mid[0])
+    rel_mid_y = yy - float(pelvis_mid[1])
+    grid_cross_from_pelvis = (
+        float(pelvis_axis[0]) * rel_mid_y
+        - float(pelvis_axis[1]) * rel_mid_x
+    )
+
+    # Determine which side of the pelvis axis contains the torso.
+    #
+    # The leg-facing half-plane is defined as the side opposite the torso.
+    # Shoulder landmarks are preferred because they remain meaningful even when
+    # the legs are bent, crossed, raised, or partially occluded. The head is used
+    # as a fallback, followed by the image-space upward direction.
+    shoulder_points = [
+        point
+        for point in (
+            _valid_pose_point(pose_xy, 11),
+            _valid_pose_point(pose_xy, 12),
+        )
+        if point is not None
+    ]
+
+    if shoulder_points:
+        torso_reference = np.mean(
+            np.stack(shoulder_points, axis=0),
+            axis=0,
+        )
+    else:
+        torso_reference = _valid_pose_point(
+            pose_xy,
+            0,
+        )
+
+    if torso_reference is None:
+        torso_reference = pelvis_mid + np.asarray(
+            [0.0, -pelvis_width],
+            dtype=np.float32,
+        )
+
+    torso_cross = (
+        float(pelvis_axis[0])
+        * float(torso_reference[1] - pelvis_mid[1])
+        - float(pelvis_axis[1])
+        * float(torso_reference[0] - pelvis_mid[0])
+    )
+
+    leg_geometries: list[LimbRegionGeometry] = []
+
+    for side in selected_sides:
+        ids = _LEG_LANDMARKS[side]
+
+        hip = _valid_pose_point(pose_xy, ids['hip'])
+        knee = _valid_pose_point(pose_xy, ids['knee'])
+        ankle = _valid_pose_point(pose_xy, ids['ankle'])
+
+        if hip is None:
+            continue
+
+        other_hip = (
+            right_hip
+            if side == 'anatomical-left'
+            else left_hip
+        )
+
+        segments = leg_segments_from_landmarks(
+            pose_xy,
+            side=side,
+        )
+        if not segments:
+            continue
+
+        radius = _estimate_hip_radius(
+            silhouette_bool,
+            hip=hip,
+            other_hip=other_hip,
+            knee=knee,
+            image_shape=image_shape,
+        )
+        radius *= max(1.0, float(expansion))
+
+        tube_mask = np.zeros((h, w), dtype=bool)
+        for start, end in segments:
+            tube_mask |= segment_capsule_mask(
+                image_shape,
+                start,
+                end,
+                radius,
+            )
+
+        skeleton_u8 = np.zeros((h, w), dtype=np.uint8)
+        for start, end in segments:
+            cv2.line(
+                skeleton_u8,
+                tuple(int(value) for value in np.rint(start)),
+                tuple(int(value) for value in np.rint(end)),
+                255,
+                thickness=1,
+                lineType=cv2.LINE_8,
+            )
+
+        for point in (hip, knee, ankle):
+            if point is None:
+                continue
+            cv2.circle(
+                skeleton_u8,
+                tuple(int(value) for value in np.rint(point)),
+                1,
+                255,
+                thickness=-1,
+                lineType=cv2.LINE_8,
+            )
+
+        skeleton_mask = skeleton_u8 > 0
+
+        hip_circle_mask = (
+            np.hypot(
+                xx - float(hip[0]),
+                yy - float(hip[1]),
+            )
+            <= radius
+        )
+
+        # The torso side becomes geometrically ambiguous when the torso reference
+        # lies almost exactly on the pelvis axis. In that rare case the lower
+        # half-plane constraint is disabled rather than choosing an arbitrary side.
+        if abs(torso_cross) <= 1e-3:
+            lower_halfplane = np.ones(
+                silhouette_bool.shape,
+                dtype=bool,
+            )
+        else:
+            lower_side = (
+                -1.0
+                if torso_cross >= 0.0
+                else 1.0
+            )
+
+            lower_halfplane = (
+                lower_side * grid_cross_from_pelvis
+            ) >= -0.35 * radius * pelvis_axis_len
+
+        outward_vector = hip - other_hip
+        outward_length = float(np.linalg.norm(outward_vector))
+
+        if outward_length < 1e-6:
+            continue
+
+        outward_unit = outward_vector / outward_length
+
+        rel_hip_x = xx - float(hip[0])
+        rel_hip_y = yy - float(hip[1])
+
+        outward_projection = (
+            rel_hip_x * float(outward_unit[0])
+            + rel_hip_y * float(outward_unit[1])
+        )
+
+        outward_halfplane = (
+            outward_projection >= -0.35 * radius
+        )
+
+        hip_quadrant_mask = (
+            silhouette_bool
+            & lower_halfplane
+            & outward_halfplane
+        )
+
+        leg_support_mask = (
+            silhouette_bool
+            & (
+                tube_mask
+                | hip_circle_mask
+            )
+        )
+
+        sam_prior_mask = (
+            hip_quadrant_mask
+            | leg_support_mask
+        )
+
+        if ankle is not None and knee is not None:
+            lower_leg_vector = ankle - knee
+            lower_leg_length = float(np.linalg.norm(lower_leg_vector))
+
+            if lower_leg_length >= 2.0:
+                lower_leg_unit = lower_leg_vector / lower_leg_length
+
+                after_ankle = (
+                    (
+                        xx - float(ankle[0])
+                    ) * float(lower_leg_unit[0])
+                    + (
+                        yy - float(ankle[1])
+                    ) * float(lower_leg_unit[1])
+                ) > radius * 0.25
+
+                sam_prior_mask &= ~after_ankle
+                sam_prior_mask |= (
+                    hip_circle_mask
+                    & silhouette_bool
+                )
+
+        if not np.any(sam_prior_mask):
+            continue
+
+        synthetic_barriers_u8 = np.zeros(
+            (h, w),
+            dtype=np.uint8,
+        )
+
+        hip_center_xy = tuple(
+            int(value)
+            for value in np.rint(hip)
+        )
+        hip_radius_px = max(
+            1,
+            int(round(radius)),
+        )
+
+        cv2.circle(
+            synthetic_barriers_u8,
+            hip_center_xy,
+            hip_radius_px,
+            255,
+            thickness=1,
+            lineType=cv2.LINE_8,
+        )
+
+        if knee is not None and ankle is not None:
+            lower_leg_vector = ankle - knee
+            lower_leg_length = float(np.linalg.norm(lower_leg_vector))
+
+            if lower_leg_length >= 2.0:
+                lower_leg_unit = lower_leg_vector / lower_leg_length
+                lower_leg_normal = np.asarray(
+                    [
+                        -lower_leg_unit[1],
+                        lower_leg_unit[0],
+                    ],
+                    dtype=np.float32,
+                )
+
+                ankle_barrier_start = (
+                    ankle - lower_leg_normal * radius
+                )
+                ankle_barrier_end = (
+                    ankle + lower_leg_normal * radius
+                )
+
+                cv2.line(
+                    synthetic_barriers_u8,
+                    tuple(
+                        int(value)
+                        for value in np.rint(
+                            ankle_barrier_start
+                        )
+                    ),
+                    tuple(
+                        int(value)
+                        for value in np.rint(
+                            ankle_barrier_end
+                        )
+                    ),
+                    255,
+                    thickness=1,
+                    lineType=cv2.LINE_8,
+                )
+
+        synthetic_barrier_mask = (
+            synthetic_barriers_u8 > 0
+        )
+
+        base_bbox = tight_mask_bbox(
+            sam_prior_mask.astype(np.uint8)
+        )
+
+        prompt_bbox = expand_clip_bbox(
+            *base_bbox,
+            w,
+            h,
+            max(
+                0.08,
+                min(
+                    0.30,
+                    0.12 * max(
+                        1.0,
+                        float(expansion),
+                    ),
+                ),
+            ),
+        )
+
+        point_coords, point_labels = (
+            _leg_sam_points_for_side(
+                pose_xy,
+                side=side,
+                prior_mask=sam_prior_mask,
+                prompt_bbox=prompt_bbox,
+                additional_positive_points=(
+                    additional_positive_points_by_side
+                    or {}
+                ).get(side),
+            )
+        )
+
+        sam_region = SamRegion(
+            side=side,
+            base_bbox=base_bbox,
+            prompt_bbox=prompt_bbox,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            probe_point=None,
+        )
+
+        leg_geometries.append(
+            LimbRegionGeometry(
+                sam_region=sam_region,
+                prior_mask=sam_prior_mask,
+                skeleton_mask=skeleton_mask,
+                synthetic_barrier_mask=(
+                    synthetic_barrier_mask
+                ),
+                joint_circle_mask=(
+                    hip_circle_mask
+                ),
+                joint_quadrant_mask=(
+                    hip_quadrant_mask
+                ),
+                tube_radius=float(radius),
+            )
+        )
+
+    if not leg_geometries:
+        raise RuntimeError(
+            f'Could not derive leg geometry for which={which!r}.'
+        )
+
+    return leg_geometries
 
 
 def _point_segment_distance(

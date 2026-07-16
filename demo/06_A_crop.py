@@ -18,6 +18,9 @@ Defined DAGs
 ``subject_crop_arms``
     Trimmed RGBA crops for both arms and image-relative left/right arms.
 
+``subject_crop_legs``
+    Trimmed RGBA crops for both legs and image-relative left/right legs.
+
 ``subject_crop_feet``
     Trimmed RGBA crops for both feet and image-relative left/right feet.
 
@@ -34,6 +37,7 @@ How to run
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_hands
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_arms
+    ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_legs
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_feet
     ./bin/run_dag.sh demo.06_A_crop --dag face_crop_features
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_bbox_ratio
@@ -82,6 +86,11 @@ FOOT_PARAMS = {
 }
 
 ARM_PARAMS = {
+    **COMMON_PARAMS,
+    'postprocess': SHAPE_CLEANUP_PARAMS,
+}
+
+LEG_PARAMS = {
     **COMMON_PARAMS,
     'postprocess': SHAPE_CLEANUP_PARAMS,
 }
@@ -477,6 +486,64 @@ with DAG(
         arms_crop,
         left_arm_crop,
         right_arm_crop,
+    ]
+
+
+with DAG(
+    name='subject_crop_legs',
+    out_dir=ROOT / 'outputs' / '06_A_subject_crop_legs',
+):
+    init_img = FileImage(
+        name='init_img',
+        path=INIT_IMG,
+    )
+
+    legs_crop = SubjectCrop(
+        name='legs_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **LEG_PARAMS,
+                'target': 'legs',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    left_leg_crop = SubjectCrop(
+        name='left_leg_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **LEG_PARAMS,
+                'target': 'left-leg',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    right_leg_crop = SubjectCrop(
+        name='right_leg_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **LEG_PARAMS,
+                'target': 'right-leg',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    init_img >> [
+        legs_crop,
+        left_leg_crop,
+        right_leg_crop,
     ]
 
 

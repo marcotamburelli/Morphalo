@@ -162,16 +162,16 @@ with DAG(
         },
     )
 
-    # arms_crop = FashnSegmentCrop(
-    #     name='arms_crop',
-    #     spec={
-    #         'model': MODEL_SPEC,
-    #         'params': {
-    #             **COMMON_PARAMS,
-    #             'target': 'arms',
-    #         },
-    #     },
-    # )
+    arms_crop = FashnSegmentCrop(
+        name='arms_crop',
+        spec={
+            'model': MODEL_SPEC,
+            'params': {
+                **COMMON_PARAMS,
+                'target': 'arms',
+            },
+        },
+    )
 
     legs_with_pants_crop = FashnSegmentCrop(
         name='legs_with_pants_crop',
@@ -209,7 +209,7 @@ with DAG(
         skin_crop,
         clothes_crop,
         head_crop,
-        # arms_crop,
+        arms_crop,
         legs_with_pants_crop,
         mixed_parts_crop,
     ]
