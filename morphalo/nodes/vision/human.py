@@ -22,6 +22,12 @@ class PoseLandmarksResult:
     z : np.ndarray
         Array with shape ``(33,)`` containing image-space relative depth.
         Invalid landmarks are encoded as ``np.nan``.
+    xyz_px : np.ndarray
+        Array with shape ``(33, 3)`` containing pseudo-3D image-space
+        coordinates in pixels. ``x`` and ``y`` are the same pixel coordinates as
+        ``xy``; ``z`` is MediaPipe's image-space relative depth scaled by image
+        width, matching MediaPipe's normalized-depth convention. Invalid
+        landmarks are encoded as ``np.nan``.
     world_xyz : np.ndarray
         Array with shape ``(33, 3)`` containing world coordinates.
         Invalid landmarks are encoded as ``np.nan``.
@@ -40,6 +46,7 @@ class PoseLandmarksResult:
     """
     xy: np.ndarray
     z: np.ndarray
+    xyz_px: np.ndarray
     world_xyz: np.ndarray
     visibility: np.ndarray
     presence: np.ndarray
@@ -221,6 +228,7 @@ def mp_pose_landmarks_full(
 
     xy = np.full((33, 2), -1, dtype=np.int32)
     z = np.full((33,), np.nan, dtype=np.float32)
+    xyz_px = np.full((33, 3), np.nan, dtype=np.float32)
     world_xyz = np.full((33, 3), np.nan, dtype=np.float32)
     visibility = np.zeros((33,), dtype=np.float32)
     presence = np.zeros((33,), dtype=np.float32)
@@ -247,6 +255,9 @@ def mp_pose_landmarks_full(
 
         if in_bounds and passes_valid:
             xy[i] = (x_px, y_px)
+            xyz_px[i, 0] = float(x_px)
+            xyz_px[i, 1] = float(y_px)
+            xyz_px[i, 2] = float(z_rel) * float(w)
             valid[i] = True
 
         if in_bounds and passes_strong:
@@ -282,6 +293,7 @@ def mp_pose_landmarks_full(
     return PoseLandmarksResult(
         xy=xy,
         z=z,
+        xyz_px=xyz_px,
         world_xyz=world_xyz,
         visibility=visibility,
         presence=presence,
@@ -1646,13 +1658,21 @@ class LimbRegionGeometry:
         edges by distance from the expected limb axis.
     synthetic_barrier_mask : np.ndarray
         Thin full-frame artificial barriers closing the limb at proximal and
-        distal joints. These pixels are used only as flood-fill barriers.
+        distal joints. These pixels are used only as Canny partition barriers.
     joint_circle_mask : np.ndarray
         Filled full-frame proximal-joint restoration domain. Only pixels
-        selected by SAM inside this circle are restored after flood-fill.
+        selected by SAM inside this circle are restored after refinement.
     joint_quadrant_mask : np.ndarray
         Full-frame external proximal-joint quadrant. Only the portion also
-        selected by SAM is restored after flood-fill.
+        selected by SAM is restored after refinement.
+    proximal_point : np.ndarray or None
+        Full-frame proximal landmark, shoulder for arms and hip for legs.
+    middle_point : np.ndarray or None
+        Full-frame middle landmark, elbow for arms and knee for legs.
+    distal_point : np.ndarray or None
+        Full-frame distal landmark, wrist for arms and ankle for legs.
+    limb_chain_length : float
+        Proximal-to-distal landmark-chain length in pixels.
     tube_radius : float
         Radius used to construct the coarse limb tube.
     """
@@ -1662,6 +1682,10 @@ class LimbRegionGeometry:
     synthetic_barrier_mask: np.ndarray
     joint_circle_mask: np.ndarray
     joint_quadrant_mask: np.ndarray
+    proximal_point: Optional[np.ndarray]
+    middle_point: Optional[np.ndarray]
+    distal_point: Optional[np.ndarray]
+    limb_chain_length: float
     tube_radius: float
 
 
@@ -2061,6 +2085,16 @@ def arm_regions_from_landmarks(
         if not segments:
             continue
 
+        limb_chain_length = 0.0
+        if elbow is not None:
+            limb_chain_length += float(
+                np.linalg.norm(elbow - shoulder)
+            )
+        if elbow is not None and wrist is not None:
+            limb_chain_length += float(
+                np.linalg.norm(wrist - elbow)
+            )
+
         radius = _estimate_shoulder_radius(
             silhouette_bool,
             shoulder=shoulder,
@@ -2429,6 +2463,10 @@ def arm_regions_from_landmarks(
                 joint_quadrant_mask=(
                     shoulder_quadrant_mask
                 ),
+                proximal_point=shoulder,
+                middle_point=elbow,
+                distal_point=wrist,
+                limb_chain_length=limb_chain_length,
                 tube_radius=float(radius),
             )
         )
@@ -2924,6 +2962,16 @@ def leg_regions_from_landmarks(
         if not segments:
             continue
 
+        limb_chain_length = 0.0
+        if knee is not None:
+            limb_chain_length += float(
+                np.linalg.norm(knee - hip)
+            )
+        if knee is not None and ankle is not None:
+            limb_chain_length += float(
+                np.linalg.norm(ankle - knee)
+            )
+
         radius = _estimate_hip_radius(
             silhouette_bool,
             hip=hip,
@@ -3181,6 +3229,10 @@ def leg_regions_from_landmarks(
                 joint_quadrant_mask=(
                     hip_quadrant_mask
                 ),
+                proximal_point=hip,
+                middle_point=knee,
+                distal_point=ankle,
+                limb_chain_length=limb_chain_length,
                 tube_radius=float(radius),
             )
         )

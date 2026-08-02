@@ -51,7 +51,7 @@ from morphalo.nodes.preprocess import FaceCrop, SubjectCrop
 
 ROOT = Path(__file__).resolve().parents[1]
 
-INIT_IMG = '~/images/init_img_2.png'
+INIT_IMG = '~/images/init_img_1.png'
 
 SUBJECT_MODEL_SPEC = {
     'sam_model': 'facebook/sam-vit-large',

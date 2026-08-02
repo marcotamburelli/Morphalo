@@ -272,6 +272,56 @@ def get_sapiens2_segmenter(
     return processor, model
 
 
+def get_sapiens2_pose_estimator(
+    *,
+    model_id: str,
+    device: str,
+    dtype: torch.dtype,
+) -> Tuple[Any, Any]:
+    """
+    Load or retrieve a cached Sapiens2 top-down pose processor/model.
+
+    Sapiens2 pose checkpoints require person boxes at preprocessing time. This
+    helper only owns model caching; callers remain responsible for running a
+    detector, passing boxes to the processor, and post-processing keypoints.
+    """
+    from transformers import AutoImageProcessor, Sapiens2ForPoseEstimation
+
+    model_dtype = dtype if str(device).lower(
+    ).startswith('cuda') else torch.float32
+
+    proc_key = CacheKey(
+        kind='sapiens2_pose_processor',
+        ref=model_id,
+        device='cpu',
+        dtype='na',
+    )
+    mod_key = CacheKey(
+        kind='sapiens2_pose_model',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(model_dtype),
+    )
+
+    processor = ModelCache.get(proc_key)
+    if processor is None:
+        processor = ModelCache.put(
+            proc_key,
+            AutoImageProcessor.from_pretrained(model_id),
+        )
+
+    model = ModelCache.get(mod_key)
+    if model is None:
+        model = Sapiens2ForPoseEstimation.from_pretrained(
+            model_id,
+            torch_dtype=model_dtype,
+        ).to(device)
+        model.eval()
+        ModelCache.put(mod_key, model)
+
+    return processor, model
+
+
 def get_ip_image_encoder(
     *,
     repo_id: str,

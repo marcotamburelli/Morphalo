@@ -11,6 +11,7 @@ from .mask_insert_layer import MaskInsertLayer
 from .resize_image import ResizeImage
 from .sapiens2_segment_crop import Sapiens2SegmentCrop
 from .subject_crop import SubjectCrop
+from .subject_crop2 import SubjectCrop2
 from .transpose_image import TransposeImage
 from .visual_reference_selector import VisualReferenceSelector
 
@@ -28,6 +29,7 @@ __all__ = [
     'ResizeImage',
     'Sapiens2SegmentCrop',
     'SubjectCrop',
+    'SubjectCrop2',
     'TransposeImage',
     'VisualReferenceSelector',
 ]

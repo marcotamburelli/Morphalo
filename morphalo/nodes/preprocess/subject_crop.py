@@ -16,7 +16,6 @@ from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
-from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.crop_debug import write_crop_debug_overlay
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
@@ -29,10 +28,8 @@ from morphalo.nodes.preprocess.utils.geometry import (
     clip_mask_to_bbox, expand_clip_bbox, expand_clip_bbox_by_size_expr,
     tight_mask_bbox, union_bboxes_xyxy)
 from morphalo.nodes.preprocess.utils.mask_ops import (
-    bridge_consistent_edge_endpoints, cleanup_shape_mask, cleanup_shape_mask_by_parts, extend_consistent_edge_endpoints, invert_mask_inside_box,
-    labeled_points_inside_mask, prepare_output_mask,
-    reachable_components_from_labeled_points,
-    remove_small_components_unless_touching)
+    cleanup_shape_mask, cleanup_shape_mask_by_parts, invert_mask_inside_box,
+    prepare_output_mask)
 from morphalo.nodes.preprocess.utils.mask_selection import \
     reference_mask_coverage
 from morphalo.nodes.preprocess.utils.sam import (
@@ -69,187 +66,8 @@ FOOT_CHROMATIC_MIN_SEGMENT_LEN_PX = 3.0
 ARM_CHROMATIC_LAB_DISTANCE_THRESHOLD = 14.0
 ARM_CHROMATIC_MIN_SEGMENT_LEN_PX = 4.0
 
-# ``ARM_CANNY_L_*`` controls edge detection on the LAB luminance channel.
-# Lower values increase sensitivity to weak brightness boundaries such as
-# low-contrast skin, fabric, shadows, and soft silhouette transitions.
-ARM_CANNY_L_LOW_THRESHOLD = 30
-ARM_CANNY_L_HIGH_THRESHOLD = 100
-#
-# ``ARM_CANNY_AB_*`` controls edge detection on the LAB chromatic channels.
-# These channels recover boundaries between similarly bright but differently
-# colored regions. They are usually noisier than luminance, so their thresholds
-# should generally remain stricter than extremely permissive values.
-ARM_CANNY_AB_LOW_THRESHOLD = 35
-ARM_CANNY_AB_HIGH_THRESHOLD = 100
-#
-# Local contrast enhancement
-# --------------------------
-# CLAHE is applied only to the LAB luminance channel before Canny.
-#
-# ``ARM_CANNY_CLAHE_CLIP_LIMIT`` controls how aggressively local contrast is
-# amplified. Higher values reveal weaker boundaries but also emphasize fabric
-# texture, hair strands, wrinkles, and image noise.
-ARM_CANNY_CLAHE_CLIP_LIMIT = 1.5
-#
-# ``ARM_CANNY_CLAHE_TILE_SIZE`` is the width and height of each CLAHE tile.
-# Smaller tiles make enhancement more local and aggressive; larger tiles make
-# it smoother and closer to global contrast enhancement.
-ARM_CANNY_CLAHE_TILE_SIZE = 8
-#
-# Spatial edge filtering
-# ----------------------
-# Luminance edges are accepted up to the complete arm tube radius.
-# Chromatic edges are more easily contaminated by texture, so they are accepted
-# only within this fraction of the maximum skeleton distance.
-#
-# Lower values reduce chromatic noise but may miss the external boundary of
-# wide sleeves. Higher values preserve more clothing boundaries but may retain
-# unrelated color transitions.
-ARM_CANNY_AB_DISTANCE_RATIO = 0.75
-#
-# Barrier morphology
-# ------------------
-# ``ARM_CANNY_EDGE_CLOSE_RADIUS`` applies blind morphological closing to the
-# complete edge mask. It is currently disabled because endpoint-aware bridging
-# is more selective and less likely to connect unrelated texture fragments.
-ARM_CANNY_EDGE_CLOSE_RADIUS = 0
-#
-# ``ARM_CANNY_EDGE_DILATE_RADIUS`` thickens accepted visual barriers before
-# flood-fill. Larger values close tiny leaks more effectively, but may consume
-# too much valid arm area or merge nearby contours.
-ARM_CANNY_EDGE_DILATE_RADIUS = 1
-#
-# ``ARM_CANNY_MIN_EDGE_COMPONENT_AREA`` removes isolated visual-edge components
-# smaller than this number of pixels, unless they touch an explicit synthetic
-# shoulder or wrist barrier. Increasing it suppresses more texture noise but
-# may discard legitimate short contour fragments.
-ARM_CANNY_MIN_EDGE_COMPONENT_AREA = 12
-#
-# Endpoint-aware contour bridging
-# -------------------------------
-# Interrupted contours are reconnected only when two skeletonized edge
-# endpoints are spatially close and their local outgoing directions are
-# geometrically compatible.
-#
-# ``ARM_CANNY_MAX_BRIDGE_GAP`` is the maximum endpoint distance, in pixels,
-# eligible for reconnection. Larger values close longer missing contour
-# sections but increase the risk of connecting unrelated edges.
-ARM_CANNY_MAX_BRIDGE_GAP = 15.0
-#
-# ``ARM_CANNY_BRIDGE_TANGENT_RADIUS`` is the local skeleton graph distance used
-# to estimate the outgoing tangent at each endpoint. Larger values give a more
-# stable direction on smooth contours, while smaller values follow local curves
-# more closely but are more sensitive to pixel noise.
-ARM_CANNY_BRIDGE_TANGENT_RADIUS = 6
-#
-# ``ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT`` is the minimum cosine alignment
-# between each endpoint's outgoing tangent and the direction toward the other
-# endpoint. Values closer to 1.0 require the endpoints to face each other more
-# directly.
-ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT = 0.70
-#
-# ``ARM_CANNY_BRIDGE_MIN_PARALLELISM`` is the minimum absolute cosine
-# similarity between the two endpoint tangents. Values closer to 1.0 require
-# the interrupted contour fragments to be more nearly collinear.
-ARM_CANNY_BRIDGE_MIN_PARALLELISM = 0.65
-#
-# ``ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION`` is the minimum fraction of bridge
-# pixels that must lie inside the permitted bridge domain, defined by the arm
-# skeleton distance and the local SAM neighborhood.
-ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION = 0.90
-#
-# Flood-fill edge restoration
-# ---------------------------
-# Thick barriers temporarily consume pixels that may belong to the arm.
-# ``ARM_CANNY_RESTORE_EDGE_RADIUS`` controls how far from the reachable
-# flood-filled region barrier pixels may be restored, provided they were also
-# selected by SAM.
-ARM_CANNY_RESTORE_EDGE_RADIUS = 2
-#
-# Refined-mask validation
-# -----------------------
-# The refined result is compared with the original SAM mask before acceptance.
-#
-# ``ARM_CANNY_ACCEPT_MIN_AREA_RATIO`` rejects refinements that retain too little
-# of the SAM candidate, which usually indicates a leak, an over-aggressive
-# barrier, or poor flood-fill connectivity.
-ARM_CANNY_ACCEPT_MIN_AREA_RATIO = 0.15
-#
-# ``ARM_CANNY_ACCEPT_MAX_AREA_RATIO`` rejects refinements that grow excessively
-# relative to SAM. Values above 1.0 allow limited growth caused by controlled
-# restoration logic, although the current pipeline normally keeps the final
-# candidate inside the SAM mask.
-ARM_CANNY_ACCEPT_MAX_AREA_RATIO = 1.25
-
-# Endpoint extension
-# ------------------
-# Endpoint bridging requires compatible contour fragments on both sides of a
-# gap. Endpoint extension handles the complementary case where one reliable
-# contour terminates and no matching fragment is visible beyond the gap.
-#
-# An endpoint is eligible only when it belongs to a sufficiently long
-# skeletonized edge component and its outgoing tangent is approximately
-# parallel to the local arm skeleton. The extension follows the edge tangent,
-# not the skeleton itself, and remains constrained to the permitted bridge
-# domain.
-#
-# ``ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH`` is the minimum skeletonized
-# component length, in pixels, required before one of its endpoints may be
-# extended. Larger values reduce the chance of extending short texture fragments
-# or noise, but may reject legitimate weak arm contours.
-ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH = 20
-#
-# ``ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH`` optionally excludes components
-# longer than the configured value. ``None`` disables the upper bound. Long
-# contours are usually the most reliable candidates, so an upper limit is
-# normally unnecessary.
-ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH = None
-#
-# ``ARM_CANNY_EXTENSION_MAX_LENGTH`` is the maximum number of pixels that may be
-# synthesized beyond an eligible endpoint. Increasing it can bridge longer
-# low-contrast regions, but also increases the risk of inventing a barrier where
-# no real arm boundary exists.
-ARM_CANNY_EXTENSION_MAX_LENGTH = 12.0
-#
-# ``ARM_CANNY_EXTENSION_TANGENT_RADIUS`` is the local edge-skeleton graph
-# distance used to estimate the endpoint's outgoing tangent. Larger values give
-# more stable directions on smooth contours; smaller values follow sharp local
-# curvature more closely but are more sensitive to pixel noise.
-ARM_CANNY_EXTENSION_TANGENT_RADIUS = 6
-#
-# ``ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS`` is the radius, in pixels,
-# around the nearest arm-skeleton point used to derive candidate local skeleton
-# directions. Near the elbow this neighborhood may expose both upper-arm and
-# forearm directions, allowing the endpoint to match the locally relevant one.
-ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS = 10
-#
-# ``ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM`` is the minimum absolute
-# cosine similarity between the outgoing edge tangent and at least one nearby
-# arm-skeleton direction. Values closer to 1.0 require the contour to be more
-# nearly longitudinal with respect to the arm.
-ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM = 0.75
-#
-# ``ARM_CANNY_EXTENSION_SNAP_RADIUS`` is the local search radius used while
-# extending an endpoint. When another edge is encountered inside this radius,
-# the extension snaps to the best forward-aligned pixel and stops.
-ARM_CANNY_EXTENSION_SNAP_RADIUS = 2
-
-# Flood-fill margin recovery
-# --------------------------
-# Flood-fill always stops on the inner side of the visual barriers. Even after
-# restoring the reachable-side barrier pixels, the accepted region remains
-# slightly contracted because the detected contour itself occupies a finite
-# thickness.
-#
-# Expand the accepted flood-filled region by the estimated barrier thickness
-# plus one additional safety pixel. The result is clipped to the original SAM
-# mask, so this expansion can only recover pixels that already belonged to the
-# selected SAM candidate.
-#
-# The expansion radius is intentionally derived from the configured barrier
-# dilation to keep both stages geometrically consistent.
-ARM_CANNY_FLOOD_EXPANSION_RADIUS = (
-    ARM_CANNY_EDGE_DILATE_RADIUS + 1
+_SUBJECT_CROP_DISABLED_MESSAGE = (
+    "SubjectCrop is disabled. Use SubjectCrop2 / subject_crop2 instead."
 )
 
 
@@ -344,8 +162,8 @@ class TargetSegmentationResult:
         Full-frame face landmarks used only by debug rendering.
     hands_result : Any, optional
         MediaPipe hand-landmarker result used only by debug rendering.
-    sam_regions : list[SamRegion] | None, optional
-        Final SAM prompt regions, including expanded prompt boxes and any
+    crop_regions : list[SamRegion] | None, optional
+        Final crop debug regions, including expanded prompt boxes and any
         target-specific prompt enrichment, used by debug rendering.
     prompt_bbox_label : str, default='person'
         Human-readable label for the prompt bbox in debug overlays.
@@ -365,7 +183,7 @@ class TargetSegmentationResult:
     shape_part_masks: Optional[np.ndarray | list[np.ndarray]] = None
     face_xy: Optional[np.ndarray] = None
     hands_result: Any = None
-    sam_regions: Optional[list[SamRegion]] = None
+    crop_regions: Optional[list[SamRegion]] = None
     prompt_bbox_label: str = 'person'
     preserve_all_components: bool = False
     debug_region_masks: Optional[list[np.ndarray]] = None
@@ -1187,519 +1005,6 @@ def _select_best_limb_sam_mask(
     )
 
 
-def _refine_limb_mask_with_canny_barriers(
-    *,
-    local_rgb: np.ndarray,
-    local_sam_mask: np.ndarray,
-    local_skeleton_mask: np.ndarray,
-    local_synthetic_barrier_mask: np.ndarray,
-    local_joint_circle_mask: np.ndarray,
-    local_joint_quadrant_mask: np.ndarray,
-    tube_radius: float,
-    point_coords: list[list[float]],
-    point_labels: list[int],
-    flood_seed_coords: list[list[float]],
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Refine a local SAM limb mask using multi-channel Canny barriers and
-    seeded flood-fill.
-
-    The SAM mask remains the primary segmentation domain. Edge detection does
-    not create a replacement mask from the complete crop. Instead, visual and
-    synthetic barriers subdivide the SAM mask, and only regions reachable from
-    dedicated limb flood-fill seeds are retained.
-
-    The visual barrier pipeline operates in LAB color space:
-
-    1. compute luminance and chromatic Canny edges from the original local RGB
-       crop;
-    2. retain luminance and chromatic edges only inside their configured
-       distance from the limb skeleton;
-    3. reconnect pairs of interrupted edge endpoints when their local outgoing
-       tangents are mutually compatible;
-    4. extend remaining endpoints belonging to sufficiently long contours when
-       their local tangent is approximately parallel to the nearby limb skeleton;
-    5. remove small disconnected edge components;
-    6. optionally close and dilate the remaining visual edges to create stronger
-       flood-fill barriers;
-    7. combine the visual barriers with explicit synthetic joint and distal
-       barriers;
-    8. flood-fill inside the SAM mask from positive limb seed points outside the
-       trusted proximal-joint circle;
-    9. restore the reachable-side portion of the visual barriers;
-    10. expand the accepted flood-filled region by the estimated barrier thickness,
-        while remaining inside the original SAM mask;
-    11. restore SAM-selected proximal-joint support inside:
-        - the geometric joint circle;
-        - the external joint quadrant;
-    12. validate positive-point coverage and the refined-to-SAM area ratio.
-
-    Endpoint bridging and extension solve different failure modes. Bridging
-    reconnects two compatible contour fragments separated by a short gap.
-    Extension continues a single reliable contour when Canny loses the opposite
-    fragment entirely, for example across a weakly contrasted fabric fold.
-
-    The coarse limb prior used to neutralize the image before SAM is deliberately
-    not accepted by this function. It must never be reintroduced after the
-    flood-fill stage.
-
-    Parameters
-    ----------
-    local_rgb : np.ndarray
-        Original local RGB crop used for edge detection. This image must not be
-        neutralized with the limb prior, because the refinement stage needs the
-        real visual boundaries of the limb, clothing, torso, hair, and
-        surrounding image content.
-
-    local_sam_mask : np.ndarray
-        Boolean local SAM mask selected for the limb. Flood-fill and final mask
-        restoration remain constrained to this segmentation domain.
-
-    local_skeleton_mask : np.ndarray
-        Boolean local proximal-to-distal centerline mask. It is used to
-        filter visual edges by distance and to validate whether an endpoint
-        extension follows a plausible longitudinal limb direction.
-
-    local_synthetic_barrier_mask : np.ndarray
-        Boolean local mask containing only explicit synthetic joint and distal
-        barrier lines. These pixels restrict flood-fill and are never restored
-        directly as target geometry.
-
-    local_joint_circle_mask : np.ndarray
-        Boolean local filled circle centered on the proximal joint. The circle
-        defines a joint restoration domain, but only pixels already selected by
-        SAM inside it are restored after flood-fill.
-
-    local_joint_quadrant_mask : np.ndarray
-        Boolean local mask representing the external joint quadrant. Only
-        pixels already selected by SAM inside this domain are restored.
-
-    tube_radius : float
-        Radius used to build the coarse limb tube. It defines the maximum useful
-        distance between visual edges and the limb skeleton. Chromatic edges may
-        use a stricter fraction of this distance.
-
-    point_coords : list[list[float]]
-        Local SAM point coordinates used both for candidate selection and final
-        positive-point coverage validation.
-
-    point_labels : list[int]
-        Labels aligned with ``point_coords``. Positive prompts use label ``1``
-        and negative prompts use label ``0``.
-
-    flood_seed_coords : list[list[float]]
-        Positive local points used exclusively as flood-fill seeds. Unlike the
-        complete SAM prompt set, these coordinates exclude points inside the
-        trusted joint circle because joint support is restored explicitly
-        after flood-fill. They normally include distal landmarks and chromatic
-        samples along the limb that lie outside the joint circle.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        ``(refined_mask, barrier_mask)``.
-
-        ``refined_mask`` is the accepted refined local limb mask. The original
-        SAM mask is returned when refinement cannot be applied safely or fails
-        validation.
-
-        ``barrier_mask`` is the final local union of visual Canny-derived
-        barriers and synthetic joint/distal barriers. It is returned for debug
-        rendering even when the original SAM mask is retained.
-
-    Notes
-    -----
-    The refinement deliberately favors limb completeness over pixel-perfect edge
-    placement. Flood-fill is used primarily to identify the correct SAM-connected
-    limb component rather than to determine the final contour with pixel accuracy.
-    A small expansion then recovers the limb margin lost to the visual barriers
-    while remaining strictly constrained by the original SAM mask.
-
-    Endpoint extension follows the same philosophy. It is intentionally
-    conservative and is limited to sufficiently long observed contours, bounded by
-    a maximum synthetic length, constrained to the permitted domain, and accepted
-    only when its local tangent is approximately parallel to the nearby limb
-    skeleton.
-    """
-    import cv2
-
-    sam_mask = local_sam_mask.astype(bool)
-    skeleton_mask = local_skeleton_mask.astype(bool)
-    synthetic_barriers = local_synthetic_barrier_mask.astype(bool)
-    joint_circle = local_joint_circle_mask.astype(bool)
-    joint_quadrant = local_joint_quadrant_mask.astype(bool)
-
-    empty_barriers = np.zeros_like(sam_mask, dtype=bool)
-
-    sam_area = int(np.count_nonzero(sam_mask))
-    if sam_area <= 0:
-        return sam_mask, empty_barriers
-
-    positive_inside_sam, positive_valid = labeled_points_inside_mask(
-        sam_mask,
-        point_coords,
-        point_labels,
-    )
-
-    required_positive_count = (
-        positive_valid
-        if positive_valid <= 2
-        else int(math.ceil(0.65 * positive_valid))
-    )
-
-    # Keep the same positive-point tolerance used by limb SAM candidate
-    # selection. Sparse prompts remain strict, while richer prompts may miss
-    # a minority of chromatic samples without disabling Canny refinement.
-    if positive_inside_sam < required_positive_count:
-        return sam_mask, empty_barriers
-
-    if not np.any(skeleton_mask):
-        return sam_mask, empty_barriers
-
-    # -------------------------------------------------------------
-    # Multi-channel Canny edge detection
-    # -------------------------------------------------------------
-    distance_to_skeleton = cv2.distanceTransform(
-        (~skeleton_mask).astype(np.uint8),
-        cv2.DIST_L2,
-        5,
-    )
-
-    max_edge_distance = max(
-        2.0,
-        float(tube_radius),
-    )
-
-    lab = cv2.cvtColor(
-        local_rgb,
-        cv2.COLOR_RGB2LAB,
-    )
-
-    clahe = cv2.createCLAHE(
-        clipLimit=ARM_CANNY_CLAHE_CLIP_LIMIT,
-        tileGridSize=(
-            ARM_CANNY_CLAHE_TILE_SIZE,
-            ARM_CANNY_CLAHE_TILE_SIZE,
-        ),
-    )
-
-    l_channel = clahe.apply(
-        lab[:, :, 0],
-    )
-    l_channel = cv2.GaussianBlur(
-        l_channel,
-        (5, 5),
-        0,
-    )
-
-    a_channel = cv2.GaussianBlur(
-        lab[:, :, 1],
-        (5, 5),
-        0,
-    )
-    b_channel = cv2.GaussianBlur(
-        lab[:, :, 2],
-        (5, 5),
-        0,
-    )
-
-    edges_l = cv2.Canny(
-        l_channel,
-        ARM_CANNY_L_LOW_THRESHOLD,
-        ARM_CANNY_L_HIGH_THRESHOLD,
-    ) > 0
-
-    edges_a = cv2.Canny(
-        a_channel,
-        ARM_CANNY_AB_LOW_THRESHOLD,
-        ARM_CANNY_AB_HIGH_THRESHOLD,
-    ) > 0
-
-    edges_b = cv2.Canny(
-        b_channel,
-        ARM_CANNY_AB_LOW_THRESHOLD,
-        ARM_CANNY_AB_HIGH_THRESHOLD,
-    ) > 0
-
-    l_domain = (
-        distance_to_skeleton
-        <= max_edge_distance
-    )
-
-    ab_domain = (
-        distance_to_skeleton
-        <= ARM_CANNY_AB_DISTANCE_RATIO * max_edge_distance
-    )
-
-    edges_l &= l_domain
-    edges_a &= ab_domain
-    edges_b &= ab_domain
-
-    canny = (
-        edges_l
-        | edges_a
-        | edges_b
-    )
-
-    # Creating barriers far outside SAM cannot help the flood-fill. A small
-    # dilation still permits reconnecting borders immediately adjacent to SAM.
-    sam_bridge_domain = cv2.dilate(
-        sam_mask.astype(np.uint8) * 255,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (5, 5),
-        ),
-        iterations=1,
-    ) > 0
-
-    bridge_domain = (
-        l_domain
-        & sam_bridge_domain
-    )
-
-    canny = bridge_consistent_edge_endpoints(
-        canny,
-        allowed_domain=bridge_domain,
-        max_gap=ARM_CANNY_MAX_BRIDGE_GAP,
-        tangent_radius=ARM_CANNY_BRIDGE_TANGENT_RADIUS,
-        min_facing_alignment=ARM_CANNY_BRIDGE_MIN_FACING_ALIGNMENT,
-        min_parallelism=ARM_CANNY_BRIDGE_MIN_PARALLELISM,
-        min_allowed_fraction=ARM_CANNY_BRIDGE_MIN_ALLOWED_FRACTION,
-        bridge_thickness=1,
-    )
-
-    canny = extend_consistent_edge_endpoints(
-        canny,
-        arm_skeleton_mask=skeleton_mask,
-        allowed_domain=bridge_domain,
-        min_component_length=(
-            ARM_CANNY_EXTENSION_MIN_COMPONENT_LENGTH
-        ),
-        max_component_length=(
-            ARM_CANNY_EXTENSION_MAX_COMPONENT_LENGTH
-        ),
-        max_extension_length=(
-            ARM_CANNY_EXTENSION_MAX_LENGTH
-        ),
-        tangent_radius=(
-            ARM_CANNY_EXTENSION_TANGENT_RADIUS
-        ),
-        skeleton_tangent_radius=(
-            ARM_CANNY_EXTENSION_SKELETON_TANGENT_RADIUS
-        ),
-        min_skeleton_parallelism=(
-            ARM_CANNY_EXTENSION_MIN_SKELETON_PARALLELISM
-        ),
-        snap_radius=(
-            ARM_CANNY_EXTENSION_SNAP_RADIUS
-        ),
-        bridge_thickness=1,
-    )
-    # -------------------------------------------------------------
-    # Strengthen visual edges.
-    # -------------------------------------------------------------
-    visual_barriers = canny
-
-    if ARM_CANNY_EDGE_CLOSE_RADIUS > 0:
-        kernel_size = 2 * ARM_CANNY_EDGE_CLOSE_RADIUS + 1
-        close_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (kernel_size, kernel_size),
-        )
-        visual_barriers = cv2.morphologyEx(
-            visual_barriers.astype(np.uint8) * 255,
-            cv2.MORPH_CLOSE,
-            close_kernel,
-        ) > 0
-
-    if ARM_CANNY_EDGE_DILATE_RADIUS > 0:
-        kernel_size = 2 * ARM_CANNY_EDGE_DILATE_RADIUS + 1
-        dilate_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (kernel_size, kernel_size),
-        )
-        visual_barriers = cv2.dilate(
-            visual_barriers.astype(np.uint8) * 255,
-            dilate_kernel,
-            iterations=1,
-        ) > 0
-
-    # Remove small isolated Canny fragments. Synthetic barriers are not passed
-    # through this cleanup because they are explicit trusted closures.
-    visual_barriers = remove_small_components_unless_touching(
-        visual_barriers,
-        reference_mask=synthetic_barriers,
-        min_area=ARM_CANNY_MIN_EDGE_COMPONENT_AREA,
-    )
-
-    barriers = visual_barriers | synthetic_barriers
-
-    # -------------------------------------------------------------
-    # Flood-fill only inside the SAM mask.
-    #
-    # This is the central distinction from the previous implementation:
-    # Canny cuts SAM into reachable regions instead of creating a completely
-    # new mask from the entire local crop.
-    # -------------------------------------------------------------
-    walkable = sam_mask & ~barriers
-
-    reachable = reachable_components_from_labeled_points(
-        walkable,
-        flood_seed_coords,
-        [1] * len(flood_seed_coords),
-    )
-
-    if not np.any(reachable):
-        return sam_mask, barriers
-
-    # -------------------------------------------------------------
-    # Restore the reachable-side half of thickened visual barriers.
-    #
-    # Flood-fill excludes the complete barrier thickness, so the reachable region
-    # ends on the inner edge of each barrier and may become noticeably contracted.
-    #
-    # Each visual-barrier pixel is assigned to the closest side:
-    #
-    # - pixels closer to the reachable limb region are restored;
-    # - pixels closer to the rejected SAM region remain excluded.
-    #
-    # This approximately restores the mask up to the estimated contour centerline
-    # without dilating through the barrier into another SAM component.
-    #
-    # Synthetic joint and distal barriers are deliberately excluded from this
-    # restoration. They are logical flood-fill closures rather than detected image
-    # boundaries.
-    # -------------------------------------------------------------
-    restored_edge_pixels = np.zeros_like(
-        reachable,
-        dtype=bool,
-    )
-
-    if (
-        ARM_CANNY_RESTORE_EDGE_RADIUS > 0
-        and np.any(visual_barriers)
-    ):
-        distance_to_reachable = cv2.distanceTransform(
-            (~reachable).astype(np.uint8),
-            cv2.DIST_L2,
-            5,
-        )
-
-        rejected_region = (
-            sam_mask
-            & ~reachable
-            & ~barriers
-        )
-
-        if np.any(rejected_region):
-            distance_to_rejected = cv2.distanceTransform(
-                (~rejected_region).astype(np.uint8),
-                cv2.DIST_L2,
-                5,
-            )
-        else:
-            distance_to_rejected = np.full(
-                reachable.shape,
-                np.inf,
-                dtype=np.float32,
-            )
-
-        restored_edge_pixels = (
-            visual_barriers
-            & sam_mask
-            & (
-                distance_to_reachable
-                <= float(ARM_CANNY_RESTORE_EDGE_RADIUS)
-            )
-            & (
-                distance_to_reachable
-                <= distance_to_rejected
-            )
-        )
-
-    flood_part = (
-        reachable
-        | restored_edge_pixels
-    )
-
-    # -------------------------------------------------------------
-    # Recover the limb margin consumed by flood-fill barriers.
-    #
-    # Even after restoring the reachable-side barrier pixels, the accepted region
-    # still tends to terminate inside the true limb contour because flood-fill
-    # cannot cross the visual barriers.
-    #
-    # Expand the accepted region by a small configurable radius while remaining
-    # strictly inside the original SAM mask. This produces a more realistic limb
-    # outline without allowing leakage into neighboring regions.
-    # -------------------------------------------------------------
-    if ARM_CANNY_FLOOD_EXPANSION_RADIUS > 0:
-        kernel_size = (
-            2 * ARM_CANNY_FLOOD_EXPANSION_RADIUS + 1
-        )
-
-        expansion_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (kernel_size, kernel_size),
-        )
-
-        flood_part = cv2.dilate(
-            flood_part.astype(np.uint8) * 255,
-            expansion_kernel,
-            iterations=1,
-        ) > 0
-
-        flood_part &= sam_mask
-
-    # -------------------------------------------------------------
-    # Restore proximal-joint support selected by SAM.
-    #
-    # The joint circle and external quadrant define the geometric domains
-    # where SAM-selected joint pixels may be restored after flood-fill.
-    # Neither mask may introduce pixels that were rejected by SAM.
-    # -------------------------------------------------------------
-    joint_restore = (
-        sam_mask
-        & (
-            joint_circle
-            | joint_quadrant
-        )
-    )
-
-    candidate = (
-        flood_part
-        | joint_restore
-    )
-
-    candidate &= sam_mask
-
-    # -------------------------------------------------------------
-    # Validation
-    # -------------------------------------------------------------
-    positive_inside_candidate, _ = labeled_points_inside_mask(
-        candidate,
-        point_coords,
-        point_labels,
-    )
-
-    if positive_inside_candidate < required_positive_count:
-        return sam_mask, barriers
-
-    candidate_area = int(np.count_nonzero(candidate))
-    if candidate_area <= 0:
-        return sam_mask, barriers
-
-    area_ratio = float(candidate_area) / float(max(1, sam_area))
-
-    if area_ratio < ARM_CANNY_ACCEPT_MIN_AREA_RATIO:
-        return sam_mask, barriers
-
-    if area_ratio > ARM_CANNY_ACCEPT_MAX_AREA_RATIO:
-        return sam_mask, barriers
-
-    return candidate, barriers
-
-
 def _predict_limb_mask_on_prior_crop(
     ctx: SegmentationContext,
     *,
@@ -1776,16 +1081,6 @@ def _predict_limb_mask_on_prior_crop(
         x1:x2,
     ].astype(bool)
 
-    local_joint_circle_mask = limb_geometry.joint_circle_mask[
-        y1:y2,
-        x1:x2,
-    ].astype(bool)
-
-    local_joint_quadrant_mask = limb_geometry.joint_quadrant_mask[
-        y1:y2,
-        x1:x2,
-    ].astype(bool)
-
     if not np.any(local_prior):
         return (
             limb_geometry.prior_mask.copy(),
@@ -1838,6 +1133,47 @@ def _predict_limb_mask_on_prior_crop(
         local_points.append([local_x, local_y])
         local_labels.append(int(label))
 
+    def to_local_point(point: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if point is None:
+            return None
+
+        point_array = np.asarray(point, dtype=np.float32).reshape(-1)
+        if point_array.size < 2 or not np.all(np.isfinite(point_array[:2])):
+            return None
+
+        return np.asarray(
+            [
+                float(point_array[0]) - float(x1),
+                float(point_array[1]) - float(y1),
+            ],
+            dtype=np.float32,
+        )
+
+    local_proximal_point = to_local_point(limb_geometry.proximal_point)
+    local_middle_point = to_local_point(limb_geometry.middle_point)
+    local_distal_point = to_local_point(limb_geometry.distal_point)
+
+    local_anatomical_segments: list[tuple[np.ndarray, np.ndarray]] = []
+    if local_proximal_point is not None and local_middle_point is not None:
+        local_anatomical_segments.append((
+            local_proximal_point,
+            local_middle_point,
+        ))
+    if local_middle_point is not None and local_distal_point is not None:
+        local_anatomical_segments.append((
+            local_middle_point,
+            local_distal_point,
+        ))
+    if (
+        not local_anatomical_segments
+        and local_proximal_point is not None
+        and local_distal_point is not None
+    ):
+        local_anatomical_segments.append((
+            local_proximal_point,
+            local_distal_point,
+        ))
+
     if not any(label == 1 for label in local_labels):
         raise RuntimeError(
             f"SubjectCrop node '{ctx.node_id}': {target_name} region "
@@ -1878,63 +1214,23 @@ def _predict_limb_mask_on_prior_crop(
         preferred_source=f'{target_name}-prior-crop',
     ).astype(bool)
 
-    flood_seed_coords: list[list[float]] = []
-
-    for point, label in zip(local_points, local_labels):
-        if int(label) != 1:
-            continue
-
-        px = int(round(float(point[0])))
-        py = int(round(float(point[1])))
-
-        if not (
-            0 <= px < local_width
-            and 0 <= py < local_height
-        ):
-            continue
-
-        # Positive points inside the trusted joint circle are useful for SAM,
-        # but must not seed the limb flood-fill. The joint region is restored
-        # explicitly after flood-fill.
-        if local_joint_circle_mask[py, px]:
-            continue
-
-        flood_seed_coords.append([
-            float(point[0]),
-            float(point[1]),
-        ])
-
-    if not flood_seed_coords:
-        full_mask = np.zeros(
-            (ctx.height, ctx.width),
-            dtype=bool,
-        )
-        full_mask[y1:y2, x1:x2] = local_sam_mask
-
-        full_barriers = np.zeros(
-            (ctx.height, ctx.width),
-            dtype=bool,
-        )
-        full_barriers[y1:y2, x1:x2] = (
-            local_synthetic_barrier_mask
-        )
-
-        return full_mask, full_barriers
-
-    local_refined_mask, local_barriers = (
-        _refine_limb_mask_with_canny_barriers(
-            local_rgb=local_source_rgb,
-            local_sam_mask=local_sam_mask,
-            local_skeleton_mask=local_skeleton_mask,
-            local_synthetic_barrier_mask=local_synthetic_barrier_mask,
-            local_joint_circle_mask=local_joint_circle_mask,
-            local_joint_quadrant_mask=local_joint_quadrant_mask,
-            tube_radius=limb_geometry.tube_radius,
-            point_coords=local_points,
-            point_labels=local_labels,
-            flood_seed_coords=flood_seed_coords,
-        )
-    )
+    # Legacy SubjectCrop path: keep using the compatibility wrapper. SubjectCrop2
+    # owns the split barrier-build / region-partition / proximal-extension
+    # pipeline and should replace this path before the wrapper is removed.
+    # local_refined_mask, local_barriers = (
+    #     refine_limb_mask_with_canny_barriers(
+    #         local_rgb=local_source_rgb,
+    #         local_mask=local_sam_mask,
+    #         local_synthetic_barrier_mask=local_synthetic_barrier_mask,
+    #         local_distal_point=local_distal_point,
+    #         limb_chain_length=limb_geometry.limb_chain_length,
+    #         tube_radius=limb_geometry.tube_radius,
+    #         point_coords=local_points,
+    #         point_labels=local_labels,
+    #         local_anatomical_segments=local_anatomical_segments,
+    #     )
+    # )
+    local_refined_mask, local_barriers = (None, None)
 
     full_mask = np.zeros(
         (ctx.height, ctx.width),
@@ -2578,7 +1874,7 @@ def _segment_arms(ctx: SegmentationContext) -> TargetSegmentationResult:
             for geometry in arm_geometries
         ]),
         shape_part_masks=arm_region_masks,
-        sam_regions=[
+        crop_regions=[
             geometry.sam_region
             for geometry in arm_geometries
         ],
@@ -2746,7 +2042,7 @@ def _segment_legs(ctx: SegmentationContext) -> TargetSegmentationResult:
             for geometry in leg_geometries
         ]),
         shape_part_masks=leg_region_masks,
-        sam_regions=[
+        crop_regions=[
             geometry.sam_region
             for geometry in leg_geometries
         ],
@@ -2932,7 +2228,7 @@ def _segment_feet(ctx: SegmentationContext) -> TargetSegmentationResult:
             region.prompt_bbox for region in foot_regions
         ]),
         shape_part_masks=foot_region_masks,
-        sam_regions=foot_regions,
+        crop_regions=foot_regions,
         prompt_bbox_label='foot-prompt',
         preserve_all_components=True,
     )
@@ -3574,10 +2870,13 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
 
     @property
     def uses_cuda(self) -> bool:
-        spec = resolve_spec(self.spec)
-        return is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
+        return False
 
     def run(self, output_dir, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
+        raise RuntimeError(
+            f"SubjectCrop node '{self.id}': {_SUBJECT_CROP_DISABLED_MESSAGE}"
+        )
+
         # Local imports to avoid hard deps if node unused
         import cv2
 
@@ -3790,12 +3089,12 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
                 out_path=out_path,
                 target=cfg.target,
                 pose_xy=pose_xy,
-                sam_prompt_bbox=segmentation.prompt_bbox,
+                crop_prompt_bbox=segmentation.prompt_bbox,
                 target_bbox=segmentation.target_bbox,
                 hands_res=segmentation.hands_result,
                 face_xy=segmentation.face_xy,
                 mask=debug_mask,
-                sam_regions=segmentation.sam_regions,
+                crop_regions=segmentation.crop_regions,
                 prompt_bbox_label=segmentation.prompt_bbox_label,
                 region_masks=segmentation.debug_region_masks,
                 edge_masks=segmentation.debug_edge_masks,

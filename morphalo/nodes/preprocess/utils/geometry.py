@@ -2,11 +2,29 @@ import numpy as np
 
 from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
 
-
 Point = tuple[float, float]
 
 
 def tight_mask_bbox(alpha: np.ndarray) -> tuple[int, int, int, int]:
+    """
+    Return the tight end-exclusive bbox of non-zero mask pixels.
+
+    Parameters
+    ----------
+    alpha : np.ndarray
+        Two-dimensional mask or alpha channel. Pixels greater than zero are
+        treated as foreground.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        End-exclusive ``(x1, y1, x2, y2)`` foreground bbox.
+
+    Raises
+    ------
+    RuntimeError
+        If ``alpha`` contains no foreground pixels.
+    """
     ys, xs = np.where(alpha > 0)
     if xs.size == 0 or ys.size == 0:
         raise RuntimeError('Trimmed crop has no non-transparent pixels.')
@@ -136,6 +154,30 @@ def expand_clip_bbox(
     h: int,
     margin: float,
 ) -> tuple[int, int, int, int]:
+    """
+    Expand an end-exclusive bbox by a proportional margin and clip to image.
+
+    Parameters
+    ----------
+    x1, y1, x2, y2 : int
+        End-exclusive bbox coordinates.
+    w : int
+        Image width in pixels.
+    h : int
+        Image height in pixels.
+    margin : float
+        Fraction of bbox width/height added to each side.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Expanded and clipped end-exclusive bbox.
+
+    Raises
+    ------
+    RuntimeError
+        If the input or expanded bbox is invalid.
+    """
     # assume x2,y2 are end-exclusive after this normalization
     x1 = int(round(x1))
     y1 = int(round(y1))
@@ -174,6 +216,31 @@ def expand_clip_bbox_by_size_expr(
     h: int,
     margin: SizeExpr,
 ) -> tuple[int, int, int, int]:
+    """
+    Expand an end-exclusive bbox by a size expression and clip to image.
+
+    Parameters
+    ----------
+    x1, y1, x2, y2 : int
+        End-exclusive bbox coordinates.
+    w : int
+        Image width in pixels.
+    h : int
+        Image height in pixels.
+    margin : SizeExpr
+        Pixel, percentage, or numeric size expression resolved independently
+        against bbox width and height.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Expanded and clipped end-exclusive bbox.
+
+    Raises
+    ------
+    RuntimeError
+        If the input or expanded bbox is invalid.
+    """
     # assume x2,y2 are end-exclusive after this normalization
     x1 = int(round(x1))
     y1 = int(round(y1))
@@ -211,6 +278,25 @@ def offset_bbox_xyxy(
 ) -> tuple[int, int, int, int]:
     """
     Translate an end-exclusive bounding box by a constant offset.
+
+    Parameters
+    ----------
+    bbox_xyxy : tuple[int, int, int, int]
+        End-exclusive ``(x1, y1, x2, y2)`` bbox.
+    dx : int
+        Horizontal offset in pixels.
+    dy : int
+        Vertical offset in pixels.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Translated end-exclusive bbox.
+
+    Raises
+    ------
+    RuntimeError
+        If ``bbox_xyxy`` is invalid.
     """
     x1, y1, x2, y2 = bbox_xyxy
 
@@ -228,6 +314,25 @@ def offset_landmarks_xy(
 ) -> np.ndarray:
     """
     Translate landmark coordinates by a constant offset.
+
+    Parameters
+    ----------
+    xy : np.ndarray
+        Landmark coordinates with shape ``(N, 2)``.
+    dx : int
+        Horizontal offset in pixels.
+    dy : int
+        Vertical offset in pixels.
+
+    Returns
+    -------
+    np.ndarray
+        Translated landmark coordinates as ``int32`` with shape ``(N, 2)``.
+
+    Raises
+    ------
+    ValueError
+        If ``xy`` does not have shape ``(N, 2)``.
     """
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError(

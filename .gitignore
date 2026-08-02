@@ -3,5 +3,6 @@ hf_cache/
 __pycache__/
 *.pyc
 outputs/
-my_dags/
+output*/
+my_*/
 .vscode/

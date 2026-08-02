@@ -1,12 +1,10 @@
 import numpy as np
 
 from morphalo.nodes.preprocess.sapiens2_segment_crop import (
-    _parse_target_specs,
-    _resolve_parsed_target,
-    _segment_part_masks,
-    SAPIENS2_CLASSES,
-)
-from morphalo.nodes.preprocess.utils.mask_ops import cleanup_shape_mask_by_parts
+    parse_target_specs, resolve_parsed_target, segment_part_masks)
+from morphalo.nodes.preprocess.utils.mask_ops import \
+    cleanup_shape_mask_by_parts
+from morphalo.nodes.preprocess.utils.sapiens2_seg import SAPIENS2_CLASSES
 
 
 def test_sapiens2_label_ids_match_official_taxonomy():
@@ -18,7 +16,7 @@ def test_sapiens2_label_ids_match_official_taxonomy():
 
 
 def test_target_array_parses_specs_in_order():
-    parsed = _parse_target_specs(
+    parsed = parse_target_specs(
         ['head', 'left-hand', 'hands'],
         node_id='sapiens',
     )
@@ -35,13 +33,13 @@ def test_target_array_parses_specs_in_order():
 
 
 def test_parsed_target_resolves_label_ids_in_order():
-    parsed = _parse_target_specs(
+    parsed = parse_target_specs(
         ['head', 'left-hand', 'hands'],
         node_id='sapiens',
     )
     segments = np.asarray([[0, 15, 0, 0, 6]], dtype=np.int64)
 
-    resolved = _resolve_parsed_target(
+    resolved = resolve_parsed_target(
         parsed,
         node_id='sapiens',
         segments=segments,
@@ -62,12 +60,12 @@ def test_parsed_target_resolves_label_ids_in_order():
 
 
 def test_person_alias_excludes_background():
-    parsed = _parse_target_specs(
+    parsed = parse_target_specs(
         'person',
         node_id='sapiens',
     )
     segments = np.asarray([[0, 1, 28]], dtype=np.int64)
-    resolved = _resolve_parsed_target(
+    resolved = resolve_parsed_target(
         parsed,
         node_id='sapiens',
         segments=segments,
@@ -78,7 +76,7 @@ def test_person_alias_excludes_background():
 
 
 def test_side_specific_arm_and_leg_aliases_parse_candidate_pairs():
-    parsed = _parse_target_specs(
+    parsed = parse_target_specs(
         ['left-arm', 'right-arm', 'left-leg', 'right-leg'],
         node_id='sapiens',
     )
@@ -103,18 +101,18 @@ def test_side_specific_arm_and_leg_aliases_parse_candidate_pairs():
 def test_image_relative_target_selects_candidate_by_image_position():
     segments = np.asarray([[0, 15, 0, 0, 6]], dtype=np.int64)
 
-    left = _resolve_parsed_target(
-        _parse_target_specs('left-hand', node_id='sapiens'),
+    left = resolve_parsed_target(
+        parse_target_specs('left-hand', node_id='sapiens'),
         node_id='sapiens',
         segments=segments,
     )
-    right = _resolve_parsed_target(
-        _parse_target_specs('right-hand', node_id='sapiens'),
+    right = resolve_parsed_target(
+        parse_target_specs('right-hand', node_id='sapiens'),
         node_id='sapiens',
         segments=segments,
     )
-    anatomical = _resolve_parsed_target(
-        _parse_target_specs('anatomical-left-hand', node_id='sapiens'),
+    anatomical = resolve_parsed_target(
+        parse_target_specs('anatomical-left-hand', node_id='sapiens'),
         node_id='sapiens',
         segments=segments,
     )
@@ -148,7 +146,7 @@ def test_cleanup_by_segment_parts_preserves_one_component_per_label():
 
     clean = cleanup_shape_mask_by_parts(
         mask,
-        _segment_part_masks(
+        segment_part_masks(
             segments,
             [SAPIENS2_CLASSES['left-hand'], SAPIENS2_CLASSES['right-hand']],
         ),
