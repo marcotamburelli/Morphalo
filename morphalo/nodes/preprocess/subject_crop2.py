@@ -116,6 +116,44 @@ _LIMB_LABELS_BY_SIDE = {
     ),
 }
 
+
+def _skeleton_touched_limb_label_groups(
+    touched_label_values: frozenset[int],
+    *,
+    limb_side: str,
+) -> tuple[tuple[int, ...], ...]:
+    """
+    Group upper/lower Sapiens2 limb labels for the same anatomical limb.
+
+    The raw Sapiens2 map keeps upper and lower limb classes separate. For limb
+    topology, those classes describe one anatomical target: if the skeleton
+    touches either half, both halves should participate in support filtering and
+    semantic boundary extraction.
+    """
+    touched_values = {int(value) for value in touched_label_values}
+    groups: list[tuple[int, ...]] = []
+    grouped_values: set[int] = set()
+
+    for (_target_kind, side), label_names in sorted(_LIMB_LABELS_BY_SIDE.items()):
+        if side != limb_side:
+            continue
+
+        label_values = tuple(
+            int(SAPIENS2_CLASSES[label_name])
+            for label_name in label_names
+        )
+        if not any(value in touched_values for value in label_values):
+            continue
+
+        groups.append(tuple(sorted(label_values)))
+        grouped_values.update(label_values)
+
+    for value in sorted(touched_values - grouped_values):
+        groups.append((int(value),))
+
+    return tuple(groups)
+
+
 MEDIAPIPE_POSE_LANDMARKS: dict[str, int] = {
     'nose': 0,
     'left_eye': 2,
@@ -152,7 +190,8 @@ LIMB_DEPTH_MIN_DELTA = 0.02
 _LIMB_WORKSPACE_RELIEF_MAX_DISTANCE_RADIUS_RATIO = 0.35
 _LIMB_WORKSPACE_RELIEF_HARD_DISTANCE_RADIUS_RATIO = 0.45
 _LIMB_WORKSPACE_RELIEF_DILATION_PX = 4
-_LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_RADIUS_PX = 5
+_LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_RADIUS_RATIO = 0.10
+_LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_MIN_RADIUS_PX = 1
 _LIMB_WORKSPACE_RELIEF_BRANCH_LOOKAHEAD_PX = 8
 _LIMB_WORKSPACE_RELIEF_MICRO_SPUR_PX = 3
 
@@ -808,6 +847,7 @@ def _build_limb_workspace_relief_from_semantic_edges(
     skeleton_label_edge_mask: np.ndarray,
     tube_radius: float,
     opposite_skeleton_exclusion_mask: Optional[np.ndarray] = None,
+    rejected_component_accumulator: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Expand a geometric tube where skeleton-label borders leave and re-enter it.
@@ -844,6 +884,7 @@ def _build_limb_workspace_relief_from_semantic_edges(
         if opposite_skeleton_exclusion_mask is None
         else np.asarray(opposite_skeleton_exclusion_mask).astype(bool)
     )
+    rejected_accumulator = rejected_component_accumulator
 
     if not (
         semantic_region.shape
@@ -858,6 +899,13 @@ def _build_limb_workspace_relief_from_semantic_edges(
     if opposite_exclusion is not None and opposite_exclusion.shape != tube.shape:
         raise ValueError(
             'opposite_skeleton_exclusion_mask must align with relief masks'
+        )
+    if (
+        rejected_accumulator is not None
+        and rejected_accumulator.shape != tube.shape
+    ):
+        raise ValueError(
+            'rejected_component_accumulator must align with relief masks'
         )
     opposite_exclusion_mask = (
         np.zeros_like(tube, dtype=bool)
@@ -945,12 +993,28 @@ def _build_limb_workspace_relief_from_semantic_edges(
             patch_allowed_mask &= tube_distance <= hard_max_distance_px
         if path_p95_distance > max_distance_px:
             patch_allowed_mask &= tube_distance <= max_distance_px
-        patch &= patch_allowed_mask
+        patch &= patch_allowed_mask & semantic_region
         if not np.any(patch):
             continue
 
         if np.any(patch & opposite_exclusion_mask):
-            continue
+            _, patch_component_labels = cv2.connectedComponents(
+                patch.astype(np.uint8),
+                connectivity=8,
+            )
+            filtered_patch = np.zeros_like(patch, dtype=bool)
+            for component_id in np.unique(patch_component_labels):
+                if int(component_id) == 0:
+                    continue
+                component = patch_component_labels == int(component_id)
+                if np.any(component & opposite_exclusion_mask):
+                    if rejected_accumulator is not None:
+                        rejected_accumulator |= component
+                    continue
+                filtered_patch |= component
+            patch = filtered_patch
+            if not np.any(patch):
+                continue
 
         patch = cv2.dilate(
             patch.astype(np.uint8),
@@ -1110,6 +1174,14 @@ class LimbPartitionContext:
     relief_contact_endpoint_mask : np.ndarray
         Representative outside endpoint pixels selected from ``relief_contact``.
 
+    relief_opposite_skeleton_exclusion_mask : np.ndarray
+        Local dilated opposite-limb skeleton mask used to reject relief patch
+        components.
+
+    relief_rejected_component_mask : np.ndarray
+        Local relief patch components rejected because they intersected
+        ``relief_opposite_skeleton_exclusion_mask``.
+
     skeleton_mask : np.ndarray
         Local anatomical skeleton used only for Canny refinement.
 
@@ -1153,6 +1225,8 @@ class LimbPartitionContext:
     outside_skeleton_label_edge_mask: np.ndarray
     relief_contact_mask: np.ndarray
     relief_contact_endpoint_mask: np.ndarray
+    relief_opposite_skeleton_exclusion_mask: np.ndarray
+    relief_rejected_component_mask: np.ndarray
 
     skeleton_mask: np.ndarray
     anatomical_segments: tuple[
@@ -1247,6 +1321,14 @@ class LimbCoreExtraction:
     relief_contact_endpoint_mask : np.ndarray | None
         Full-frame representative contact endpoints used to start relief traces.
 
+    relief_opposite_skeleton_exclusion_mask : np.ndarray | None
+        Full-frame dilated opposite-limb skeleton mask used to reject relief
+        patch components.
+
+    relief_rejected_component_mask : np.ndarray | None
+        Full-frame relief patch components rejected because they intersected the
+        opposite-limb skeleton exclusion mask.
+
     proximal_cap_mask : np.ndarray
         Full-frame proximal cap retained for proximal continuity selection.
 
@@ -1287,6 +1369,8 @@ class LimbCoreExtraction:
     outside_skeleton_label_edge_mask: Optional[np.ndarray] = None
     relief_contact_mask: Optional[np.ndarray] = None
     relief_contact_endpoint_mask: Optional[np.ndarray] = None
+    relief_opposite_skeleton_exclusion_mask: Optional[np.ndarray] = None
+    relief_rejected_component_mask: Optional[np.ndarray] = None
     canny_debug: Optional[LimbCannyDebug] = None
     overlap_subtraction: Optional['LimbOverlapSubtraction'] = None
 
@@ -1523,7 +1607,10 @@ def _build_limb_partition_context(
         label_map=local_segment_labels,
         selector_mask=local_skeleton,
     )
-    local_skeleton_label_values = sorted(touched_skeleton_label_values)
+    local_skeleton_label_groups = _skeleton_touched_limb_label_groups(
+        touched_skeleton_label_values,
+        limb_side=limb_geometry.side,
+    )
     local_skeleton_label_edges_wide = np.zeros_like(
         local_base_workspace,
         dtype=bool,
@@ -1536,10 +1623,10 @@ def _build_limb_partition_context(
     # semantic region. Using the geometry-clipped prior would add artificial
     # tube/cap edges as if they were semantic label boundaries.
     full_segment_labels = np.asarray(ctx.segments)
-    for label_value in local_skeleton_label_values:
+    for label_values in local_skeleton_label_groups:
         label_support = (
             local_semantic_region
-            & (local_segment_labels == int(label_value))
+            & np.isin(local_segment_labels, np.asarray(label_values))
         )
         if not np.any(label_support):
             continue
@@ -1547,7 +1634,7 @@ def _build_limb_partition_context(
 
         full_label_support = (
             limb_geometry.semantic_region_mask
-            & (full_segment_labels == int(label_value))
+            & np.isin(full_segment_labels, np.asarray(label_values))
         )
         full_label_edge = _mask_boundary_inside_workspace(
             full_label_support,
@@ -1669,14 +1756,21 @@ def _build_limb_partition_context(
         (ctx.height, ctx.width),
         dtype=bool,
     )
+    full_relief_rejected_components = np.zeros_like(
+        full_workspace_relief,
+        dtype=bool,
+    )
     full_opposite_skeleton_exclusion = np.zeros_like(
         full_workspace_relief,
         dtype=bool,
     )
     if opposite_skeleton is not None and np.any(opposite_skeleton):
         exclusion_radius = max(
-            0,
-            int(_LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_RADIUS_PX),
+            int(_LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_MIN_RADIUS_PX),
+            int(round(
+                float(limb_geometry.tube_radius)
+                * _LIMB_WORKSPACE_RELIEF_OPPOSITE_SKELETON_EXCLUSION_RADIUS_RATIO
+            )),
         )
         if exclusion_radius == 0:
             full_opposite_skeleton_exclusion = opposite_skeleton.copy()
@@ -1707,6 +1801,9 @@ def _build_limb_partition_context(
                 opposite_skeleton_exclusion_mask=(
                     full_opposite_skeleton_exclusion
                 ),
+                rejected_component_accumulator=(
+                    full_relief_rejected_components
+                ),
             )
         )
 
@@ -1714,6 +1811,12 @@ def _build_limb_partition_context(
     # been completed on the full semantic contour.
     local_workspace_relief = (
         full_workspace_relief[y1:y2, x1:x2]
+    )
+    local_relief_opposite_skeleton_exclusion = (
+        full_opposite_skeleton_exclusion[y1:y2, x1:x2]
+    )
+    local_relief_rejected_components = (
+        full_relief_rejected_components[y1:y2, x1:x2]
     )
 
     # Build the final closed-core envelope. This workspace, not the semantic
@@ -1770,6 +1873,10 @@ def _build_limb_partition_context(
         outside_skeleton_label_edge_mask=local_outside_skeleton_label_edges,
         relief_contact_mask=local_relief_contact_mask,
         relief_contact_endpoint_mask=local_relief_contact_endpoint_mask,
+        relief_opposite_skeleton_exclusion_mask=(
+            local_relief_opposite_skeleton_exclusion
+        ),
+        relief_rejected_component_mask=local_relief_rejected_components,
         skeleton_mask=local_skeleton,
         anatomical_segments=tuple(anatomical_segments),
         proximal_point=local_proximal_point,
@@ -1790,30 +1897,40 @@ def _expand_regions_over_partition_barriers(
     """
     Build an expanded silhouette from selected topological regions.
 
-    The input regions remain the authoritative undilated topological representation.
-    The returned mask restores adjacent partition-barrier pixels and can then
-    lightly dilate the resulting outline for output and overlap cleanup.
+    The input regions remain the authoritative undilated topological
+    representation. Partition-barrier pixels are restored by propagating from
+    the selected regions through the barrier mask for a bounded number of
+    one-pixel steps.
+
+    An optional final dilation can then smooth or slightly enlarge the derived
+    output silhouette without affecting the original region topology.
 
     Parameters
     ----------
     region_mask : np.ndarray
-        Selected free-space regions before barrier restoration.
+        Selected free-space regions before partition-barrier restoration.
 
     barrier_mask : np.ndarray
         Strengthened partition barriers whose thickness was removed from the
         free-space topology.
 
     allowed_mask : np.ndarray
-        Domain inside which barrier pixels may be restored.
+        Domain inside which barrier restoration and optional output dilation are
+        allowed.
 
     dilation_radius : int
-        Radius used to reach barrier pixels from selected regions. This should
-        normally match the effective barrier-strengthening radius.
+        Maximum number of one-pixel propagation steps through connected
+        partition-barrier pixels.
+
+        This should normally match the effective barrier-strengthening radius.
+        A value of zero disables barrier restoration.
 
     output_dilation_radius : int, default=0
-        Optional final dilation radius applied to the selected regions plus
-        restored barrier pixels. This expands only the derived output silhouette;
-        it does not affect region topology.
+        Optional final morphological dilation radius applied after partition
+        barriers have been restored.
+
+        Unlike ``dilation_radius``, this operation expands the complete derived
+        silhouette and is therefore clipped back to ``allowed_mask``.
 
     Returns
     -------
@@ -1824,13 +1941,16 @@ def _expand_regions_over_partition_barriers(
     ------
     ValueError
         If the masks are not two-dimensional, are not shape-aligned, or if
-        any radius is negative.
+        either radius is negative.
 
     Notes
     -----
-    ``dilation_radius`` is used only to identify partition-barrier pixels
-    adjacent to the selected regions. ``output_dilation_radius`` is the explicit
-    output-silhouette dilation step used to smooth mosaic-like borders.
+    Barrier restoration is constrained to ``barrier_mask``. It cannot propagate
+    through ordinary unselected free-space regions.
+
+    ``dilation_radius`` controls how deeply restoration may travel into a
+    connected strengthened barrier. ``output_dilation_radius`` controls a
+    separate final enlargement of the reconstructed silhouette.
     """
     region = np.asarray(region_mask)
     barriers = np.asarray(barrier_mask)
@@ -1838,13 +1958,16 @@ def _expand_regions_over_partition_barriers(
 
     if region.ndim != 2 or barriers.ndim != 2 or allowed.ndim != 2:
         raise ValueError(
-            'region_mask, barrier_mask, and allowed_mask must be HxW')
+            'region_mask, barrier_mask, and allowed_mask must be HxW'
+        )
     if region.shape != barriers.shape or region.shape != allowed.shape:
         raise ValueError(
-            'region_mask, barrier_mask, and allowed_mask must align')
+            'region_mask, barrier_mask, and allowed_mask must align'
+        )
 
     dilation_radius = int(dilation_radius)
     output_dilation_radius = int(output_dilation_radius)
+
     if dilation_radius < 0 or output_dilation_radius < 0:
         raise ValueError(
             'dilation_radius and output_dilation_radius must be non-negative'
@@ -1854,35 +1977,51 @@ def _expand_regions_over_partition_barriers(
     barrier = barriers.astype(bool)
     domain = allowed.astype(bool)
 
+    selected &= domain
+
     if not np.any(selected):
         return np.zeros_like(selected, dtype=bool)
 
-    selected &= domain
-    if dilation_radius == 0:
-        expanded = selected
-    else:
-        kernel = cv2.getStructuringElement(
+    expanded = selected.copy()
+
+    if dilation_radius > 0 and np.any(barrier):
+        propagation_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (2 * dilation_radius + 1, 2 * dilation_radius + 1),
+            (3, 3),
         )
-        dilated = cv2.dilate(
-            selected.astype(np.uint8) * 255,
-            kernel,
-            iterations=1,
-        ) > 0
-        restored_barriers = barrier & dilated & domain
-        expanded = (selected | restored_barriers) & domain
+
+        for _ in range(dilation_radius):
+            reached = cv2.dilate(
+                expanded.astype(np.uint8),
+                propagation_kernel,
+                iterations=1,
+            ) > 0
+
+            restored_barriers = (
+                reached
+                & barrier
+                & domain
+                & ~expanded
+            )
+
+            if not np.any(restored_barriers):
+                break
+
+            expanded |= restored_barriers
 
     if output_dilation_radius == 0:
         return expanded
 
-    kernel = cv2.getStructuringElement(
+    output_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (2 * output_dilation_radius + 1, 2 * output_dilation_radius + 1),
+        (
+            2 * output_dilation_radius + 1,
+            2 * output_dilation_radius + 1,
+        ),
     )
     expanded = cv2.dilate(
         expanded.astype(np.uint8),
-        kernel,
+        output_kernel,
         iterations=1,
     ) > 0
 
@@ -2010,6 +2149,12 @@ def _extract_internal_limb_core_regions(
             relief_contact_endpoint_mask=paste(
                 partition_context.relief_contact_endpoint_mask,
             ),
+            relief_opposite_skeleton_exclusion_mask=paste(
+                partition_context.relief_opposite_skeleton_exclusion_mask,
+            ),
+            relief_rejected_component_mask=paste(
+                partition_context.relief_rejected_component_mask,
+            ),
             canny_debug=LimbCannyDebug(endpoint_debug=None),
         )
 
@@ -2040,9 +2185,6 @@ def _extract_internal_limb_core_regions(
             synthetic_stop_mask=(
                 partition_context.proximal_barrier_mask
                 | partition_context.distal_barrier_mask
-            ),
-            prolongation_forbidden_mask=(
-                partition_context.workspace_relief_mask
             ),
         )
 
@@ -2093,7 +2235,7 @@ def _extract_internal_limb_core_regions(
         region_mask=local_region_mask,
         barrier_mask=barrier_set.partition_mask,
         allowed_mask=local_reconstruction_domain,
-        dilation_radius=1,
+        dilation_radius=2,
         output_dilation_radius=1,
     )
 
@@ -2125,6 +2267,12 @@ def _extract_internal_limb_core_regions(
         relief_contact_mask=paste(partition_context.relief_contact_mask),
         relief_contact_endpoint_mask=paste(
             partition_context.relief_contact_endpoint_mask,
+        ),
+        relief_opposite_skeleton_exclusion_mask=paste(
+            partition_context.relief_opposite_skeleton_exclusion_mask,
+        ),
+        relief_rejected_component_mask=paste(
+            partition_context.relief_rejected_component_mask,
         ),
         canny_debug=LimbCannyDebug(endpoint_debug=endpoint_debug),
     )
@@ -2622,7 +2770,7 @@ def _extend_limb_regions_proximally(
         region_mask=local_region_mask,
         barrier_mask=barrier_set.partition_mask,
         allowed_mask=local_workspace,
-        dilation_radius=1,
+        dilation_radius=2,
         output_dilation_radius=1,
     )
     # Keep the expanded extension disjoint from the already expanded core.
@@ -2880,6 +3028,18 @@ def _limb_topology_debug_images(
                     (255, 190, 70),
                     0.48,
                 ),
+                CropDebugMaskOverlay(
+                    'opposite skeleton exclusion',
+                    debug_mask(core.relief_opposite_skeleton_exclusion_mask),
+                    (80, 120, 255),
+                    0.28,
+                ),
+                CropDebugMaskOverlay(
+                    'rejected relief components',
+                    debug_mask(core.relief_rejected_component_mask),
+                    (255, 40, 40),
+                    0.62,
+                ),
             ],
             edge_overlays=[
                 CropDebugEdgeOverlay(
@@ -2977,7 +3137,7 @@ def _limb_topology_debug_images(
                 CropDebugMaskOverlay(
                     'expanded core',
                     core.expanded_mask,
-                    (60, 220, 120),
+                    (70, 190, 255),
                     0.34,
                 ),
                 CropDebugMaskOverlay(

@@ -47,7 +47,7 @@ from morphalo.nodes.preprocess import SubjectCrop2
 
 ROOT = Path(__file__).resolve().parents[1]
 
-INIT_IMG = '~/images/2026-03-11_180553.png'
+INIT_IMG = '~/images/img_2.jpg'
 
 SUBJECT_MODEL_SPEC = {
     'yolo_model': 'yolov8n.pt',

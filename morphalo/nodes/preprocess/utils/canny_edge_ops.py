@@ -1400,8 +1400,8 @@ def _prolong_unconnected_limb_endpoints(
     unconnected_indices: list[int],
     result_u8: np.ndarray,
     domain_mask: np.ndarray,
-    synthetic_stop_mask: np.ndarray,
     forbidden_mask: np.ndarray,
+    synthetic_stop_mask: np.ndarray,
     bridge_thickness: int,
     debug_color: tuple[int, int, int],
     rejection_color: tuple[int, int, int],
@@ -1474,7 +1474,6 @@ def connect_limb_edge_endpoints(
     min_allowed_fraction: float = 0.90,
     bridge_thickness: int = 1,
     synthetic_stop_mask: Optional[np.ndarray] = None,
-    prolongation_forbidden_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, CannyPairExtensionDebug]:
     """
     Connect compatible terminal Canny endpoints with direct edge segments.
@@ -1540,10 +1539,6 @@ def connect_limb_edge_endpoints(
     synthetic_stop_mask : np.ndarray or None, optional
         Optional synthetic barrier mask that can stop natural endpoint
         prolongation, such as proximal and distal closure barriers.
-    prolongation_forbidden_mask : np.ndarray or None, optional
-        Optional binary mask. Endpoint-to-endpoint extensions and natural
-        endpoint prolongations are rejected when their rasterized pixels
-        intersect this mask.
 
     Returns
     -------
@@ -1554,11 +1549,6 @@ def connect_limb_edge_endpoints(
     edge_mask = np.asarray(edges).astype(bool)
     skeleton_mask = np.asarray(limb_skeleton_mask).astype(bool)
     domain_mask = np.asarray(allowed_domain).astype(bool)
-    forbidden = (
-        None
-        if prolongation_forbidden_mask is None
-        else np.asarray(prolongation_forbidden_mask).astype(bool)
-    )
 
     if edge_mask.ndim != 2:
         raise ValueError(
@@ -1575,17 +1565,6 @@ def connect_limb_edge_endpoints(
             f'shape, got {edge_mask.shape!r}, {skeleton_mask.shape!r}, '
             f'{domain_mask.shape!r}.'
         )
-    if forbidden is not None and forbidden.shape != edge_mask.shape:
-        raise ValueError(
-            'prolongation_forbidden_mask must have the same shape as edges, '
-            f'got {forbidden.shape!r} and {edge_mask.shape!r}.'
-        )
-    forbidden_mask = (
-        np.zeros_like(edge_mask, dtype=bool)
-        if forbidden is None
-        else forbidden
-    )
-
     if (
         not np.any(edge_mask)
         or not np.any(skeleton_mask)
@@ -1611,7 +1590,7 @@ def connect_limb_edge_endpoints(
     debug_color_pair_intersection = (255, 0, 0)
     debug_color_pair_domain = (0, 255, 0)
     debug_color_pair_parallelism = (0, 215, 255)
-    debug_color_pair_forbidden = (180, 0, 255)
+    debug_color_projection_skeleton = (180, 0, 255)
     debug_color_accepted_pair = (0, 128, 255)
     debug_color_accepted_prolongation = (255, 128, 0)
 
@@ -2186,14 +2165,6 @@ def connect_limb_edge_endpoints(
                 ))
                 continue
 
-            if np.any((extension_u8 > 0) & forbidden_mask):
-                rejection_marks.append((
-                    int(current['x']),
-                    int(current['y']),
-                    debug_color_pair_forbidden,
-                ))
-                continue
-
             connected_index = candidate_index
             connected_mask = extension_u8 > 0
             connected_start_xy = start_xy
@@ -2272,11 +2243,11 @@ def connect_limb_edge_endpoints(
         unconnected_indices=unconnected_indices,
         result_u8=result_u8,
         domain_mask=domain_mask,
+        forbidden_mask=skeleton_mask,
         synthetic_stop_mask=resolved_synthetic_stop_mask,
-        forbidden_mask=forbidden_mask,
         bridge_thickness=bridge_thickness,
         debug_color=debug_color_accepted_prolongation,
-        rejection_color=debug_color_pair_forbidden,
+        rejection_color=debug_color_projection_skeleton,
         accepted_extension_mask=accepted_extension_mask,
         accepted_endpoint_mask=accepted_endpoint_mask,
         accepted_segments=accepted_segments,

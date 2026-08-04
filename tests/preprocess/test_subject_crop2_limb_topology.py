@@ -42,6 +42,7 @@ from morphalo.nodes.preprocess.utils.mask_geometry import (
     ResolvedLandmark,
     build_arm_crop_geometries,
 )
+from morphalo.nodes.preprocess.utils.sapiens2_seg import SAPIENS2_CLASSES
 
 
 def _ctx(shape=(12, 12)):
@@ -200,6 +201,49 @@ def test_barrier_restoration_respects_allowed_mask():
     assert not out[2, 2]
 
 
+def test_barrier_restoration_recovers_two_pixel_barrier():
+    region = np.zeros((7, 8), dtype=bool)
+    region[3, 1] = True
+    barrier = np.zeros_like(region)
+    barrier[3, 2:4] = True
+    allowed = np.ones_like(region)
+
+    out = _expand_regions_over_partition_barriers(
+        region_mask=region,
+        barrier_mask=barrier,
+        allowed_mask=allowed,
+        dilation_radius=2,
+    )
+
+    assert out[3, 1]
+    assert out[3, 2]
+    assert out[3, 3]
+    assert not out[3, 4]
+    assert int(np.count_nonzero(out)) == 3
+
+
+def test_barrier_restoration_recovers_three_pixel_barrier():
+    region = np.zeros((7, 9), dtype=bool)
+    region[3, 1] = True
+    barrier = np.zeros_like(region)
+    barrier[3, 2:5] = True
+    allowed = np.ones_like(region)
+
+    out = _expand_regions_over_partition_barriers(
+        region_mask=region,
+        barrier_mask=barrier,
+        allowed_mask=allowed,
+        dilation_radius=3,
+    )
+
+    assert out[3, 1]
+    assert out[3, 2]
+    assert out[3, 3]
+    assert out[3, 4]
+    assert not out[3, 5]
+    assert int(np.count_nonzero(out)) == 4
+
+
 def test_barrier_restoration_output_dilation_respects_allowed_mask():
     region = np.zeros((5, 5), dtype=bool)
     region[2, 2] = True
@@ -307,6 +351,40 @@ def test_workspace_relief_rejects_patch_near_opposite_skeleton():
 
     opposite_exclusion = np.zeros_like(semantic_region)
     opposite_exclusion[8, 13] = True
+    rejected_components = np.zeros_like(semantic_region)
+
+    relief = _build_limb_workspace_relief_from_semantic_edges(
+        semantic_region_mask=semantic_region,
+        tube_mask=tube,
+        base_workspace_mask=tube,
+        skeleton_label_edge_mask=edge,
+        tube_radius=20.0,
+        opposite_skeleton_exclusion_mask=opposite_exclusion,
+        rejected_component_accumulator=rejected_components,
+    )
+
+    assert not np.any(relief)
+    assert rejected_components[8, 13]
+
+
+def test_workspace_relief_keeps_clean_components_near_opposite_skeleton():
+    semantic_region = np.zeros((24, 24), dtype=bool)
+    semantic_region[3:20, 4:18] = True
+
+    tube = np.zeros_like(semantic_region)
+    tube[5:18, 5:12] = True
+    edge = np.zeros_like(semantic_region)
+
+    edge[6, 12:15] = True
+    edge[7:10, 14] = True
+    edge[10, 12:15] = True
+
+    edge[13, 12:15] = True
+    edge[14:17, 14] = True
+    edge[17, 12:15] = True
+
+    opposite_exclusion = np.zeros_like(semantic_region)
+    opposite_exclusion[8, 13] = True
 
     relief = _build_limb_workspace_relief_from_semantic_edges(
         semantic_region_mask=semantic_region,
@@ -317,7 +395,40 @@ def test_workspace_relief_rejects_patch_near_opposite_skeleton():
         opposite_skeleton_exclusion_mask=opposite_exclusion,
     )
 
-    assert not np.any(relief)
+    assert not relief[8, 13]
+    assert relief[15, 13]
+
+
+def test_workspace_relief_components_are_clipped_to_label_before_rejection():
+    semantic_region = np.zeros((18, 18), dtype=bool)
+    semantic_region[6:12, 12:15] = True
+    semantic_region[8:10, 12:14] = False
+
+    tube = np.zeros_like(semantic_region)
+    tube[5:12, 5:12] = True
+    edge = np.zeros_like(semantic_region)
+
+    edge[6, 12:15] = True
+    edge[7:10, 14] = True
+    edge[10, 12:15] = True
+
+    opposite_exclusion = np.zeros_like(semantic_region)
+    opposite_exclusion[6, 13] = True
+    rejected_components = np.zeros_like(semantic_region)
+
+    relief = _build_limb_workspace_relief_from_semantic_edges(
+        semantic_region_mask=semantic_region,
+        tube_mask=tube,
+        base_workspace_mask=tube,
+        skeleton_label_edge_mask=edge,
+        tube_radius=20.0,
+        opposite_skeleton_exclusion_mask=opposite_exclusion,
+        rejected_component_accumulator=rejected_components,
+    )
+
+    assert not np.any(relief & ~semantic_region)
+    assert np.any(rejected_components)
+    assert not np.any(rejected_components & ~semantic_region)
 
 
 def test_workspace_relief_clips_path_too_far_from_tube():
@@ -605,6 +716,45 @@ def test_skeleton_label_support_uses_labels_crossed_in_semantic_region():
         np.array_equal(label_mask, crossed_extra_label)
         for label_mask in partition.skeleton_label_support_masks
     )
+
+
+def test_skeleton_label_support_groups_upper_and_lower_limb_labels():
+    shape = (14, 14)
+    upper_arm = np.zeros(shape, dtype=bool)
+    upper_arm[2:7, 3:10] = True
+    lower_arm = np.zeros(shape, dtype=bool)
+    lower_arm[7:12, 3:10] = True
+    semantic_region = upper_arm | lower_arm
+
+    tube = np.zeros(shape, dtype=bool)
+    tube[3:6, 4:9] = True
+    support = semantic_region & tube
+    skeleton = np.zeros(shape, dtype=bool)
+    skeleton[3:6, 6] = True
+
+    ctx = _ctx(shape)
+    ctx.segments[upper_arm] = SAPIENS2_CLASSES['left-upper-arm']
+    ctx.segments[lower_arm] = SAPIENS2_CLASSES['left-lower-arm']
+
+    partition = _build_limb_partition_context(
+        ctx,
+        limb_geometry=_geometry(
+            shape=shape,
+            support=support,
+            semantic_region=semantic_region,
+            tube=tube,
+            skeleton=skeleton,
+            side='anatomical-left',
+        ),
+    )
+
+    assert len(partition.skeleton_label_support_masks) == 1
+    assert np.array_equal(
+        partition.skeleton_label_support_masks[0],
+        semantic_region,
+    )
+    assert not partition.skeleton_label_edge_wide_mask[6, 6]
+    assert not partition.skeleton_label_edge_wide_mask[7, 6]
 
 
 def test_arm_tube_radius_uses_pseudo_3d_shoulder_width_for_bounds():
@@ -1045,46 +1195,6 @@ def test_connect_limb_edge_endpoints_rejects_misaligned_terminal_tangents():
     assert np.all(connected[1:4, 10])
 
 
-def test_connect_limb_edge_endpoints_rejects_pair_through_forbidden_mask():
-    edges = np.zeros((15, 25), dtype=bool)
-    edges[4, 3:7] = True
-    edges[2:5, 3] = True
-    edges[4, 12:16] = True
-    edges[2:5, 15] = True
-
-    skeleton = np.zeros_like(edges)
-    skeleton[9, :] = True
-    allowed = np.ones_like(edges)
-    forbidden = np.zeros_like(edges)
-    forbidden[4, 7:13] = True
-
-    connected, debug = connect_limb_edge_endpoints(
-        edges,
-        limb_skeleton_mask=skeleton,
-        allowed_domain=allowed,
-        anatomical_segments=[
-            (
-                np.asarray([0.0, 9.0], dtype=np.float32),
-                np.asarray([24.0, 9.0], dtype=np.float32),
-            ),
-        ],
-        min_contour_parallelism=0.80,
-        ignore_intersection_radius=1,
-        intersection_blocker_dilation_radius=0,
-        prolongation_forbidden_mask=forbidden,
-    )
-
-    assert not np.any(connected & ~edges & forbidden)
-    assert not any(
-        segment.color == (0, 128, 255)
-        for segment in debug.accepted_segments
-    )
-    assert any(
-        color == (180, 0, 255)
-        for _, _, color in debug.rejection_marks
-    )
-
-
 def test_prolong_endpoint_extends_to_workspace_boundary():
     domain = np.ones((7, 7), dtype=bool)
     stop_mask = np.zeros_like(domain)
@@ -1120,16 +1230,14 @@ def test_prolong_endpoint_stops_at_existing_barrier():
     )
 
 
-def test_connect_limb_edge_endpoints_rejects_projection_through_forbidden_mask():
+def test_connect_limb_edge_endpoints_rejects_projection_through_skeleton():
     edges = np.zeros((11, 15), dtype=bool)
     edges[5, 5:9] = True
     edges[4:7, 8] = True
 
     skeleton = np.zeros_like(edges)
-    skeleton[8, :] = True
+    skeleton[5, 2] = True
     allowed = np.ones_like(edges)
-    forbidden = np.zeros_like(edges)
-    forbidden[5, 0:5] = True
 
     connected, debug = connect_limb_edge_endpoints(
         edges,
@@ -1144,7 +1252,6 @@ def test_connect_limb_edge_endpoints_rejects_projection_through_forbidden_mask()
         min_contour_parallelism=0.80,
         ignore_intersection_radius=1,
         intersection_blocker_dilation_radius=0,
-        prolongation_forbidden_mask=forbidden,
     )
 
     assert np.array_equal(connected, edges)
