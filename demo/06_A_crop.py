@@ -54,10 +54,11 @@ ROOT = Path(__file__).resolve().parents[1]
 INIT_IMG = '~/images/init_img_1.png'
 
 SUBJECT_MODEL_SPEC = {
-    'sam_model': 'facebook/sam-vit-large',
-    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
-    'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
+    'yolo_model': 'yolov8n.pt',
+    'segment_model': 'facebook/sapiens2-seg-0.4b',
     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+    'device': 'cuda',
+    'dtype': 'bfloat16',
 }
 
 FACE_MODEL_SPEC = {
@@ -76,23 +77,24 @@ COMMON_PARAMS = {
 SHAPE_CLEANUP_PARAMS = {
     'morph_open_radius': 1,
     'fill_holes': 'all',
-    'min_component_area': 'biggest',
+    'min_component_area': '150',
 }
 
-FOOT_PARAMS = {
+PART_PARAMS = {
     **COMMON_PARAMS,
-    'prompt_expansion': 0.12,
     'postprocess': SHAPE_CLEANUP_PARAMS,
 }
 
 ARM_PARAMS = {
-    **COMMON_PARAMS,
-    'postprocess': SHAPE_CLEANUP_PARAMS,
+    **PART_PARAMS,
 }
 
 LEG_PARAMS = {
-    **COMMON_PARAMS,
-    'postprocess': SHAPE_CLEANUP_PARAMS,
+    **PART_PARAMS,
+}
+
+FOOT_PARAMS = {
+    **PART_PARAMS,
 }
 
 MASK_PARAMS = {
@@ -107,6 +109,10 @@ MASK_PARAMS = {
 NEGATIVE_MASK_PARAMS = {
     **MASK_PARAMS,
     'mode': 'negative-mask',
+}
+
+DEBUG_SPEC = {
+    'save_debug': True,
 }
 
 
@@ -124,6 +130,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': MASK_PARAMS,
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -132,6 +139,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': NEGATIVE_MASK_PARAMS,
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -155,9 +163,10 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'person',
             },
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -166,9 +175,10 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'head',
             },
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -192,9 +202,10 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'hands',
             },
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -203,9 +214,10 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'left-hand',
             },
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -214,9 +226,10 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'right-hand',
             },
+            'debug': DEBUG_SPEC,
         },
     )
 
@@ -561,7 +574,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'person',
                 'crop_mode': 'bbox',
             },
@@ -573,7 +586,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'person',
                 'crop_mode': 'bbox[1:1]',
             },
@@ -585,7 +598,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'person',
                 'crop_mode': 'bbox[16:9]',
             },
@@ -597,7 +610,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'head',
                 'crop_mode': 'bbox',
             },
@@ -609,7 +622,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'head',
                 'crop_mode': 'bbox[1:1]',
             },
@@ -621,7 +634,7 @@ with DAG(
         spec={
             'model': SUBJECT_MODEL_SPEC,
             'params': {
-                **COMMON_PARAMS,
+                **PART_PARAMS,
                 'target': 'left-hand',
                 'crop_mode': 'bbox[1:1]',
             },

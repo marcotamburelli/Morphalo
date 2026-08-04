@@ -464,8 +464,8 @@ Or use the provided helper script:
 ## Optional: download extra model assets
 
 Some nodes rely on external assets such as MediaPipe task files. Most Hugging Face
-models, including SAM/SAM-HQ backends used by `SubjectCrop`, are downloaded
-automatically by Transformers on first use.
+models, including Sapiens2 for `SubjectCrop` and SAM/SAM-HQ for prompt or face
+cropping, are downloaded automatically by Transformers on first use.
 
 Helper scripts are provided:
 

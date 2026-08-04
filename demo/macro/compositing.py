@@ -5,7 +5,7 @@ from typing import Optional
 from morphalo.dag import NodeGroup
 from morphalo.nodes import Img2Img, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
-from morphalo.nodes.preprocess import ImageStack, ImgAuxMap, SubjectCrop2
+from morphalo.nodes.preprocess import ImageStack, ImgAuxMap, SubjectCrop
 from morphalo.nodes.preprocess.utils import ResizeMode
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
@@ -23,7 +23,7 @@ def cutout_stack_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(full_frame=True) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(full_frame=True) -> ImageStack.layer(1)
     background -------------------------------> ImageStack.layer(0)
     ImageStack -> Img2Img(out)  (+ prompt)
 
@@ -65,7 +65,7 @@ def cutout_stack_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {
@@ -134,7 +134,7 @@ def cutout_stack_canny_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(trim) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
     ImageStack -> ImgAuxMap(canny) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
@@ -180,7 +180,7 @@ def cutout_stack_canny_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {
@@ -267,7 +267,7 @@ def cutout_stack_depth_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(trim) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
     ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
@@ -313,7 +313,7 @@ def cutout_stack_depth_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {
@@ -400,7 +400,7 @@ def cutout_stack_pose_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(trim) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
     ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
@@ -442,7 +442,7 @@ def cutout_stack_pose_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {
@@ -531,7 +531,7 @@ def cutout_stack_ip_img2img_group(
 
     This NodeGroup implements a simple compositing + harmonization pattern:
 
-    - a foreground image is cut out with ``SubjectCrop2``;
+    - a foreground image is cut out with ``SubjectCrop``;
     - the cut-out is placed over a background using ``ImageStack``;
     - the stacked composite is passed as the init image to ``Img2Img``;
     - an external style image is attached through IP-Adapter;
@@ -539,7 +539,7 @@ def cutout_stack_ip_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(trim) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
@@ -613,7 +613,7 @@ def cutout_stack_ip_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {
@@ -700,7 +700,7 @@ def cutout_stack_depth_ip_img2img_group(
 
     Pattern
     -------
-    foreground -> SubjectCrop2(trim) -> ImageStack.layer(1)
+    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
     ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
@@ -776,7 +776,7 @@ def cutout_stack_depth_ip_img2img_group(
         # -------------------
         # Subject cut-out
         # -------------------
-        crop = SubjectCrop2(
+        crop = SubjectCrop(
             name='cutout',
             spec={
                 'model': {

@@ -7,6 +7,15 @@ from morphalo.nodes.preprocess import (BoxCrop, ImageStack, ImgAuxMap,
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
 
+SUBJECT_MODEL_SPEC = {
+    'yolo_model': 'yolov8n.pt',
+    'segment_model': 'facebook/sapiens2-seg-0.4b',
+    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+    'device': 'cuda',
+    'dtype': 'bfloat16',
+}
+
+
 def stylize_subject_background_singlepass_group(
     name: str,
     *,
@@ -58,9 +67,7 @@ def stylize_subject_background_singlepass_group(
         subject_mask = SubjectCrop(
             name='subject_mask',
             spec={
-                'model': {
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                },
+                'model': SUBJECT_MODEL_SPEC,
                 'params': {
                     'mode': 'mask',
                     'dilate_radius': subject_mask_dilate_radius,
@@ -73,9 +80,7 @@ def stylize_subject_background_singlepass_group(
         bg_mask = SubjectCrop(
             name='bg_mask',
             spec={
-                'model': {
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                },
+                'model': SUBJECT_MODEL_SPEC,
                 'params': {
                     'mode': 'negative-mask',
                     'dilate_radius': bg_mask_dilate_radius,

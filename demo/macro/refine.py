@@ -20,6 +20,21 @@ FineRegion = Literal[
 ]
 
 
+SUBJECT_MODEL_SPEC = {
+    'yolo_model': 'yolov8n.pt',
+    'segment_model': 'facebook/sapiens2-seg-0.4b',
+    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+    'device': 'cuda',
+    'dtype': 'bfloat16',
+}
+
+FACE_MODEL_SPEC = {
+    'sam_model': 'facebook/sam-vit-large',
+    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+}
+
+
 def refine_face_group(
     name: str,
     *,
@@ -98,10 +113,7 @@ def refine_face_group(
         crop_face = SubjectCrop(
             name='crop_face',
             spec={
-                'model': {
-                    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                },
+                'model': SUBJECT_MODEL_SPEC,
                 'params': {
                     'target': 'head',
                     'mode': 'default',
@@ -263,10 +275,7 @@ def apply_face_id_head_group(
         head_mask = SubjectCrop(
             name='head_mask',
             spec={
-                'model': {
-                    'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                },
+                'model': SUBJECT_MODEL_SPEC,
                 'params': {
                     'target': 'head',
                     'mode': 'mask',
@@ -450,11 +459,7 @@ def fine_face_details_group(
             mask_params['expansion'] = mask_expansion
 
         crop_node_cls = SubjectCrop if region == 'head' else FaceCrop
-        model_spec = {
-            'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
-        }
-        if region == 'head':
-            model_spec['pose_landmarker_task'] = '~/models/mediapipe/pose_landmarker_heavy.task'
+        model_spec = SUBJECT_MODEL_SPEC if region == 'head' else FACE_MODEL_SPEC
 
         region_mask = crop_node_cls(
             name='region_mask',
@@ -603,10 +608,7 @@ def refine_hand_group(
         crop_hand = SubjectCrop(
             name='crop_hand',
             spec={
-                'model': {
-                    'hand_landmarker_task': '~/models/mediapipe/hand_landmarker.task',
-                    'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
-                },
+                'model': SUBJECT_MODEL_SPEC,
                 'params': {
                     'target': target,
                     'mode': 'default',

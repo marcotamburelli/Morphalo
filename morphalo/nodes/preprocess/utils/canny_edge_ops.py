@@ -56,7 +56,7 @@ LIMB_CANNY_GAUSSIAN_KERNEL_AT_REFERENCE = 9
 LIMB_CANNY_GAUSSIAN_KERNEL_MAX = 11
 #
 # The direct Canny path deliberately keeps preprocessing lighter than
-# ``build_canny_edge_map_backup``. A small scale-aware blur suppresses dense
+# ``build_smoothed_canny_edge_map``. A small scale-aware blur suppresses dense
 # fabric texture before Canny without the stronger region flattening introduced
 # by mean-shift.
 LIMB_CANNY_DIRECT_GAUSSIAN_KERNEL_AT_REFERENCE = 5
@@ -98,8 +98,8 @@ LIMB_CANNY_LOW_THRESHOLD = 10
 LIMB_CANNY_HIGH_THRESHOLD = 60
 #
 # Thresholds used by the direct Canny path. They are intentionally higher than
-# the backup thresholds because this path no longer performs mean-shift texture
-# flattening before edge extraction.
+# the smoothed-path thresholds because this path no longer performs mean-shift
+# texture flattening before edge extraction.
 LIMB_CANNY_DIRECT_LOW_THRESHOLD = 25
 LIMB_CANNY_DIRECT_HIGH_THRESHOLD = 85
 #
@@ -445,7 +445,7 @@ def build_canny_edge_map(
 
     This experimental implementation runs Canny on the grayscale source image
     after only a light scale-aware Gaussian blur. It intentionally avoids the
-    stronger mean-shift flattening used by ``build_canny_edge_map_backup`` while
+    stronger mean-shift flattening used by ``build_smoothed_canny_edge_map`` while
     still suppressing dense clothing texture before it becomes endpoint-heavy
     topology.
     """
@@ -541,7 +541,7 @@ def build_canny_edge_map(
     )
 
 
-def build_canny_edge_map_backup(
+def build_smoothed_canny_edge_map(
     *,
     local_rgb: np.ndarray,
     local_mask: np.ndarray,

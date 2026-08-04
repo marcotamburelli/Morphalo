@@ -13,8 +13,8 @@ This is a minimal example of how preprocessing nodes can be chained into a small
 compositing pipeline inside the DAG:
 
 - ``FileImage`` provides the input assets
-- ``SubjectCrop`` isolates the person from the source image using landmarks and
-  a SAM/SAM-HQ segmentation backend
+- ``SubjectCrop`` isolates the person from the source image using YOLO and
+  Sapiens2 semantic segmentation
 - ``ImageStack`` places multiple image layers on a shared canvas
 
 The resulting workflow is useful as a starting point for:
@@ -66,16 +66,16 @@ BK_IMG = '~/images/bk_img.png'
 # Shared model assets used by SubjectCrop.
 #
 # Notes:
-# - sam_model selects the SAM/SAM-HQ backend used for person segmentation.
-# - YOLO proposes person boxes. If omitted, SubjectCrop uses its default YOLO
-#   model.
-# - MediaPipe Pose landmarks stabilize subject-box selection and provide
-#   positive prompt points for person-mask candidates.
+# - YOLO proposes person boxes.
+# - Sapiens2 provides dense body-part parsing.
+# - MediaPipe Pose is required only for topology-dependent limb targets.
 #
 MODEL_SPEC = {
-    'sam_model': 'facebook/sam-vit-large',
     'yolo_model': 'yolov8n.pt',
+    'segment_model': 'facebook/sapiens2-seg-0.4b',
     'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
+    'device': 'cuda',
+    'dtype': 'bfloat16',
 }
 
 # Shared crop parameters for SubjectCrop.

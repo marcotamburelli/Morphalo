@@ -12,7 +12,7 @@ from morphalo.nodes.preprocess.crop_debug import (
     LimbTopologyDebugImage,
     write_limb_topology_debug_directory,
 )
-from morphalo.nodes.preprocess.subject_crop2 import (
+from morphalo.nodes.preprocess.subject_crop import (
     HumanParseContext,
     LimbCoreExtraction,
     LimbOverlapSubtraction,
@@ -881,16 +881,16 @@ def test_limb_core_edge_extension_uses_workspace_domain(monkeypatch):
         )
 
     monkeypatch.setattr(
-        'morphalo.nodes.preprocess.subject_crop2.build_canny_edge_map',
+        'morphalo.nodes.preprocess.subject_crop.build_canny_edge_map',
         fake_build_canny_edge_map,
     )
     monkeypatch.setattr(
-        'morphalo.nodes.preprocess.subject_crop2.'
+        'morphalo.nodes.preprocess.subject_crop.'
         'bridge_consistent_edge_endpoints',
         fake_bridge_consistent_edge_endpoints,
     )
     monkeypatch.setattr(
-        'morphalo.nodes.preprocess.subject_crop2.connect_limb_edge_endpoints',
+        'morphalo.nodes.preprocess.subject_crop.connect_limb_edge_endpoints',
         fake_connect_limb_edge_endpoints,
     )
 
@@ -1005,7 +1005,7 @@ def test_core_overlap_subtraction_updates_region_and_expanded_masks(monkeypatch)
         )
 
     monkeypatch.setattr(
-        'morphalo.nodes.preprocess.subject_crop2.'
+        'morphalo.nodes.preprocess.subject_crop.'
         '_build_front_other_limb_subtraction',
         fake_subtraction,
     )
