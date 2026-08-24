@@ -93,8 +93,8 @@ class LayerSpec:
 
 @dataclass
 class Config:
-    width: int
-    height: int
+    width: Optional[int]
+    height: Optional[int]
     background: Optional[Union[str, Tuple[int, int, int, int]]]
     out_mode: Literal['RGBA', 'RGB']
 
@@ -244,9 +244,11 @@ def feather_is_nonzero(feather: int | str) -> bool:
 def _read_cfg(spec: dict, node_id: str) -> Config:
     params = spec.get('params', {})
 
-    width = int(params.get('width', 1024))
-    height = int(params.get('height', 1024))
-    if width <= 0 or height <= 0:
+    width_raw = params.get('width')
+    height_raw = params.get('height')
+    width = None if width_raw is None else int(width_raw)
+    height = None if height_raw is None else int(height_raw)
+    if (width is not None and width <= 0) or (height is not None and height <= 0):
         raise ValueError(f"'{node_id}': invalid canvas size {width}x{height}")
 
     # Background configuration:
@@ -280,6 +282,32 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     # type: ignore[arg-type]
     return Config(width=width, height=height, background=background, out_mode=out_mode)
+
+
+def _input_image_path(
+    upstream: Any,
+    *,
+    node_id: str,
+    input_name: str,
+) -> Optional[str | Path]:
+    if upstream is None:
+        return None
+
+    if isinstance(upstream, (str, Path)):
+        return upstream
+
+    if isinstance(upstream, dict):
+        path = upstream.get('image') or upstream.get('path')
+        if path:
+            return path
+        raise ValueError(
+            f"{node_id}: upstream for {input_name!r} must contain 'image' or 'path'"
+        )
+
+    raise TypeError(
+        f'{node_id}: upstream for {input_name!r} must be a dict, str, or Path, '
+        f'got {type(upstream).__name__}.'
+    )
 
 
 def _resolve_position_xy(
@@ -1169,7 +1197,13 @@ class ImageStack(NodeRef):
 
     Canvas
     ------
-    Canvas geometry is configured via ``params.width`` and ``params.height``.
+    Canvas geometry can be supplied by a wired ``default`` input or by
+    ``params.width`` and ``params.height``. When ``input['default']`` contains an
+    ``image`` or ``path`` entry, that image becomes the background canvas and
+    its dimensions are used; ``params.width``, ``params.height`` and
+    ``params.background`` are ignored for that run.
+
+    Without a ``default`` background input, the canvas is configured from params.
     The canvas is always constructed in ``RGBA`` mode and may be initialized as:
 
     - fully transparent (``background = null``),
@@ -1414,12 +1448,17 @@ class ImageStack(NodeRef):
     Expected structure:
 
     ``params`` : dict
-        ``width`` : int
+        ``width`` : int, optional
             Output canvas width in pixels.
-        ``height`` : int
+            Ignored when a ``default`` background input is provided.
+
+        ``height`` : int, optional
             Output canvas height in pixels.
-        ``background`` : str or RGB/RGBA sequence or null
+            Ignored when a ``default`` background input is provided.
+
+        ``background`` : str or RGB/RGBA sequence or null, optional
             Initial canvas background.
+            Ignored when a ``default`` background input is provided.
 
             Accepted forms are:
 
@@ -1877,12 +1916,28 @@ class ImageStack(NodeRef):
         input = input or {}
 
         # Build canvas.
-        if cfg.background is None:
-            canvas = Image.new('RGBA', (cfg.width, cfg.height), (0, 0, 0, 0))
-        elif isinstance(cfg.background, str):
-            canvas = Image.new('RGBA', (cfg.width, cfg.height), cfg.background)
+        background_input_path = _input_image_path(
+            input.get('default'),
+            node_id=self.id,
+            input_name='default',
+        )
+        if background_input_path is not None:
+            with Image.open(background_input_path) as im:
+                canvas = im.convert('RGBA')
+            canvas_w, canvas_h = canvas.size
+            background_source = 'input:default'
+            background_value: Any = str(background_input_path)
         else:
-            canvas = Image.new('RGBA', (cfg.width, cfg.height), cfg.background)
+            canvas_w = cfg.width if cfg.width is not None else 1024
+            canvas_h = cfg.height if cfg.height is not None else 1024
+            if cfg.background is None:
+                canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+            elif isinstance(cfg.background, str):
+                canvas = Image.new('RGBA', (canvas_w, canvas_h), cfg.background)
+            else:
+                canvas = Image.new('RGBA', (canvas_w, canvas_h), cfg.background)
+            background_source = 'params'
+            background_value = cfg.background
 
         if not self._layers:
             raise ValueError(
@@ -1898,11 +1953,11 @@ class ImageStack(NodeRef):
                     f"(expected wiring into input_id='image:{idx}')"
                 )
 
-            path = up.get('image') or up.get('path')
-            if not path:
-                raise ValueError(
-                    f"{self.id}: upstream for idx={idx} must contain 'image' or 'path'"
-                )
+            path = _input_image_path(
+                up,
+                node_id=self.id,
+                input_name=f'image:{idx}',
+            )
 
             with Image.open(path) as im:
                 layer = im.convert('RGBA')
@@ -1977,8 +2032,8 @@ class ImageStack(NodeRef):
             layer, anchor_xy = _apply_resize(
                 layer,
                 resize,
-                cfg.width,
-                cfg.height,
+                canvas_w,
+                canvas_h,
                 anchor_xy,
             )
 
@@ -2055,8 +2110,8 @@ class ImageStack(NodeRef):
 
             placement_xy = _resolve_position_xy(
                 position,
-                cfg.width,
-                cfg.height,
+                canvas_w,
+                canvas_h,
                 layer.width,
                 layer.height,
                 anchor_xy,
@@ -2089,9 +2144,10 @@ class ImageStack(NodeRef):
             'id': self.id,
             'image': str(out_path),
             'params': {
-                'width': cfg.width,
-                'height': cfg.height,
-                'background': cfg.background,
+                'width': canvas_w,
+                'height': canvas_h,
+                'background': background_value,
+                'background_source': background_source,
                 'out_mode': cfg.out_mode,
                 'layers': [
                     {

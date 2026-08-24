@@ -350,6 +350,43 @@ def test_image_stack_brightness_changes_rgb_and_preserves_alpha(tmp_path):
     assert out['params']['layers'][0]['brightness'] == -0.5
 
 
+def test_image_stack_default_input_overrides_canvas_params(tmp_path):
+    background = tmp_path / 'background.png'
+    layer = tmp_path / 'layer.png'
+    Image.new('RGB', (6, 5), color=(10, 20, 30)).save(background)
+    Image.new('RGBA', (1, 1), color=(255, 0, 0, 0)).save(layer)
+
+    with DAG('test', out_dir=tmp_path):
+        stack = ImageStack(
+            name='stack',
+            spec={
+                'params': {
+                    'width': 99,
+                    'height': 77,
+                    'background': 'white',
+                    'out_mode': 'RGBA',
+                }
+            },
+        )
+        stack.image(idx=0)
+
+    out = stack.run(
+        tmp_path,
+        input={
+            'default': {'path': str(background)},
+            'image:0': {'image': str(layer)},
+        },
+    )
+    result = Image.open(out['image']).convert('RGBA')
+
+    assert result.size == (6, 5)
+    assert result.getpixel((0, 0)) == (10, 20, 30, 255)
+    assert out['params']['width'] == 6
+    assert out['params']['height'] == 5
+    assert out['params']['background'] == str(background)
+    assert out['params']['background_source'] == 'input:default'
+
+
 @pytest.mark.parametrize('brightness', [-1.1, 1.1])
 def test_image_stack_rejects_brightness_outside_range(tmp_path, brightness):
     with DAG('test', out_dir=tmp_path):
