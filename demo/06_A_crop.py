@@ -12,6 +12,9 @@ Defined DAGs
 ``subject_crop``
     Trimmed RGBA crops for person and head.
 
+``subject_crop_head``
+    Trimmed RGBA crop for the head.
+
 ``subject_crop_hands``
     Trimmed RGBA crops for both hands and image-relative left/right hands.
 
@@ -35,6 +38,7 @@ How to run
 ----------
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_masks
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop
+    ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_head
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_hands
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_arms
     ./bin/run_dag.sh demo.06_A_crop --dag subject_crop_legs
@@ -90,6 +94,10 @@ ARM_PARAMS = {
 }
 
 LEG_PARAMS = {
+    **PART_PARAMS,
+}
+
+HEAD_PARAMS = {
     **PART_PARAMS,
 }
 
@@ -184,6 +192,34 @@ with DAG(
 
     init_img >> [
         person_crop,
+        head_crop,
+    ]
+
+
+with DAG(
+    name='subject_crop_head',
+    out_dir=ROOT / 'outputs' / '06_A_subject_crop_head',
+):
+    init_img = FileImage(
+        name='init_img',
+        path=INIT_IMG,
+    )
+
+    head_crop = SubjectCrop(
+        name='head_crop',
+        spec={
+            'model': SUBJECT_MODEL_SPEC,
+            'params': {
+                **HEAD_PARAMS,
+                'target': 'head',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    init_img >> [
         head_crop,
     ]
 

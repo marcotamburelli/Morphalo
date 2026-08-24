@@ -4391,11 +4391,111 @@ def _segment_legs(
 def _segment_target(
     ctx: HumanParseContext,
 ) -> TargetSegmentationResult:
+    if ctx.cfg.target == 'head':
+        return _segment_head(ctx)
     if ctx.cfg.target in ('arms', 'left-arm', 'right-arm'):
         return _segment_arms(ctx)
     if ctx.cfg.target in ('legs', 'left-leg', 'right-leg'):
         return _segment_legs(ctx)
     return _segment_simple_target(ctx)
+
+
+def _segment_head(
+    ctx: HumanParseContext,
+) -> TargetSegmentationResult:
+    """
+    Resolve the semantic head mask but keep crop geometry face-size driven.
+
+    Sapiens2's ``head`` target includes hair, which is useful for alpha but can
+    over-expand the crop when long hair is visible. The ``face-neck`` label gives
+    a stable center and lower bound, so the final mask is clipped to a
+    geometry-driven head bbox and the reported ``target_bbox`` remains detached
+    from long lateral hair.
+    """
+    head_support_mask, resolved = _resolve_semantic_region(
+        ctx,
+        target='head',
+    )
+    label_ids = resolved.label_ids
+
+    part_masks = segment_part_masks(ctx.segments, label_ids)
+    selected_mask = cleanup_shape_mask_by_parts(
+        head_support_mask,
+        part_masks,
+        **ctx.cfg.shape_cleanup,
+    )
+    if not np.any(selected_mask):
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': structural cleanup removed "
+            "the entire selected mask for target='head'."
+        )
+
+    face_neck_label_id = int(SAPIENS2_CLASSES['face-neck'])
+    face_neck_mask = (ctx.segments == face_neck_label_id) & head_support_mask
+    if not np.any(face_neck_mask):
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': semantic region is empty "
+            "for target='face-neck', required to derive head crop geometry."
+        )
+
+    fx1, fy1, fx2, fy2 = tight_mask_bbox(face_neck_mask.astype(np.uint8))
+
+    hair_label_id = int(SAPIENS2_CLASSES['hair'])
+    hair_mask = (ctx.segments == hair_label_id) & head_support_mask
+    top_mask = hair_mask if np.any(hair_mask) else face_neck_mask
+    _, top_y, _, _ = tight_mask_bbox(top_mask.astype(np.uint8))
+
+    face_neck_y, face_neck_x = np.nonzero(face_neck_mask)
+    if face_neck_x.size == 0:
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': cannot derive head crop "
+            "center from empty face-neck mask."
+        )
+
+    bottom_y = int(fy2)
+    height = max(1, bottom_y - int(top_y))
+    center_x = float(np.median(face_neck_x))
+    half_width = max(1.0, 0.4 * float(height))
+
+    head_bbox = (
+        max(0, int(math.floor(center_x - half_width))),
+        max(0, int(top_y)),
+        min(ctx.width, int(math.ceil(center_x + half_width))),
+        min(ctx.height, bottom_y),
+    )
+    if head_bbox[2] <= head_bbox[0] or head_bbox[3] <= head_bbox[1]:
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': invalid derived head bbox "
+            f'{head_bbox!r}.'
+        )
+
+    hx1, hy1, hx2, hy2 = head_bbox
+    head_region_mask = np.zeros((ctx.height, ctx.width), dtype=bool)
+    head_region_mask[hy1:hy2, hx1:hx2] = True
+    selected_mask = selected_mask & head_region_mask
+    if not np.any(selected_mask):
+        raise RuntimeError(
+            f"SubjectCrop node '{ctx.node_id}': semantic head mask does not "
+            "overlap the face-derived head crop geometry."
+        )
+
+    return TargetSegmentationResult(
+        mask=selected_mask,
+        target_bbox=head_bbox,
+        labels=resolved.labels,
+        label_ids=label_ids,
+        selected_candidates=resolved.selected_candidates,
+        side_resolutions=[
+            *resolved.side_resolutions,
+            {
+                'mode': 'hair-face-neck-derived-head-bbox',
+                'face_neck_bbox_xyxy': [int(fx1), int(fy1), int(fx2), int(fy2)],
+                'head_bbox_xyxy': [int(v) for v in head_bbox],
+            },
+        ],
+        shape_part_masks=part_masks,
+        debug_region_masks=[head_region_mask],
+    )
 
 
 def _segment_simple_target(

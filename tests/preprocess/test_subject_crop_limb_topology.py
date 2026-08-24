@@ -24,6 +24,7 @@ from morphalo.nodes.preprocess.subject_crop import (
     _extract_internal_limb_core_regions,
     _find_edge_tube_intersections,
     _merge_limb_core_and_extension,
+    _segment_head,
     _subtract_limb_core_overlaps,
 )
 from morphalo.nodes.preprocess.utils.canny_edge_ops import (
@@ -62,6 +63,43 @@ def _ctx(shape=(12, 12)):
         segments=np.zeros(shape, dtype=np.int64),
         runtime_dtype=None,
     )
+
+
+def test_segment_head_uses_face_neck_bbox_for_target_geometry():
+    height, width = 80, 80
+    segments = np.zeros((height, width), dtype=np.int64)
+    segments[20:50, 34:47] = SAPIENS2_CLASSES['face-neck']
+    segments[8:70, 20:60] = np.where(
+        segments[8:70, 20:60] == SAPIENS2_CLASSES['face-neck'],
+        segments[8:70, 20:60],
+        SAPIENS2_CLASSES['hair'],
+    )
+    ctx = HumanParseContext(
+        node_id='test',
+        cfg=SimpleNamespace(
+            target='head',
+            expansion=0.5,
+            shape_cleanup={},
+        ),
+        img_rgb=np.zeros((height, width, 3), dtype=np.uint8),
+        width=width,
+        height=height,
+        person_bbox=(0, 0, width, height),
+        pose=None,
+        segments=segments,
+        runtime_dtype=None,
+    )
+
+    result = _segment_head(ctx)
+
+    assert result.target_bbox == (23, 8, 57, 50)
+    assert result.target_bbox != (20, 8, 60, 70)
+    assert np.any(result.mask[8:20, 23:57])
+    assert np.any(result.mask[20:50, 34:47])
+    assert not np.any(result.mask[:8, 20:60])
+    assert not np.any(result.mask[50:70, 20:60])
+    assert not np.any(result.mask[8:70, :23])
+    assert not np.any(result.mask[8:70, 57:])
 
 
 def _geometry(
