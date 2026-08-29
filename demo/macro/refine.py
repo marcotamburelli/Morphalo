@@ -749,12 +749,8 @@ def refine_sliding_tiles_group(
     image_size: tuple[int, int],
     grid: tuple[int, int] = (3, 3),
     window_fraction: tuple[float, float] = (0.5, 0.5),
-    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    texture_weight: float = 0.75,
-    struct_weight: float = 0.75,
-    texture_compl: float = 0.1,
-    struct_compl: float = 0.1,
+    adapter_weight_names: list[str] | None = None,
+    adapter_scales: list[float | dict] | None = None,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
 ) -> NodeGroup:
@@ -788,23 +784,11 @@ def refine_sliding_tiles_group(
         Tile size as a fraction of ``image_size``, expressed as
         ``(width_fraction, height_fraction)``.
 
-    texture_weight_name : str, optional
-        IP-Adapter weight name used for the texture reference.
+    adapter_weight_names : list[str] or None, optional
+        IP-Adapter weight names. When ``None``, no style adapters are added.
 
-    struct_weight_name : str, optional
-        IP-Adapter weight name used for the structure reference.
-
-    texture_weight : float, optional
-        Main texture strength applied mostly to the upper blocks.
-
-    struct_weight : float, optional
-        Main structure strength applied mostly to the lower blocks.
-
-    texture_compl : float, optional
-        Complementary low-block texture strength.
-
-    struct_compl : float, optional
-        Complementary up-block structure strength.
+    adapter_scales : list[float | dict] or None, optional
+        IP-Adapter scales aligned with ``adapter_weight_names``.
 
     layer_feather : int or str, optional
         Feather applied when compositing every refined tile.
@@ -846,14 +830,29 @@ def refine_sliding_tiles_group(
     if not bboxes:
         raise ValueError(f'{name}: no tile boxes were generated')
 
+    if (adapter_weight_names is None) != (adapter_scales is None):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must both be set '
+            'or both be None'
+        )
+    if adapter_weight_names is not None and (
+        len(adapter_weight_names) != len(adapter_scales)
+    ):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must have the '
+            'same length'
+        )
+
     with NodeGroup(name) as g:
         # -------------------
         # Ports
         # -------------------
         tap_image = Tap(name='in_image')
         tap_prompt = Tap(name='in_prompt', strict=False)
-        tap_style_texture = Tap(name='in_texture')
-        tap_style_struct = Tap(name='in_struct')
+        tap_styles = [
+            Tap(name=f'style_{idx + 1}')
+            for idx in range(len(adapter_weight_names or []))
+        ]
 
         resized_image = ResizeImage(
             name='resize_input',
@@ -893,27 +892,18 @@ def refine_sliding_tiles_group(
                 spec={},
             )
 
-            texture_sink = refine_tile.ip_adapter.add(
-                'h94/IP-Adapter',
-                subfolder='sdxl_models',
-                weight_name=texture_weight_name,
-                scale={
-                    'down': {'block_2': [0, texture_compl]},
-                    'up': {'block_0': [0.0, texture_weight, 0.0]},
-                },
-                key='texture',
-            )
-
-            struct_sink = refine_tile.ip_adapter.add(
-                'h94/IP-Adapter',
-                subfolder='sdxl_models',
-                weight_name=struct_weight_name,
-                scale={
-                    'down': {'block_2': [0, struct_weight]},
-                    'up': {'block_0': [0.0, struct_compl, 0.0]},
-                },
-                key='structure',
-            )
+            adapter_sinks = []
+            for style_idx, (weight_name, scale) in enumerate(zip(
+                adapter_weight_names or [],
+                adapter_scales or [],
+            )):
+                adapter_sinks.append(refine_tile.ip_adapter.add(
+                    'h94/IP-Adapter',
+                    subfolder='sdxl_models',
+                    weight_name=weight_name,
+                    scale=scale,
+                    key=f'style_{style_idx + 1}',
+                ))
 
             stack_name = 'out' if is_last else f'stack_{idx:02d}'
 
@@ -931,8 +921,8 @@ def refine_sliding_tiles_group(
             # 3) Refine the tile.
             crop_tile >> refine_tile
             tap_prompt >> refine_tile.prompt()
-            tap_style_texture >> texture_sink
-            tap_style_struct >> struct_sink
+            for tap_style, adapter_sink in zip(tap_styles, adapter_sinks):
+                tap_style >> adapter_sink
 
             # 4) Restore the refined tile to the original crop size before
             #    compositing. Img2Img may emit a different resolution, while
@@ -956,8 +946,7 @@ def refine_sliding_tiles_group(
         g.register_ports(
             tap_image,
             tap_prompt,
-            tap_style_texture,
-            tap_style_struct,
+            *tap_styles,
         )
 
     return g
@@ -975,12 +964,8 @@ def refine_sliding_tiles_with_controlnet_group(
     aux_map_spec: SpecInput = {
         'processor': 'depth_midas',
     },
-    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    texture_weight: float = 0.75,
-    struct_weight: float = 0.75,
-    texture_compl: float = 0.1,
-    struct_compl: float = 0.1,
+    adapter_weight_names: list[str] | None = None,
+    adapter_scales: list[float | dict] | None = None,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
 ) -> NodeGroup:
@@ -1026,23 +1011,11 @@ def refine_sliding_tiles_with_controlnet_group(
         constraint. By default this uses MiDaS depth, matching
         ``controlnet_model``.
 
-    texture_weight_name : str, optional
-        IP-Adapter weight name used for the texture reference.
+    adapter_weight_names : list[str] or None, optional
+        IP-Adapter weight names. When ``None``, no style adapters are added.
 
-    struct_weight_name : str, optional
-        IP-Adapter weight name used for the structure reference.
-
-    texture_weight : float, optional
-        Main texture strength applied mostly to the upper blocks.
-
-    struct_weight : float, optional
-        Main structure strength applied mostly to the lower blocks.
-
-    texture_compl : float, optional
-        Complementary low-block texture strength.
-
-    struct_compl : float, optional
-        Complementary up-block structure strength.
+    adapter_scales : list[float | dict] or None, optional
+        IP-Adapter scales aligned with ``adapter_weight_names``.
 
     layer_feather : int or str, optional
         Feather applied when compositing every refined tile.
@@ -1099,14 +1072,29 @@ def refine_sliding_tiles_with_controlnet_group(
     if not bboxes:
         raise ValueError(f'{name}: no tile boxes were generated')
 
+    if (adapter_weight_names is None) != (adapter_scales is None):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must both be set '
+            'or both be None'
+        )
+    if adapter_weight_names is not None and (
+        len(adapter_weight_names) != len(adapter_scales)
+    ):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must have the '
+            'same length'
+        )
+
     with NodeGroup(name) as g:
         # -------------------
         # Ports
         # -------------------
         tap_image = Tap(name='in_image')
         tap_prompt = Tap(name='in_prompt', strict=False)
-        tap_style_texture = Tap(name='in_texture')
-        tap_style_struct = Tap(name='in_struct')
+        tap_styles = [
+            Tap(name=f'style_{idx + 1}')
+            for idx in range(len(adapter_weight_names or []))
+        ]
 
         resized_image = ResizeImage(
             name='resize_input',
@@ -1160,27 +1148,18 @@ def refine_sliding_tiles_with_controlnet_group(
                 spec={},
             )
 
-            texture_sink = refine_tile.ip_adapter.add(
-                'h94/IP-Adapter',
-                subfolder='sdxl_models',
-                weight_name=texture_weight_name,
-                scale={
-                    'down': {'block_2': [0, texture_compl]},
-                    'up': {'block_0': [0.0, texture_weight, 0.0]},
-                },
-                key='texture',
-            )
-
-            struct_sink = refine_tile.ip_adapter.add(
-                'h94/IP-Adapter',
-                subfolder='sdxl_models',
-                weight_name=struct_weight_name,
-                scale={
-                    'down': {'block_2': [0, struct_weight]},
-                    'up': {'block_0': [0.0, struct_compl, 0.0]},
-                },
-                key='structure',
-            )
+            adapter_sinks = []
+            for style_idx, (weight_name, scale) in enumerate(zip(
+                adapter_weight_names or [],
+                adapter_scales or [],
+            )):
+                adapter_sinks.append(refine_tile.ip_adapter.add(
+                    'h94/IP-Adapter',
+                    subfolder='sdxl_models',
+                    weight_name=weight_name,
+                    scale=scale,
+                    key=f'style_{style_idx + 1}',
+                ))
 
             controlnet_sink = refine_tile.controlnet.add(
                 controlnet_model,
@@ -1210,8 +1189,8 @@ def refine_sliding_tiles_with_controlnet_group(
             # 4) Refine the tile with all constraints.
             crop_tile >> refine_tile
             tap_prompt >> refine_tile.prompt()
-            tap_style_texture >> texture_sink
-            tap_style_struct >> struct_sink
+            for tap_style, adapter_sink in zip(tap_styles, adapter_sinks):
+                tap_style >> adapter_sink
             aux_map >> controlnet_sink
 
             # 5) Restore the refined tile to the original crop size before
@@ -1236,8 +1215,7 @@ def refine_sliding_tiles_with_controlnet_group(
         g.register_ports(
             tap_image,
             tap_prompt,
-            tap_style_texture,
-            tap_style_struct,
+            *tap_styles,
         )
 
     return g

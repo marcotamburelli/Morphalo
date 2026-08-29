@@ -217,8 +217,9 @@ with DAG(
         name='out',
         spec={
             'model': {
-                # Defaults to 'Qwen/Qwen-Image-Edit-2509' if omitted.
-                # 'id': 'Qwen/Qwen-Image-Edit-2509',
+                # Defaults to 'Qwen/Qwen-Image-Edit-2511' if omitted.
+                # Use 'Qwen/Qwen-Image-Edit-2509' for older-run compatibility.
+                # 'id': 'Qwen/Qwen-Image-Edit-2511',
                 'dtype': 'bf16',
                 'device_map': 'balanced',
             },

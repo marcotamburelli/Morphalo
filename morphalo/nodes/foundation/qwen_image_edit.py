@@ -21,12 +21,13 @@ from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
                                                   resolve_qwen_seed)
 from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
-from morphalo.nodes.wiring.mixins import PromptMixin
+from morphalo.nodes.wiring.conditioning import apply_lora, cleanup_adapters
+from morphalo.nodes.wiring.mixins import LoraMixin, PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 
 
 @dataclass
-class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
+class QwenImageEdit(ImageOutputMixin, LoraMixin, PromptMixin, NodeRef):
     """
     Image editing node based on Qwen-Image-Edit.
 
@@ -197,6 +198,7 @@ class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
             dtype=model_cfg.dtype,
             device_map=model_cfg.device_map,
         )
+        lora_bundle = self.build_lora_bundle()
 
         # --- run + stats ---
         stats_device = qwen_stats_device()
@@ -217,6 +219,9 @@ class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
             call_kwargs['width'] = params.width
         if params.height is not None:
             call_kwargs['height'] = params.height
+
+        cleanup_adapters(pipe)
+        apply_lora(lora_bundle=lora_bundle, pipe=pipe)
 
         result = pipe(**call_kwargs)
 
@@ -242,6 +247,7 @@ class QwenImageEdit(ImageOutputMixin, PromptMixin, NodeRef):
             },
             dt_s=dt_s,
             cuda_mem=mem,
+            lora_specs=self.lora.specs,
             model_info={
                 'id': model_cfg.model_id,
                 'device_map': model_cfg.device_map,

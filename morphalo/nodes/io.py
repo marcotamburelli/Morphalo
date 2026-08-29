@@ -5,6 +5,7 @@ from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.wiring.controlnet import ControlNetSpec
 from morphalo.nodes.wiring.face_id import FaceIdSpec
 from morphalo.nodes.wiring.ip_adapter import IpAdapterSpec
+from morphalo.nodes.wiring.lora import LoraSpec
 from morphalo.nodes.wiring.t2i_adapter import T2IAdapterSpec
 
 
@@ -21,6 +22,7 @@ def finalize_image_output(
     t2i_adapter_specs: List[T2IAdapterSpec] = None,
     ip_adapter_specs: List[IpAdapterSpec] = None,
     face_id_specs: List[FaceIdSpec] = None,
+    lora_specs: List[LoraSpec] = None,
     model_info: Optional[dict] = None,
 ) -> dict:
     """
@@ -71,6 +73,8 @@ def finalize_image_output(
         IP-Adapter configuration metadata.
     face_id_specs : list[FaceIdSpec], optional
         FaceID configuration metadata.
+    lora_specs : list[LoraSpec], optional
+        LoRA configuration metadata.
     model_info : dict, optional
         Additional model metadata.
 
@@ -129,6 +133,9 @@ def finalize_image_output(
 
     if face_id_specs:
         out['face-id'] = face_id_meta(face_id_specs)
+
+    if lora_specs:
+        out['loras'] = lora_meta(lora_specs)
 
     if model_info is not None:
         out['model'] = model_info
@@ -191,4 +198,17 @@ def t2i_adapter_meta(t2i_adapter_specs: List[T2IAdapterSpec]) -> list[dict]:
             'input_id': f't2i-adapter:{a.key}',
         }
         for a in (t2i_adapter_specs or [])
+    ]
+
+
+def lora_meta(lora_specs: List[LoraSpec]) -> list[dict]:
+    return [
+        {
+            'key': lora.key,
+            'model_id': lora.model_id,
+            'weight_name': lora.weight_name,
+            'adapter_name': lora.adapter_name,
+            'adapter_weight': lora.adapter_weight,
+        }
+        for lora in (lora_specs or [])
     ]

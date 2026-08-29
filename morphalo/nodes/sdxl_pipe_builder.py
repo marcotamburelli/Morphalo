@@ -6,6 +6,7 @@ import torch
 from morphalo.nodes.wiring.controlnet import ControlNetBundle
 from morphalo.nodes.wiring.face_id import FaceIdBundle
 from morphalo.nodes.wiring.ip_adapter import IpAdapterBundle
+from morphalo.nodes.wiring.lora import LoraBundle
 from morphalo.nodes.wiring.t2i_adapter import T2IAdapterBundle
 
 
@@ -16,8 +17,10 @@ def build_cross_attention_kwargs(
     height: int,
     width: int,
     device: str,
-    dtype: torch.dtype
+    dtype: torch.dtype,
+    lora_bundle: LoraBundle = None,
 ):
+    kwargs = {}
     cross_attention_kwargs = {}
 
     if (ip_bundle.with_mask or face_bundle.with_mask):
@@ -35,11 +38,15 @@ def build_cross_attention_kwargs(
             dtype=dtype
         )
 
-        cross_attention_kwargs['cross_attention_kwargs'] = {
-            'ip_adapter_masks': ip_masks + face_masks
-        }
+        cross_attention_kwargs['ip_adapter_masks'] = ip_masks + face_masks
 
-    return cross_attention_kwargs
+    if lora_bundle is not None and lora_bundle.has_lora:
+        cross_attention_kwargs['scale'] = lora_bundle.cross_attention_scale
+
+    if cross_attention_kwargs:
+        kwargs['cross_attention_kwargs'] = cross_attention_kwargs
+
+    return kwargs
 
 
 def build_pipe_kwargs(
@@ -52,7 +59,8 @@ def build_pipe_kwargs(
     width: int,
     device: str,
     dtype: torch.dtype,
-    init_image_already_passed: bool = False
+    init_image_already_passed: bool = False,
+    lora_bundle: LoraBundle = None,
 ) -> Dict[str, Any]:
     """
     Assemble keyword arguments for a Diffusers SDXL pipeline call from the
@@ -90,6 +98,10 @@ def build_pipe_kwargs(
     face_bundle : FaceIdBundle
         Bundle describing FaceID configuration. If active, precomputed image
         embeddings are passed via ``ip_adapter_image_embeds``.
+
+    lora_bundle : LoraBundle, optional
+        Bundle describing first-class LoRA configuration. If active, its global
+        call-time scale is passed via ``cross_attention_kwargs['scale']``.
 
     height : int
         Target image height, used for constructing cross-attention masks.
@@ -167,6 +179,7 @@ def build_pipe_kwargs(
     kwargs.update(build_cross_attention_kwargs(
         ip_bundle=ip_bundle,
         face_bundle=face_bundle,
+        lora_bundle=lora_bundle,
         height=height,
         width=width,
         device=device,

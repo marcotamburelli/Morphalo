@@ -75,7 +75,6 @@ COMMON_PARAMS = {
     'mode': 'default',
     'crop_mode': 'trim',
     'box_margin': '12%',
-    'expansion': 1.2,
 }
 
 SHAPE_CLEANUP_PARAMS = {

@@ -18,8 +18,9 @@ from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
 from morphalo.nodes.sdxl_pipe_builder import build_pipe_kwargs
 from morphalo.nodes.sdxl_resolve import resolve_common
-from morphalo.nodes.wiring.conditioning import apply_ip_adapter
-from morphalo.nodes.wiring.mixins import ControlNetMixin, PromptMixin
+from morphalo.nodes.wiring.conditioning import (apply_ip_adapter, apply_lora,
+                                                cleanup_adapters)
+from morphalo.nodes.wiring.mixins import ControlNetMixin, LoraMixin, PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 
 
@@ -27,6 +28,7 @@ from morphalo.nodes.wiring.prompt import PromptBundle
 class Img2Img(
     ImageOutputMixin,
     CudaPostRunMixin,
+    LoraMixin,
     ControlNetMixin,
     PromptMixin,
     NodeRef,
@@ -283,6 +285,7 @@ class Img2Img(
             device=ctx.model.device,
             dtype=ctx.model.dtype,
         )
+        lora_bundle = self.build_lora_bundle()
 
         base = get_sdxl_base_pipe(
             model_ref=ctx.model.model_ref,
@@ -312,6 +315,7 @@ class Img2Img(
         cuda_prerun(ctx.model.device)
         t0 = time.perf_counter()
 
+        cleanup_adapters(pipe)
         apply_ip_adapter(
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
@@ -320,11 +324,13 @@ class Img2Img(
             device=ctx.model.device,
             dtype=ctx.model.dtype,
         )
+        apply_lora(lora_bundle=lora_bundle, pipe=pipe)
 
         pipe_kwargs = build_pipe_kwargs(
             cn_bundle=cn_bundle,
             ip_bundle=ip_bundle,
             face_bundle=face_bundle,
+            lora_bundle=lora_bundle,
             height=height,
             width=width,
             device=ctx.model.device,
@@ -396,6 +402,7 @@ class Img2Img(
             controlnet_specs=self.controlnet.specs,
             ip_adapter_specs=self.ip_adapter.specs,
             face_id_specs=self.face_id.specs,
+            lora_specs=self.lora.specs,
             model_info={
                 'source': ctx.model.model_ref.source,
                 'ref': ctx.model.model_ref.ref,

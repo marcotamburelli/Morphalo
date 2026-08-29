@@ -7,6 +7,7 @@ from PIL import Image
 
 from morphalo.nodes.wiring.face_id import FaceIdBundle
 from morphalo.nodes.wiring.ip_adapter import IpAdapterBundle
+from morphalo.nodes.wiring.lora import LoraBundle
 
 if TYPE_CHECKING:
     from diffusers import DiffusionPipeline
@@ -106,7 +107,8 @@ def _clear_faceid_clip_state(pipe: SDXLPipeline) -> None:
     implementation and adapter variant. The subsequent ``unload_ip_adapter()``
     call removes the projection layers themselves.
     """
-    encoder_hid_proj = getattr(pipe.unet, 'encoder_hid_proj', None)
+    unet = getattr(pipe, 'unet', None)
+    encoder_hid_proj = getattr(unet, 'encoder_hid_proj', None)
     if encoder_hid_proj is None:
         return
 
@@ -117,6 +119,104 @@ def _clear_faceid_clip_state(pipe: SDXLPipeline) -> None:
     for layer in layers:
         if hasattr(layer, 'clip_embeds'):
             layer.clip_embeds = None
+
+
+def cleanup_adapters(pipe: SDXLPipeline) -> None:
+    """
+    Reset mutable adapter state on a Diffusers pipeline before applying adapters.
+
+    Diffusers adapter APIs mutate the pipeline instance in-place. Morphalo
+    pipelines are often cached and reused across node executions, so a node must
+    clear adapter state before loading the adapters declared for the current run.
+
+    This helper clears the adapter families that can share mutable pipeline
+    state in the current Morphalo graph model:
+
+    - manually injected FaceID Plus / PlusV2 CLIP embeddings;
+    - IP-Adapter projection layers and image-encoder state, when supported by
+      the pipeline;
+    - LoRA adapters, including LoRAs loaded explicitly by Morphalo and LoRAs
+      loaded as side effects of some FaceID variants.
+
+    Parameters
+    ----------
+    pipe : DiffusionPipeline | IPAdapterMixin | StableDiffusionXLLoraLoaderMixin
+        Diffusers pipeline instance to reset. The function checks for optional
+        unload methods before calling them so it can be used with both Stable
+        Diffusion and Qwen Image pipelines.
+
+    Notes
+    -----
+    - Call this once immediately before adapter application, then call
+      ``apply_ip_adapter(...)`` and/or ``apply_lora(...)`` for the current node.
+    - This function intentionally performs pre-run cleanup only. It does not
+      unload adapters after inference, because the next node run will reset the
+      cached pipeline before applying its own adapter declarations.
+    """
+    _clear_faceid_clip_state(pipe)
+
+    if hasattr(pipe, 'unload_ip_adapter'):
+        pipe.unload_ip_adapter()
+
+    if hasattr(pipe, 'unload_lora_weights'):
+        pipe.unload_lora_weights()
+
+
+def apply_lora(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
+    """
+    Load and activate first-class LoRA adapters on a Diffusers pipeline.
+
+    This function is the runtime counterpart of
+    :class:`morphalo.nodes.wiring.lora.LoraBundle`. It mutates ``pipe`` by
+    loading each declared LoRA checkpoint with ``load_lora_weights`` and then
+    activating the loaded adapters with ``set_adapters``.
+
+    Parameters
+    ----------
+    lora_bundle : LoraBundle
+        Runtime bundle describing the LoRA adapters declared on the node.
+        If no adapters are present, this function leaves the pipeline unchanged.
+    pipe : DiffusionPipeline | StableDiffusionXLLoraLoaderMixin
+        Diffusers pipeline instance that implements ``load_lora_weights`` and
+        ``set_adapters``. Qwen Image pipelines expose the same adapter methods
+        through their LoRA loader mixin.
+
+    Behavior
+    --------
+    - For each :class:`~morphalo.nodes.wiring.lora.LoraSpec`, calls
+      ``pipe.load_lora_weights(model_id, adapter_name=..., weight_name=...)``.
+    - After all LoRAs are loaded, calls
+      ``pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)``.
+    - Adapter names and weights preserve the declaration order from
+      ``node.lora.add(...)``.
+
+    Notes
+    -----
+    - Call :func:`cleanup_adapters` before this function when working with a
+      cached pipeline.
+    - ``adapter_weight`` values control the relative contribution of loaded
+      adapters in ``set_adapters``.
+    - Stable Diffusion pipelines may also receive a separate global LoRA scale
+      through ``cross_attention_kwargs={'scale': ...}``; that call-time argument
+      is built in ``morphalo.nodes.sdxl_pipe_builder`` and is not used by Qwen
+      Image pipelines.
+    """
+    if not lora_bundle.has_lora:
+        return
+
+    for spec in lora_bundle.specs:
+        kwargs = {
+            'adapter_name': spec.adapter_name,
+        }
+        if spec.weight_name is not None:
+            kwargs['weight_name'] = spec.weight_name
+
+        pipe.load_lora_weights(spec.model_id, **kwargs)
+
+    pipe.set_adapters(
+        lora_bundle.adapter_names_arg,
+        adapter_weights=lora_bundle.adapter_weights_arg,
+    )
 
 
 def apply_ip_adapter(
@@ -173,10 +273,6 @@ def apply_ip_adapter(
 
     Behavior
     --------
-    - Always clears manually injected FaceID CLIP state, unloads any previously
-      configured IP-Adapter state, and unloads LoRA weights that may have been
-      loaded as FaceID side effects before applying new conditioning.
-
     - If ``ip_bundle.has_ip_adapter`` is True:
         - registers the corresponding image encoder
         - loads IP-Adapter weights via ``load_ip_adapter``
@@ -194,6 +290,9 @@ def apply_ip_adapter(
     Notes
     -----
     - This function performs in-place mutation of the pipeline.
+    - Call :func:`cleanup_adapters` before this function when using cached
+      pipelines or when combining IP-Adapter / FaceID with first-class LoRA
+      support.
     - The ``batch`` parameter is critical for FaceID Plus / PlusV2:
       mismatched values may lead to tensor shape errors during UNet
       forward passes.
@@ -205,20 +304,6 @@ def apply_ip_adapter(
         raise ValueError(
             'IP-Adapter and IP-Adapter-FaceID are mutually exclusive.'
         )
-
-    # Always reset adapter state before loading a new adapter configuration.
-    # Diffusers IP-Adapter loading mutates the pipeline in-place, FaceID Plus /
-    # PlusV2 injects runtime CLIP tensors into projection layers, and some
-    # FaceID variants may load auxiliary LoRA adapters.
-    _clear_faceid_clip_state(pipe)
-    pipe.unload_ip_adapter()
-    # TODO: Revisit this when Morphalo adds first-class LoRA support.
-    # ``unload_lora_weights()`` clears all LoRA adapters, not only FaceID
-    # side-effect LoRAs. This is acceptable for now because Morphalo does not
-    # yet expose LoRA as an independent conditioning mechanism. Once it does,
-    # LoRA cleanup should become selective or move into the LoRA-specific
-    # configuration block.
-    pipe.unload_lora_weights()
 
     if ip_bundle.has_ip_adapter:
         pipe.register_modules(image_encoder=ip_bundle.image_encoder)

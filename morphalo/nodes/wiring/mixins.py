@@ -6,6 +6,7 @@ from morphalo.nodes.wiring.controlnet import (ControlNetBundle,
                                               ControlNetRegistry)
 from morphalo.nodes.wiring.face_id import FaceIdBundle, FaceIdRegistry
 from morphalo.nodes.wiring.ip_adapter import IpAdapterBundle, IpAdapterRegistry
+from morphalo.nodes.wiring.lora import LoraBundle, LoraRegistry
 from morphalo.nodes.wiring.prompt import PromptRegistry
 from morphalo.nodes.wiring.t2i_adapter import (T2IAdapterBundle,
                                                T2IAdapterRegistry)
@@ -29,6 +30,18 @@ class ControlNetMixin:
             self.face_id.specs, dtype=dtype, device=device, input=input
         )
         return cn_bundle, ip_bundle, face_bundle
+
+
+class LoraMixin:
+    def __post_init__(self):
+        super().__post_init__()
+        self.lora = LoraRegistry(owner=self)
+
+    def build_lora_bundle(self) -> LoraBundle:
+        return LoraBundle(
+            self.lora.specs,
+            cross_attention_scale=self.lora.cross_attention_scale,
+        )
 
 
 class T2IAdapterMixin:

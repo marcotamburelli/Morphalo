@@ -4400,6 +4400,94 @@ def _segment_target(
     return _segment_simple_target(ctx)
 
 
+def _select_local_connected_support_mask(
+    mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Keep plausible local connected support and discard distant label leaks.
+
+    Segmentation models can occasionally emit tiny disconnected islands far from
+    the actual target, for example near shoes, jewelry-like highlights, or
+    background artifacts. Geometry derived from a mask bbox is especially
+    sensitive to those distant islands. We anchor the selection on the largest
+    component, then retain nearby components so useful split pieces around the
+    target are preserved.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Boolean or binary mask whose disconnected components should be filtered.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean mask containing the largest component plus nearby or large
+        compatible components.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return mask
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
+    if num <= 2:
+        return mask
+
+    component_areas = stats[1:, cv2.CC_STAT_AREA]
+    anchor_label = 1 + int(np.argmax(component_areas))
+    anchor_area = float(stats[anchor_label, cv2.CC_STAT_AREA])
+    ax = int(stats[anchor_label, cv2.CC_STAT_LEFT])
+    ay = int(stats[anchor_label, cv2.CC_STAT_TOP])
+    aw = int(stats[anchor_label, cv2.CC_STAT_WIDTH])
+    ah = int(stats[anchor_label, cv2.CC_STAT_HEIGHT])
+    ax2 = ax + aw
+    ay2 = ay + ah
+
+    # The expanded anchor neighborhood intentionally accepts small disconnected
+    # pieces around the face/neck (thin neck splits, accessories, segmentation
+    # gaps) while rejecting isolated islands far below the head.
+    pad_x = max(2, int(round(0.6 * float(aw))))
+    pad_y = max(2, int(round(0.8 * float(ah))))
+    nx1 = max(0, ax - pad_x)
+    ny1 = max(0, ay - pad_y)
+    nx2 = min(mask.shape[1], ax2 + pad_x)
+    ny2 = min(mask.shape[0], ay2 + pad_y)
+
+    keep = labels == anchor_label
+    for label in range(1, num):
+        if label == anchor_label:
+            continue
+
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        x2 = x + w
+        y2 = y + h
+
+        intersects_anchor_neighborhood = (
+            x < nx2
+            and x2 > nx1
+            and y < ny2
+            and y2 > ny1
+        )
+        vertically_compatible = y < ay2 + max(2, int(round(0.5 * float(ah))))
+
+        # Large nearby splits are kept even when disconnected; small far-away
+        # specks are the exact failure mode that makes the head bbox collapse
+        # into an almost person-sized crop.
+        if (
+            intersects_anchor_neighborhood
+            or (area >= 0.15 * anchor_area and vertically_compatible)
+        ):
+            keep |= labels == label
+
+    return keep
+
+
 def _segment_head(
     ctx: HumanParseContext,
 ) -> TargetSegmentationResult:
@@ -4432,6 +4520,7 @@ def _segment_head(
 
     face_neck_label_id = int(SAPIENS2_CLASSES['face-neck'])
     face_neck_mask = (ctx.segments == face_neck_label_id) & head_support_mask
+    face_neck_mask = _select_local_connected_support_mask(face_neck_mask)
     if not np.any(face_neck_mask):
         raise RuntimeError(
             f"SubjectCrop node '{ctx.node_id}': semantic region is empty "

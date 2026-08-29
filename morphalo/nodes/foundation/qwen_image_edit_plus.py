@@ -22,18 +22,28 @@ from morphalo.nodes.foundation.qwen_utils import (qwen_cpu_generator,
 from morphalo.nodes.foundation.wiring import ImageSequenceMixin
 from morphalo.nodes.image_output import ImageOutputMixin
 from morphalo.nodes.io import finalize_image_output
-from morphalo.nodes.wiring.mixins import PromptMixin
+from morphalo.nodes.wiring.conditioning import apply_lora, cleanup_adapters
+from morphalo.nodes.wiring.mixins import LoraMixin, PromptMixin
 from morphalo.nodes.wiring.prompt import PromptBundle
 
 
+DEFAULT_QWEN_IMAGE_EDIT_PLUS_MODEL_ID = 'Qwen/Qwen-Image-Edit-2511'
+
+
 @dataclass
-class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeRef):
+class QwenImageEditPlus(
+    ImageOutputMixin,
+    ImageSequenceMixin,
+    LoraMixin,
+    PromptMixin,
+    NodeRef,
+):
     """
-    Image editing node based on Qwen-Image-Edit-2509.
+    Image editing node based on Qwen-Image-Edit Plus models.
 
     This node applies an instruction-driven image edit using the Diffusers
     ``QwenImageEditPlusPipeline``. It is intended as the updated counterpart of
-    ``QwenImageEdit`` and defaults to ``'Qwen/Qwen-Image-Edit-2509'``.
+    ``QwenImageEdit`` and defaults to ``'Qwen/Qwen-Image-Edit-2511'``.
 
     Unlike the older single-image node, this node supports one or more input
     images. The optional default input, when present, contributes the first
@@ -57,7 +67,13 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
 
         - ``id`` : str, optional
           Hugging Face model identifier. Defaults to
-          ``'Qwen/Qwen-Image-Edit-2509'``.
+          ``'Qwen/Qwen-Image-Edit-2511'``.
+
+          Currently relevant Qwen Image Edit Plus checkpoints:
+          - ``'Qwen/Qwen-Image-Edit-2511'``: current default, newer model with
+            improved consistency and editing capabilities.
+          - ``'Qwen/Qwen-Image-Edit-2509'``: previous model, useful for
+            reproducibility or comparison with older runs.
         - ``dtype`` : str, optional
           Torch dtype used to load model weights. Defaults to ``'bf16'``.
         - ``device_map`` : {'balanced'}, optional
@@ -74,6 +90,9 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
           Number of inference steps. Defaults to ``40``.
         - ``true_cfg_scale`` : float, optional
           True classifier-free guidance scale. Defaults to ``4.0``.
+          ``guidance_scale`` is intentionally not exposed here for now; it may
+          be revisited if Morphalo adds support for guidance-distilled Qwen edit
+          variants.
         - ``width`` : int, optional
           Output image width. If omitted, the pipeline default is used.
         - ``height`` : int, optional
@@ -85,7 +104,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
         ``seed`` : int or str, optional
             Random seed used for generation. Can be an integer or ``'random'``.
     evict_after_run : bool, default=False
-        If ``True``, evict the cached Qwen-Image-Edit-2509 pipeline used by this
+        If ``True``, evict the cached Qwen Image Edit Plus pipeline used by this
         node after a successful execution and trigger best-effort Python/CUDA
         cleanup.
 
@@ -113,7 +132,8 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
     dict
         Primary output dictionary with a single generated image and a JSON
         sidecar. The sidecar includes resolved parameters, model information,
-        input image metadata, timing information, and CUDA memory statistics.
+        input image metadata, optional LoRA metadata, timing information, and
+        CUDA memory statistics.
 
     Notes
     -----
@@ -132,6 +152,9 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
     - The pipeline is dispatched using Accelerate ``device_map='balanced'``,
       rather than an explicit ``.to(device)`` call. This balances memory across
       available devices and is the supported path for limited-VRAM setups.
+    - LoRA adapters may be declared with ``node.lora.add(...)``. Qwen Image
+      LoRAs are loaded via Diffusers ``load_lora_weights`` and activated via
+      ``set_adapters``; SDXL-only ``cross_attention_kwargs`` are not passed.
     """
 
     spec: SpecInput = field(default_factory=dict)
@@ -155,7 +178,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
         2. image(s) received from indexed condition inputs, sorted by ascending
         ``idx``.
 
-        Qwen-Image-Edit-2509 does not receive typed condition channels through this
+        Qwen Image Edit Plus does not receive typed condition channels through this
         method. All additional inputs are passed as ordinary images in the pipeline
         ``image`` argument. Their role must therefore be described explicitly in the
         prompt, for example:
@@ -215,7 +238,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
         # Model
         model_cfg = resolve_qwen_model_config(
             spec,
-            default_model_id='Qwen/Qwen-Image-Edit-2509',
+            default_model_id=DEFAULT_QWEN_IMAGE_EDIT_PLUS_MODEL_ID,
             node_name='QwenImageEditPlus',
             supported_by='QwenImageEditPlusPipeline',
         )
@@ -238,6 +261,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
             dtype=model_cfg.dtype,
             device_map=model_cfg.device_map,
         )
+        lora_bundle = self.build_lora_bundle()
 
         stats_device = qwen_stats_device()
         cuda_prerun(stats_device)
@@ -257,6 +281,9 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
             call_kwargs['width'] = params.width
         if params.height is not None:
             call_kwargs['height'] = params.height
+
+        cleanup_adapters(pipe)
+        apply_lora(lora_bundle=lora_bundle, pipe=pipe)
 
         result = pipe(**call_kwargs)
 
@@ -283,6 +310,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
             },
             dt_s=dt_s,
             cuda_mem=mem,
+            lora_specs=self.lora.specs,
             model_info={
                 'id': model_cfg.model_id,
                 'device_map': model_cfg.device_map,
@@ -313,7 +341,7 @@ class QwenImageEditPlus(ImageOutputMixin, ImageSequenceMixin, PromptMixin, NodeR
             spec = resolve_spec(self.spec)
             model_cfg = resolve_qwen_model_config(
                 spec,
-                default_model_id='Qwen/Qwen-Image-Edit-2509',
+                default_model_id=DEFAULT_QWEN_IMAGE_EDIT_PLUS_MODEL_ID,
                 node_name='QwenImageEditPlus',
                 supported_by='QwenImageEditPlusPipeline',
             )

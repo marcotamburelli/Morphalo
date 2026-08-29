@@ -69,6 +69,7 @@ def test_segment_head_uses_face_neck_bbox_for_target_geometry():
     height, width = 80, 80
     segments = np.zeros((height, width), dtype=np.int64)
     segments[20:50, 34:47] = SAPIENS2_CLASSES['face-neck']
+    segments[65:68, 10:13] = SAPIENS2_CLASSES['face-neck']
     segments[8:70, 20:60] = np.where(
         segments[8:70, 20:60] == SAPIENS2_CLASSES['face-neck'],
         segments[8:70, 20:60],
@@ -98,6 +99,7 @@ def test_segment_head_uses_face_neck_bbox_for_target_geometry():
     assert np.any(result.mask[20:50, 34:47])
     assert not np.any(result.mask[:8, 20:60])
     assert not np.any(result.mask[50:70, 20:60])
+    assert not np.any(result.mask[65:68, 10:13])
     assert not np.any(result.mask[8:70, :23])
     assert not np.any(result.mask[8:70, 57:])
 

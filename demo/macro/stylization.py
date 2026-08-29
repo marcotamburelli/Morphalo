@@ -1134,49 +1134,34 @@ def refine_region_group(
     return g
 
 
-def refine_region_dual_style_group(
+def refine_region_multi_style_group(
     name: str,
     *,
     refine_spec: SpecInput,
     stack_spec: SpecInput = {},
     bbox: tuple[int, ...],
     bbox_format: str = 'xyxy',
-    texture_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    struct_weight_name: str = 'ip-adapter_sdxl_vit-h.bin',
-    texture_weight: float = 0.75,
-    struct_weight: float = 0.75,
-    texture_compl: float = 0.1,
-    struct_compl: float = 0.1,
+    adapter_weight_names: list[str] | None = None,
+    adapter_scales: list[float | dict] | None = None,
     layer_feather: int | str = 30,
     layer_corner_radius: int | str = 50,
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines a manually selected rectangular
-    region using separate texture and structure IP-Adapter references.
+    region using zero or more IP-Adapter references.
 
     The group crops a fixed rectangular region from the input image, refines that
-    crop with ``Img2Img`` using two IP-Adapter slots, and overlays the refined
-    crop back onto the original image using the crop metadata emitted by
+    crop with ``Img2Img`` using zero or more IP-Adapter slots, and overlays the
+    refined crop back onto the original image using the crop metadata emitted by
     ``BoxCrop``.
-
-    The two IP-Adapter references are routed differently:
-
-    - ``in_texture`` is applied mostly to upper UNet blocks, which usually affect
-      fine visual texture, material appearance, and local detail.
-    - ``in_struct`` is applied mostly to lower UNet blocks, which usually affect
-      structure, layout, and broader composition.
 
     Ports
     -----
     in_image
         Base image used both as stack background and crop source.
 
-    in_texture
-        Texture/style reference image wired into the first IP-Adapter slot.
-
-    in_struct
-        Structure/composition reference image wired into the second IP-Adapter
-        slot.
+    style_1, style_2, ...
+        Style reference ports created from ``adapter_weight_names``.
 
     in_prompt
         Optional prompt payload wired into the internal ``Img2Img`` prompt sink.
@@ -1198,23 +1183,11 @@ def refine_region_dual_style_group(
     bbox_format : {'xyxy', 'xywh', 'xyl'}, optional
         Format of ``bbox``. Default is ``'xyxy'``.
 
-    texture_weight_name : str, optional
-        IP-Adapter weight name used for the texture reference.
+    adapter_weight_names : list[str] or None, optional
+        IP-Adapter weight names. When ``None``, no style adapters are added.
 
-    struct_weight_name : str, optional
-        IP-Adapter weight name used for the structure reference.
-
-    texture_weight : float, optional
-        Main texture strength routed to upper UNet blocks.
-
-    struct_weight : float, optional
-        Main structure strength routed to lower UNet blocks.
-
-    texture_compl : float, optional
-        Complementary texture strength routed to lower UNet blocks.
-
-    struct_compl : float, optional
-        Complementary structure strength routed to upper UNet blocks.
+    adapter_scales : list[float | dict] or None, optional
+        IP-Adapter scales aligned with ``adapter_weight_names``.
 
     layer_feather : int or str, optional
         Feather applied when compositing the refined crop.
@@ -1229,13 +1202,9 @@ def refine_region_dual_style_group(
         1) background layer for ``ImageStack``;
         2) source image for ``BoxCrop``.
 
-    in_texture : Tap
-        Texture/style reference image, or reference image list, wired into the
-        ``texture`` IP-Adapter slot of ``refine_region``.
-
-    in_struct : Tap
-        Structure/composition reference image, or reference image list, wired
-        into the ``structure`` IP-Adapter slot of ``refine_region``.
+    style_1, style_2, ... : Tap
+        Style reference images, or reference image lists, wired into dynamic
+        IP-Adapter slots of ``refine_region``.
 
     in_prompt : Tap
         Optional prompt payload wired into the prompt sink of ``refine_region``.
@@ -1249,22 +1218,32 @@ def refine_region_dual_style_group(
 
     Notes
     -----
-    This group is a dual-style counterpart of ``refine_region_group``. It does
-    not run semantic detection and relies entirely on the provided coordinates.
-
-    The default IP-Adapter routing follows the practical Morphalo convention:
-
-    - lower blocks preserve or transfer structure;
-    - upper blocks transfer texture and fine visual detail.
+    This group does not run semantic detection and relies entirely on the
+    provided coordinates.
     """
+    if (adapter_weight_names is None) != (adapter_scales is None):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must both be set '
+            'or both be None'
+        )
+    if adapter_weight_names is not None and (
+        len(adapter_weight_names) != len(adapter_scales)
+    ):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must have the '
+            'same length'
+        )
+
     with NodeGroup(name) as g:
         # -------------------
         # Ports
         # -------------------
         tap_image = Tap(name='in_image')
         tap_prompt = Tap(name='in_prompt', strict=False)
-        tap_style_texture = Tap(name='in_texture')
-        tap_style_struct = Tap(name='in_struct')
+        tap_styles = [
+            Tap(name=f'style_{idx + 1}')
+            for idx in range(len(adapter_weight_names or []))
+        ]
 
         # -------------------
         # Internal nodes
@@ -1284,27 +1263,18 @@ def refine_region_dual_style_group(
             spec=refine_spec,
         )
 
-        texture_sink = refine_region.ip_adapter.add(
-            'h94/IP-Adapter',
-            subfolder='sdxl_models',
-            weight_name=texture_weight_name,
-            scale={
-                'down': {'block_2': [0, texture_compl]},
-                'up': {'block_0': [0.0, texture_weight, 0.0]},
-            },
-            key='texture',
-        )
-
-        struct_sink = refine_region.ip_adapter.add(
-            'h94/IP-Adapter',
-            subfolder='sdxl_models',
-            weight_name=struct_weight_name,
-            scale={
-                'down': {'block_2': [0, struct_weight]},
-                'up': {'block_0': [0.0, struct_compl, 0.0]},
-            },
-            key='structure',
-        )
+        adapter_sinks = []
+        for style_idx, (weight_name, scale) in enumerate(zip(
+            adapter_weight_names or [],
+            adapter_scales or [],
+        )):
+            adapter_sinks.append(refine_region.ip_adapter.add(
+                'h94/IP-Adapter',
+                subfolder='sdxl_models',
+                weight_name=weight_name,
+                scale=scale,
+                key=f'style_{style_idx + 1}',
+            ))
 
         stack = ImageStack(
             name='out',
@@ -1324,8 +1294,8 @@ def refine_region_dual_style_group(
         # 3) Refine cropped region.
         crop_region >> refine_region
         tap_prompt >> refine_region.prompt()
-        tap_style_texture >> texture_sink
-        tap_style_struct >> struct_sink
+        for tap_style, adapter_sink in zip(tap_styles, adapter_sinks):
+            tap_style >> adapter_sink
 
         # 4) Overlay refined crop using BoxCrop transform metadata.
         layer1 = stack.image(
@@ -1344,8 +1314,7 @@ def refine_region_dual_style_group(
         g.register_ports(
             tap_image,
             tap_prompt,
-            tap_style_texture,
-            tap_style_struct,
+            *tap_styles,
         )
 
     return g

@@ -122,6 +122,7 @@ def cutout_stack_img2img_group(
 def cutout_stack_canny_img2img_group(
     name: str,
     *,
+    txt2img_spec: SpecInput,
     out_spec: SpecInput,
     fg_layer_feather: int | str = '0.5%',
     fg_layer_position: str = 'center',
@@ -129,25 +130,33 @@ def cutout_stack_canny_img2img_group(
     canny_conditioning_scale: float = 0.7,
 ) -> NodeGroup:
     """
-    Compose a trimmed cut-out subject over a background, derive a Canny map
-    from the composite, then harmonize with Img2Img using Canny ControlNet.
+    Generate a Canny-guided subject, cut it out, composite it over a
+    background, then harmonize the stack with Img2Img.
+
+    The foreground image is used as the source for the initial Canny
+    ControlNet. The generated subject image is cropped with ``SubjectCrop`` and
+    placed over the provided background. The final node is a true ``Img2Img``
+    pass: it receives the stacked composite as its init image and the same
+    prompt used by the initial ``Txt2Img`` pass.
 
     Pattern
     -------
-    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
+    foreground -> ImgAuxMap(canny) -> Txt2Img.controlnet
+    prompt ----------------------> Txt2Img(prompt)
+    Txt2Img -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
-    ImageStack -> ImgAuxMap(canny) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
 
     Ports
     -----
     - 'foreground' (Tap)
-        Image containing the subject to extract.
+        Source image used to derive the Canny conditioning map.
     - 'background' (Tap)
         Background image used for the composition.
     - 'prompt' (Tap)
-        Prompt payload wired to the final Img2Img pass.
+        Prompt payload wired to both the initial Txt2Img pass and the final
+        Img2Img pass.
 
     Output
     ------
@@ -157,6 +166,10 @@ def cutout_stack_canny_img2img_group(
     ----------
     name : str
         Group name (scope prefix).
+    txt2img_spec : SpecInput
+        Spec for the initial Canny-guided Txt2Img pass. This spec should define
+        the text-to-image model and generation parameters used with Canny
+        ControlNet.
     out_spec : SpecInput
         Spec for the final Img2Img harmonization pass.
     fg_layer_feather : int | str, optional
@@ -166,7 +179,8 @@ def cutout_stack_canny_img2img_group(
     fg_layer_resize : ResizeMode, optional
         Optional resize parameter for the subject layer.
     canny_conditioning_scale : float, optional
-        Conditioning scale used for the Canny ControlNet.
+        Conditioning scale used for Canny ControlNet during the initial Txt2Img
+        pass.
     """
 
     with NodeGroup(name) as g:
@@ -178,7 +192,32 @@ def cutout_stack_canny_img2img_group(
         prompt = Tap(name='prompt', strict=False)
 
         # -------------------
-        # Subject cut-out
+        # Canny-guided generation
+        # -------------------
+        canny = ImgAuxMap(
+            name='canny',
+            spec={
+                'processor': 'canny',
+                'detect_resolution': 1024,
+            },
+        )
+
+        txt2img = Txt2Img(
+            name='txt2img',
+            spec=txt2img_spec,
+        )
+
+        fg >> canny
+        prompt >> txt2img.prompt()
+
+        canny >> txt2img.controlnet.add(
+            'diffusers/controlnet-canny-sdxl-1.0',
+            conditioning_scale=canny_conditioning_scale,
+            key='canny',
+        )
+
+        # -------------------
+        # Subject cut-out from generated image
         # -------------------
         crop = SubjectCrop(
             name='cutout',
@@ -206,7 +245,7 @@ def cutout_stack_canny_img2img_group(
 
         bg >> stack.image(0)
 
-        fg >> crop
+        txt2img >> crop
         fg_layer = stack.image(
             1,
             position=fg_layer_position,
@@ -216,33 +255,15 @@ def cutout_stack_canny_img2img_group(
         crop >> fg_layer
 
         # -------------------
-        # Canny control image
-        # -------------------
-        canny = ImgAuxMap(
-            name='canny',
-            spec={
-                'processor': 'canny',
-                'detect_resolution': 1024,
-            },
-        )
-
-        stack >> canny
-
-        # -------------------
         # Harmonize pass
         # -------------------
-        out = Txt2Img(
+        out = Img2Img(
             name='out',
             spec=out_spec,
         )
 
+        stack >> out
         prompt >> out.prompt()
-
-        canny >> out.controlnet.add(
-            'diffusers/controlnet-canny-sdxl-1.0',
-            conditioning_scale=canny_conditioning_scale,
-            key='canny',
-        )
 
         # -------------------
         # Register ports
@@ -255,6 +276,7 @@ def cutout_stack_canny_img2img_group(
 def cutout_stack_depth_img2img_group(
     name: str,
     *,
+    txt2img_spec: SpecInput,
     out_spec: SpecInput,
     fg_layer_feather: int | str = '0.5%',
     fg_layer_position: str = 'center',
@@ -262,25 +284,33 @@ def cutout_stack_depth_img2img_group(
     depth_conditioning_scale: float = 0.7,
 ) -> NodeGroup:
     """
-    Compose a trimmed cut-out subject over a background, derive a depth map
-    from the composite, then harmonize with Img2Img using Depth ControlNet.
+    Generate a depth-guided subject, cut it out, composite it over a
+    background, then harmonize the stack with Img2Img.
+
+    The foreground image is used as the source for the initial Depth
+    ControlNet. The generated subject image is cropped with ``SubjectCrop`` and
+    placed over the provided background. The final node is a true ``Img2Img``
+    pass: it receives the stacked composite as its init image and the same
+    prompt used by the initial ``Txt2Img`` pass.
 
     Pattern
     -------
-    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
+    foreground -> ImgAuxMap(depth) -> Txt2Img.controlnet
+    prompt ----------------------> Txt2Img(prompt)
+    Txt2Img -> SubjectCrop(trim) -> ImageStack.layer(1)
     background -------------------> ImageStack.layer(0)
-    ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
 
     Ports
     -----
     - 'foreground' (Tap)
-        Image containing the subject to extract.
+        Source image used to derive the depth conditioning map.
     - 'background' (Tap)
         Background image used for the composition.
     - 'prompt' (Tap)
-        Prompt payload wired to the final Img2Img pass.
+        Prompt payload wired to both the initial Txt2Img pass and the final
+        Img2Img pass.
 
     Output
     ------
@@ -290,6 +320,10 @@ def cutout_stack_depth_img2img_group(
     ----------
     name : str
         Group name (scope prefix).
+    txt2img_spec : SpecInput
+        Spec for the initial depth-guided Txt2Img pass. This spec should define
+        the text-to-image model and generation parameters used with Depth
+        ControlNet.
     out_spec : SpecInput
         Spec for the final Img2Img harmonization pass.
     fg_layer_feather : int | str, optional
@@ -299,7 +333,8 @@ def cutout_stack_depth_img2img_group(
     fg_layer_resize : ResizeMode, optional
         Optional resize parameter for the subject layer.
     depth_conditioning_scale : float, optional
-        Conditioning scale used for the Depth ControlNet.
+        Conditioning scale used for Depth ControlNet during the initial Txt2Img
+        pass.
     """
 
     with NodeGroup(name) as g:
@@ -311,7 +346,32 @@ def cutout_stack_depth_img2img_group(
         prompt = Tap(name='prompt', strict=False)
 
         # -------------------
-        # Subject cut-out
+        # Depth-guided generation
+        # -------------------
+        depth = ImgAuxMap(
+            name='depth',
+            spec={
+                'processor': 'depth_midas',
+                'detect_resolution': 1024,
+            },
+        )
+
+        txt2img = Txt2Img(
+            name='txt2img',
+            spec=txt2img_spec,
+        )
+
+        fg >> depth
+        prompt >> txt2img.prompt()
+
+        depth >> txt2img.controlnet.add(
+            'diffusers/controlnet-depth-sdxl-1.0',
+            conditioning_scale=depth_conditioning_scale,
+            key='depth',
+        )
+
+        # -------------------
+        # Subject cut-out from generated image
         # -------------------
         crop = SubjectCrop(
             name='cutout',
@@ -339,7 +399,7 @@ def cutout_stack_depth_img2img_group(
 
         bg >> stack.image(0)
 
-        fg >> crop
+        txt2img >> crop
         fg_layer = stack.image(
             1,
             position=fg_layer_position,
@@ -349,33 +409,15 @@ def cutout_stack_depth_img2img_group(
         crop >> fg_layer
 
         # -------------------
-        # Depth control image
-        # -------------------
-        depth = ImgAuxMap(
-            name='depth',
-            spec={
-                'processor': 'depth_midas',
-                'detect_resolution': 1024,
-            },
-        )
-
-        stack >> depth
-
-        # -------------------
         # Harmonize pass
         # -------------------
-        out = Txt2Img(
+        out = Img2Img(
             name='out',
             spec=out_spec,
         )
 
+        stack >> out
         prompt >> out.prompt()
-
-        depth >> out.controlnet.add(
-            'diffusers/controlnet-depth-sdxl-1.0',
-            conditioning_scale=depth_conditioning_scale,
-            key='depth',
-        )
 
         # -------------------
         # Register ports
@@ -388,6 +430,7 @@ def cutout_stack_depth_img2img_group(
 def cutout_stack_pose_img2img_group(
     name: str,
     *,
+    txt2img_spec: SpecInput,
     out_spec: SpecInput,
     fg_layer_feather: int | str = '0.5%',
     fg_layer_position: str = 'center',
@@ -395,22 +438,33 @@ def cutout_stack_pose_img2img_group(
     pose_conditioning_scale: float = 0.9,
 ) -> NodeGroup:
     """
-    Compose a trimmed cut-out subject over a background, derive a depth map
-    from the composite, then harmonize with Img2Img using Depth ControlNet.
+    Generate a pose-guided subject, cut it out, composite it over a
+    background, then harmonize the stack with Img2Img.
+
+    This macro uses the incoming foreground image only as the pose source for
+    the initial OpenPose ControlNet. The generated subject image is then cropped with
+    ``SubjectCrop`` and placed over the provided background. The final node is a
+    true ``Img2Img`` pass: it receives the stacked composite as its init image
+    and the same prompt used by the initial ``Txt2Img`` pass.
 
     Pattern
     -------
-    foreground -> SubjectCrop(trim) -> ImageStack.layer(1)
-    ImageStack -> ImgAuxMap(depth) -> Img2Img.controlnet
+    foreground -> ImgAuxMap(openpose) -> Txt2Img.controlnet
+    prompt -----------------------> Txt2Img(prompt)
+    Txt2Img -> SubjectCrop(trim) -> ImageStack.layer(1)
+    background -------------------> ImageStack.layer(0)
     ImageStack -------------------> Img2Img(default)
     prompt -----------------------> Img2Img(prompt)
 
     Ports
     -----
     - 'foreground' (Tap)
-        Image containing the subject to extract.
+        Source image used to derive the OpenPose conditioning map.
+    - 'background' (Tap)
+        Background image used for the composition.
     - 'prompt' (Tap)
-        Prompt payload wired to the final Img2Img pass.
+        Prompt payload wired to both the initial Txt2Img pass and the final
+        Img2Img pass.
 
     Output
     ------
@@ -420,6 +474,10 @@ def cutout_stack_pose_img2img_group(
     ----------
     name : str
         Group name (scope prefix).
+    txt2img_spec : SpecInput
+        Spec for the initial pose-guided Txt2Img pass. This spec should define
+        the text-to-image model and generation parameters used with OpenPose
+        ControlNet.
     out_spec : SpecInput
         Spec for the final Img2Img harmonization pass.
     fg_layer_feather : int | str, optional
@@ -428,8 +486,9 @@ def cutout_stack_pose_img2img_group(
         Subject placement anchor/position for ``stack.image(...)``.
     fg_layer_resize : ResizeMode, optional
         Optional resize parameter for the subject layer.
-    depth_conditioning_scale : float, optional
-        Conditioning scale used for the Depth ControlNet.
+    pose_conditioning_scale : float, optional
+        Conditioning scale used for OpenPose ControlNet during the initial
+        Txt2Img pass.
     """
 
     with NodeGroup(name) as g:
@@ -437,10 +496,43 @@ def cutout_stack_pose_img2img_group(
         # Ports
         # -------------------
         fg = Tap(name='foreground')
+        bg = Tap(name='background')
         prompt = Tap(name='prompt', strict=False)
 
         # -------------------
-        # Subject cut-out
+        # Pose-guided generation
+        # -------------------
+        pose = ImgAuxMap(
+            name='pose',
+            spec={
+                'processor': 'openpose',
+                'detect_resolution': 1024,
+            },
+        )
+
+        txt2img = Txt2Img(
+            name='txt2img',
+            spec=txt2img_spec,
+        )
+
+        fg >> pose
+        prompt >> txt2img.prompt()
+
+        # Previous T2I-Adapter variant, kept here for quick comparison:
+        #
+        # pose >> txt2img.t2i_adapter.add(
+        #     'TencentARC/t2i-adapter-openpose-sdxl-1.0',
+        #     conditioning_scale=pose_conditioning_scale,
+        #     key='pose',
+        # )
+        pose >> txt2img.controlnet.add(
+            'thibaud/controlnet-openpose-sdxl-1.0',
+            conditioning_scale=pose_conditioning_scale,
+            key='pose',
+        )
+
+        # -------------------
+        # Subject cut-out from generated image
         # -------------------
         crop = SubjectCrop(
             name='cutout',
@@ -466,7 +558,9 @@ def cutout_stack_pose_img2img_group(
             },
         )
 
-        fg >> crop
+        bg >> stack.image(0)
+
+        txt2img >> crop
         fg_layer = stack.image(
             1,
             position=fg_layer_position,
@@ -476,38 +570,20 @@ def cutout_stack_pose_img2img_group(
         crop >> fg_layer
 
         # -------------------
-        # Depth control image
-        # -------------------
-        pose = ImgAuxMap(
-            name='pose',
-            spec={
-                'processor': 'openpose',
-                'detect_resolution': 1024,
-            },
-        )
-
-        stack >> pose
-
-        # -------------------
         # Harmonize pass
         # -------------------
-        out = Txt2Img(
+        out = Img2Img(
             name='out',
             spec=out_spec,
         )
 
+        stack >> out
         prompt >> out.prompt()
-
-        pose >> out.t2i_adapter.add(
-            'TencentARC/t2i-adapter-openpose-sdxl-1.0',
-            conditioning_scale=pose_conditioning_scale,
-            key='pose',
-        )
 
         # -------------------
         # Register ports
         # -------------------
-        g.register_ports(fg, prompt)
+        g.register_ports(fg, bg, prompt)
 
     return g
 
