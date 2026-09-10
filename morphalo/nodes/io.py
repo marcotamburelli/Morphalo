@@ -209,6 +209,7 @@ def lora_meta(lora_specs: List[LoraSpec]) -> list[dict]:
             'weight_name': lora.weight_name,
             'adapter_name': lora.adapter_name,
             'adapter_weight': lora.adapter_weight,
+            'load_text_encoder': lora.load_text_encoder,
         }
         for lora in (lora_specs or [])
     ]

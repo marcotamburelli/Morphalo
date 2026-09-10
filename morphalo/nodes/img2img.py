@@ -338,7 +338,7 @@ class Img2Img(
             init_image_already_passed=True,
         )
 
-        if 'cross_attention_kwargs' in pipe_kwargs:
+        if 'ip_adapter_masks' in pipe_kwargs.get('cross_attention_kwargs', {}):
             l = len(ip_bundle.weight_names_arg) + \
                 len(face_bundle.weight_names_arg)
             masks = pipe_kwargs['cross_attention_kwargs']['ip_adapter_masks']

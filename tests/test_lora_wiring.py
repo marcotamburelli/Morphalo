@@ -8,6 +8,7 @@ from morphalo.nodes.wiring.lora import LoraBundle, LoraRegistry
 class FakePipe:
     def __init__(self):
         self.calls = []
+        self.unet = FakeUnet(self.calls)
 
     def unload_lora_weights(self):
         self.calls.append(('unload_lora_weights',))
@@ -17,6 +18,23 @@ class FakePipe:
 
     def set_adapters(self, adapter_names, adapter_weights):
         self.calls.append(('set_adapters', adapter_names, adapter_weights))
+
+    def lora_state_dict(self, model_id, **kwargs):
+        self.calls.append(('lora_state_dict', model_id, kwargs))
+        return {'unet.foo.lora.down.weight': 'weight'}, None, None
+
+    def load_lora_into_unet(self, state_dict, **kwargs):
+        self.calls.append(('load_lora_into_unet', state_dict, kwargs))
+
+
+class FakeUnet:
+    config = object()
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def set_adapters(self, adapter_names, adapter_weights):
+        self.calls.append(('unet.set_adapters', adapter_names, adapter_weights))
 
 
 class FakeIpBundle:
@@ -81,6 +99,46 @@ def test_apply_lora_loads_weights_and_sets_adapter_weights():
             },
         ),
         ('set_adapters', ['ikea', 'feng'], [0.7, 0.8]),
+    ]
+
+
+def test_apply_lora_can_skip_text_encoder_for_unet_only_lora():
+    registry = LoraRegistry(owner=object())
+    registry.add(
+        'TonariNoTaku/SDXL_sufficient_nudity',
+        weight_name='nudity_v03XL_i1762_prod256n128b2_swn2_offset_e5.safetensors',
+        adapter_name='sufficient_nudity',
+        adapter_weight=0.6,
+        load_text_encoder=False,
+    )
+
+    pipe = FakePipe()
+    bundle = LoraBundle(registry.specs)
+
+    apply_lora(lora_bundle=bundle, pipe=pipe)
+
+    assert pipe.calls == [
+        (
+            'lora_state_dict',
+            'TonariNoTaku/SDXL_sufficient_nudity',
+            {
+                'return_lora_metadata': True,
+                'weight_name': 'nudity_v03XL_i1762_prod256n128b2_swn2_offset_e5.safetensors',
+                'unet_config': pipe.unet.config,
+            },
+        ),
+        (
+            'load_lora_into_unet',
+            {'unet.foo.lora.down.weight': 'weight'},
+            {
+                'network_alphas': None,
+                'unet': pipe.unet,
+                'adapter_name': 'sufficient_nudity',
+                'metadata': None,
+                '_pipeline': pipe,
+            },
+        ),
+        ('unet.set_adapters', ['sufficient_nudity'], [0.6]),
     ]
 
 

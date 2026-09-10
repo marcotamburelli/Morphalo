@@ -33,6 +33,9 @@ class LoraSpec:
     adapter_weight : float
         Relative adapter weight passed to ``pipe.set_adapters``. When multiple
         LoRAs are active, these values control their blend.
+    load_text_encoder : bool
+        Whether to load matching text encoder LoRA weights. Disable this for
+        UNet-only LoRAs whose checkpoints contain no text encoder weights.
     """
 
     key: str
@@ -40,6 +43,7 @@ class LoraSpec:
     weight_name: Optional[str]
     adapter_name: str
     adapter_weight: float
+    load_text_encoder: bool = True
 
 
 class LoraRegistry:
@@ -81,6 +85,7 @@ class LoraRegistry:
         weight_name: Optional[str] = None,
         adapter_name: Optional[str] = None,
         adapter_weight: float = 1.0,
+        load_text_encoder: bool = True,
         key: Optional[str] = None,
     ) -> LoraSpec:
         """
@@ -107,6 +112,9 @@ class LoraRegistry:
             Relative adapter weight passed to
             ``pipe.set_adapters(..., adapter_weights=[...])``. Defaults to
             ``1.0``.
+        load_text_encoder : bool, optional
+            Whether to load text encoder LoRA weights. Set to ``False`` for
+            UNet-only LoRAs.
         key : str, optional
             Stable framework-level identifier for this LoRA declaration. If not
             provided, an incremental key is generated (``lora1``, ``lora2``,
@@ -138,6 +146,7 @@ class LoraRegistry:
             weight_name=weight_name,
             adapter_name=adapter_name,
             adapter_weight=float(adapter_weight),
+            load_text_encoder=bool(load_text_encoder),
         )
         self._specs.append(spec)
         return spec

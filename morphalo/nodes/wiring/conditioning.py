@@ -21,6 +21,56 @@ else:
     SDXLPipeline = Any
 
 
+def _load_lora_into_unet_only(pipe: SDXLPipeline, spec) -> None:
+    kwargs = {
+        'return_lora_metadata': True,
+    }
+    if spec.weight_name is not None:
+        kwargs['weight_name'] = spec.weight_name
+    if hasattr(pipe, 'unet') and hasattr(pipe.unet, 'config'):
+        kwargs['unet_config'] = pipe.unet.config
+
+    state_dict, network_alphas, metadata = pipe.lora_state_dict(
+        spec.model_id,
+        **kwargs,
+    )
+    pipe.load_lora_into_unet(
+        state_dict,
+        network_alphas=network_alphas,
+        unet=pipe.unet,
+        adapter_name=spec.adapter_name,
+        metadata=metadata,
+        _pipeline=pipe,
+    )
+
+
+def _set_lora_adapters(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
+    if all(spec.load_text_encoder for spec in lora_bundle.specs):
+        pipe.set_adapters(
+            lora_bundle.adapter_names_arg,
+            adapter_weights=lora_bundle.adapter_weights_arg,
+        )
+        return
+
+    pipe.unet.set_adapters(
+        lora_bundle.adapter_names_arg,
+        lora_bundle.adapter_weights_arg,
+    )
+
+    text_specs = [spec for spec in lora_bundle.specs if spec.load_text_encoder]
+    if not text_specs:
+        return
+
+    from diffusers.loaders.lora_base import set_adapters_for_text_encoder
+
+    names = [spec.adapter_name for spec in text_specs]
+    weights = [spec.adapter_weight for spec in text_specs]
+    for component in ('text_encoder', 'text_encoder_2'):
+        text_encoder = getattr(pipe, component, None)
+        if text_encoder is not None:
+            set_adapters_for_text_encoder(names, text_encoder, weights)
+
+
 def _as_image_list(x: Union[Image.Image, Sequence[Image.Image]]) -> List[Image.Image]:
     """Normalize a slot image payload to a list of PIL images."""
     if isinstance(x, Image.Image):
@@ -205,6 +255,10 @@ def apply_lora(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
         return
 
     for spec in lora_bundle.specs:
+        if not spec.load_text_encoder:
+            _load_lora_into_unet_only(pipe, spec)
+            continue
+
         kwargs = {
             'adapter_name': spec.adapter_name,
         }
@@ -213,10 +267,7 @@ def apply_lora(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
 
         pipe.load_lora_weights(spec.model_id, **kwargs)
 
-    pipe.set_adapters(
-        lora_bundle.adapter_names_arg,
-        adapter_weights=lora_bundle.adapter_weights_arg,
-    )
+    _set_lora_adapters(lora_bundle, pipe)
 
 
 def apply_ip_adapter(

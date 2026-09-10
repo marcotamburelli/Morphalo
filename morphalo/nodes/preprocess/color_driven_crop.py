@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import numpy as np
-from PIL import Image, ImageColor
+from PIL import Image
 from skimage.color import rgb2lab
 
 from morphalo.core.paths import make_node_output_path
@@ -15,6 +15,7 @@ from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              parse_crop_mode,
                                              read_shape_cleanup_config,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.color_ops import parse_colors
 from morphalo.nodes.preprocess.utils.geometry import (
     expand_clip_bbox_by_size_expr, tight_mask_bbox)
 from morphalo.nodes.preprocess.utils.mask_ops import (cleanup_shape_mask,
@@ -54,14 +55,6 @@ _TILE_SIZE = 256
 _TILE_OVERLAP = 0.5
 _SAMPLE_STRIDE = 2
 _KMEANS_ITERATIONS = 12
-
-
-def _is_rgb_triplet(value: Any) -> bool:
-    return (
-        isinstance(value, (list, tuple))
-        and len(value) == 3
-        and all(isinstance(channel, (int, float)) for channel in value)
-    )
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -110,7 +103,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             f"'{node_id}': invalid color_scope={color_scope!r}"
         )
 
-    colors = _parse_colors(
+    colors = parse_colors(
         params.get('colors', None),
         node_id=node_id,
     )
@@ -193,62 +186,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             node_id=node_id,
         ),
     )
-
-
-def _parse_color(value: Any, *, node_id: str) -> tuple[int, int, int]:
-    """
-    Parse one user-provided color into an RGB triplet.
-    """
-    if isinstance(value, str):
-        try:
-            rgb = ImageColor.getrgb(value)
-        except ValueError as exc:
-            raise ValueError(
-                f"'{node_id}': invalid color {value!r}"
-            ) from exc
-
-        if len(rgb) == 4:
-            rgb = rgb[:3]
-        return int(rgb[0]), int(rgb[1]), int(rgb[2])
-
-    if _is_rgb_triplet(value):
-        rgb = tuple(int(channel) for channel in value)
-        if any(channel < 0 or channel > 255 for channel in rgb):
-            raise ValueError(
-                f"'{node_id}': RGB values must be in [0, 255]"
-            )
-        return rgb
-
-    raise ValueError(
-        f"'{node_id}': colors entries must be color names, hex "
-        'strings, or RGB triplets'
-    )
-
-
-def _parse_colors(
-    value: Any,
-    *,
-    node_id: str,
-) -> Optional[tuple[tuple[int, int, int], ...]]:
-    """
-    Parse optional manual reference colors.
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, str):
-        return (_parse_color(value, node_id=node_id),)
-
-    if _is_rgb_triplet(value):
-        return (_parse_color(value, node_id=node_id),)
-
-    if not isinstance(value, (list, tuple)) or len(value) == 0:
-        raise ValueError(
-            f"'{node_id}': colors must be a color or a non-empty "
-            'list of colors'
-        )
-
-    return tuple(_parse_color(item, node_id=node_id) for item in value)
 
 
 def _initial_centers(samples: np.ndarray, count: int) -> np.ndarray:
@@ -535,7 +472,7 @@ def _color_driven_arrays(
     manual_centers = None
     global_centers = None
     if colors is not None:
-        colors = _parse_colors(
+        colors = parse_colors(
             colors,
             node_id='color_driven_alpha',
         )

@@ -5,9 +5,11 @@ from PIL import Image
 from morphalo.dag import DAG
 from morphalo.nodes.preprocess import (
     BoxCrop,
+    ColorTint,
     FlipImage,
     ImageLayerPlacement,
     ImageStack,
+    LuminanceColorize,
     ResizeImage,
     TransposeImage,
 )
@@ -169,6 +171,71 @@ def test_flip_image_mirrors_requested_axis(tmp_path, axis, expected):
     assert out['output_size'] == [3, 2]
     assert out['flip']['axis'] == axis
     assert _pixels(out['image']) == expected
+
+
+def test_luminance_colorize_maps_brightness_to_target_color(tmp_path):
+    src = tmp_path / 'src.png'
+    img = Image.new('RGBA', (4, 1))
+    img.putdata([
+        (0, 0, 0, 255),
+        (128, 128, 128, 255),
+        (255, 255, 255, 255),
+        (255, 255, 255, 64),
+    ])
+    img.save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = LuminanceColorize(
+            name='colorize',
+            path=src,
+            spec={'params': {'color': '#00ccff'}},
+        )
+
+    out = node.run(tmp_path)
+    result = Image.open(out['image']).convert('RGBA')
+
+    assert out['input_size'] == [4, 1]
+    assert out['output_size'] == [4, 1]
+    assert out['colorize']['color'] == [0, 204, 255]
+    assert [result.getpixel((x, 0)) for x in range(result.width)] == [
+        (0, 0, 0, 255),
+        (0, 102, 128, 255),
+        (0, 204, 255, 255),
+        (0, 204, 255, 64),
+    ]
+
+
+def test_color_tint_moves_pixels_toward_target_by_luminance(tmp_path):
+    src = tmp_path / 'src.png'
+    img = Image.new('RGBA', (4, 1))
+    img.putdata([
+        (0, 0, 0, 255),
+        (0, 0, 128, 255),
+        (128, 128, 255, 255),
+        (255, 255, 255, 64),
+    ])
+    img.save(src)
+
+    with DAG('test', out_dir=tmp_path):
+        node = ColorTint(
+            name='tint',
+            path=src,
+            spec={'params': {'color': '#ff0000'}},
+        )
+
+    out = node.run(tmp_path)
+    result = Image.open(out['image']).convert('RGBA')
+
+    assert out['input_size'] == [4, 1]
+    assert out['output_size'] == [4, 1]
+    assert out['tint']['color'] == [255, 0, 0]
+    assert out['tint']['mode'] == 'luminance'
+    assert [result.getpixel((x, 0)) for x in range(result.width)] == [
+        (0, 0, 0, 255),
+        (15, 0, 121, 255),
+        (199, 56, 113, 255),
+        (255, 0, 0, 64),
+    ]
 
 
 def test_resize_image_resolves_percentages_against_input_axes(tmp_path):
@@ -350,6 +417,38 @@ def test_image_stack_brightness_changes_rgb_and_preserves_alpha(tmp_path):
     assert out['params']['layers'][0]['brightness'] == -0.5
 
 
+def test_image_stack_color_transfer_matches_underlying_canvas(tmp_path):
+    layer = tmp_path / 'layer.png'
+    layer_img = Image.new('RGBA', (2, 2), color=(220, 40, 20, 255))
+    layer_img.putpixel((1, 1), (0, 255, 0, 0))
+    layer_img.save(layer)
+
+    with DAG('test', out_dir=tmp_path):
+        stack = ImageStack(
+            name='stack',
+            spec={
+                'params': {
+                    'width': 4,
+                    'height': 4,
+                    'background': [20, 120, 200],
+                    'out_mode': 'RGBA',
+                }
+            },
+        )
+        stack.image(idx=0, position='top-left', color_transfer=1.0)
+
+    out = stack.run(
+        tmp_path,
+        input={'image:0': {'image': str(layer)}},
+    )
+    result = Image.open(out['image']).convert('RGBA')
+    pixel = np.asarray(result.getpixel((0, 0))[:3])
+
+    assert np.max(np.abs(pixel - np.asarray([20, 120, 200]))) <= 2
+    assert result.getpixel((0, 0))[3] == 255
+    assert out['params']['layers'][0]['color_transfer'] == 1.0
+
+
 def test_image_stack_default_input_overrides_canvas_params(tmp_path):
     background = tmp_path / 'background.png'
     layer = tmp_path / 'layer.png'
@@ -394,6 +493,15 @@ def test_image_stack_rejects_brightness_outside_range(tmp_path, brightness):
 
     with pytest.raises(ValueError, match='brightness'):
         stack.image(idx=0, brightness=brightness)
+
+
+@pytest.mark.parametrize('color_transfer', [-0.1, 1.1])
+def test_image_stack_rejects_color_transfer_outside_range(tmp_path, color_transfer):
+    with DAG('test', out_dir=tmp_path):
+        stack = ImageStack(name='stack')
+
+    with pytest.raises(ValueError, match='color_transfer'):
+        stack.image(idx=0, color_transfer=color_transfer)
 
 
 def test_box_crop_emits_local_anchor_and_global_position(tmp_path):

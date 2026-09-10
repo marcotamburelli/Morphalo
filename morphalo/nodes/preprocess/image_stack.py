@@ -15,6 +15,8 @@ from morphalo.nodes.preprocess.utils import (PositionSpec, ResizeMode,
                                              read_spatial_transform,
                                              resolve_size_expr,
                                              validate_size_expr)
+from morphalo.nodes.preprocess.utils.color_ops import \
+    match_lab_color_statistics
 from morphalo.nodes.preprocess.utils.geometry import Point
 
 CornerDelta = tuple[SizeExpr, SizeExpr] | None
@@ -86,6 +88,7 @@ class LayerSpec:
     rotation: float = 0.0
     corner_offsets: Optional[CornerOffsets] = None
     brightness: float = 0.0
+    color_transfer: float = 0.0
     feather: int | str = 0
     corner_radius: Optional[int | str] = None
     alpha: float = 1.0
@@ -473,6 +476,67 @@ def _place_on_canvas_by_anchor(
     patch = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     patch.alpha_composite(layer_crop, (ix0, iy0))
     canvas.alpha_composite(patch)
+
+
+def _visible_layer_and_canvas_crops(
+    canvas: Image.Image,
+    layer_rgba: Image.Image,
+    *,
+    placement_xy: Point,
+    anchor_xy: Point,
+) -> tuple[tuple[int, int, int, int], Image.Image, Image.Image] | None:
+    """
+    Return matching visible layer and canvas crops for anchor-based placement.
+
+    Parameters
+    ----------
+    canvas : PIL.Image.Image
+        Destination canvas in ``RGBA`` mode.
+    layer_rgba : PIL.Image.Image
+        Layer image in ``RGBA`` mode.
+    placement_xy : tuple[float, float]
+        Canvas coordinates where the layer anchor must be placed.
+    anchor_xy : tuple[float, float]
+        Anchor position in the transformed layer local coordinates.
+
+    Returns
+    -------
+    tuple[tuple[int, int, int, int], PIL.Image.Image, PIL.Image.Image] or None
+        Matching ``(layer_box, layer_crop, canvas_crop)`` for the visible
+        intersection, or ``None`` when the layer lies completely outside the
+        canvas. ``layer_box`` is expressed in layer-local coordinates.
+    """
+    W, H = canvas.size
+    lw, lh = layer_rgba.size
+
+    placement_x, placement_y = placement_xy
+    anchor_x, anchor_y = anchor_xy
+
+    x0 = int(round(placement_x - anchor_x))
+    y0 = int(round(placement_y - anchor_y))
+    x1 = x0 + lw
+    y1 = y0 + lh
+
+    ix0 = max(0, x0)
+    iy0 = max(0, y0)
+    ix1 = min(W, x1)
+    iy1 = min(H, y1)
+
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+
+    lx0 = ix0 - x0
+    ly0 = iy0 - y0
+    lx1 = lx0 + (ix1 - ix0)
+    ly1 = ly0 + (iy1 - iy0)
+
+    layer_box = (lx0, ly0, lx1, ly1)
+
+    return (
+        layer_box,
+        layer_rgba.crop(layer_box),
+        canvas.crop((ix0, iy0, ix1, iy1)),
+    )
 
 
 def _apply_corner_offsets(
@@ -1129,8 +1193,8 @@ class ImageLayerAttachmentSink(AttachmentSink):
         - The transform input affects only spatial placement metadata:
           ``anchor_xy``, ``position``, and ``bbox_size``.
         - Visual layer operations such as ``corner_offsets``, ``rotation``,
-          ``brightness``, ``feather``, ``corner_radius``, and ``alpha`` remain
-          controlled by the layer declaration.
+          ``brightness``, ``color_transfer``, ``feather``, ``corner_radius``,
+          and ``alpha`` remain controlled by the layer declaration.
         - ``crop`` and ``placement`` are mutually exclusive. Supplying both is
           considered ambiguous.
         """
@@ -1176,10 +1240,11 @@ class ImageStack(NodeRef):
     5. Apply optional rotation around the current anchor.
     6. Apply optional resizing and scale the anchor accordingly.
     7. Adjust layer luminosity.
-    8. Optionally soften the layer edges.
-    9. Apply global layer opacity.
-    10. Resolve layer placement on the canvas.
-    11. Alpha-composite the transformed layer by matching anchor to placement.
+    8. Resolve layer placement on the canvas.
+    9. Optionally match layer Lab color statistics to the underlying canvas.
+    10. Optionally soften the layer edges.
+    11. Apply global layer opacity.
+    12. Alpha-composite the transformed layer by matching anchor to placement.
 
     This execution order is important:
 
@@ -1441,6 +1506,24 @@ class ImageStack(NodeRef):
     The adjustment is explicit and does not inspect or modify the canvas below
     the layer.
 
+    Color Transfer
+    --------------
+    ``color_transfer`` optionally reduces chromatic drift when reinserting a
+    refined crop into its original canvas.
+
+    When enabled, ``ImageStack`` compares the visible layer pixels with the
+    canvas pixels currently underneath the same area. For each Lab channel, it
+    shifts and scales the layer distribution to match the target region mean
+    and standard deviation, then blends the corrected Lab colors back over the
+    original layer colors according to ``color_transfer``.
+
+    Pixels with alpha ``0`` in either the layer or the underlying canvas are
+    ignored while computing and applying the correction. The layer alpha channel
+    is preserved.
+
+    A value of ``0.0`` disables color transfer. A value of ``1.0`` applies the
+    full Lab mean/std match.
+
     Configuration
     -------------
     ``spec`` may be a dictionary or a path-like configuration file.
@@ -1491,6 +1574,7 @@ class ImageStack(NodeRef):
         rotation=0.0,
         corner_offsets=None,
         brightness=0.0,
+        color_transfer=0.0,
         feather=0,
         corner_radius=None,
         alpha=1.0,
@@ -1515,8 +1599,8 @@ class ImageStack(NodeRef):
             Path to the composited output image.
         ``params.layers`` : list[dict]
             Per-layer configuration, including ``idx``, ``position``, ``resize``,
-            ``rotation``, ``corner_offsets``, ``brightness``, ``feather``,
-            ``corner_radius``, and ``alpha``.
+            ``rotation``, ``corner_offsets``, ``brightness``,
+            ``color_transfer``, ``feather``, ``corner_radius``, and ``alpha``.
         ``metadata`` : str
             Path to the JSON sidecar.
 
@@ -1546,6 +1630,7 @@ class ImageStack(NodeRef):
         rotation: float = 0.0,
         corner_offsets: Optional[CornerOffsets] = None,
         brightness: float = 0.0,
+        color_transfer: float = 0.0,
         feather: int | str = 0,
         corner_radius: Optional[int | str] = None,
         alpha: float = 1.0,
@@ -1712,6 +1797,23 @@ class ImageStack(NodeRef):
 
             Default: ``0.0``.
 
+        color_transfer : float, optional
+            Lab-space statistical color transfer applied after brightness and
+            before feathering and compositing.
+
+            The value must be finite and in ``[0.0, 1.0]``:
+
+            - ``0.0`` disables color transfer.
+            - intermediate values blend between the current layer colors and
+              the statistically matched colors.
+            - ``1.0`` fully applies the Lab mean/std match.
+
+            Statistics are computed from the visible layer area and the canvas
+            pixels currently underneath that area. Pixels with alpha ``0`` in
+            either image are ignored. The layer alpha channel is preserved.
+
+            Default: ``0.0``.
+
         feather : int or str, optional
             Feathering applied to the layer edges before compositing.
 
@@ -1794,8 +1896,8 @@ class ImageStack(NodeRef):
         - The layer transformation is purely geometric and includes anchor-aware
           local corner-offset warping, anchor-centered rotation, resizing, and
           final placement.
-        - No automatic color matching, lighting harmonization, or shadow
-          synthesis is performed.
+        - ``color_transfer`` performs only statistical color matching. It does
+          not synthesize lighting, shadows, or geometry-aware harmonization.
         - ``idx`` must be unique; attempting to reuse an index raises an error.
         """
 
@@ -1890,6 +1992,13 @@ class ImageStack(NodeRef):
                 f'got {brightness!r}'
             )
 
+        color_transfer = float(color_transfer)
+        if not math.isfinite(color_transfer) or not (0.0 <= color_transfer <= 1.0):
+            raise ValueError(
+                f'{self.id}: color_transfer must be a finite float in [0, 1], '
+                f'got {color_transfer!r}'
+            )
+
         self._layers[idx] = LayerSpec(
             idx=idx,
             position=position,
@@ -1897,6 +2006,7 @@ class ImageStack(NodeRef):
             rotation=rotation,
             corner_offsets=corner_offsets,
             brightness=brightness,
+            color_transfer=color_transfer,
             feather=feather,
             corner_radius=corner_radius,
             alpha=alpha,
@@ -1933,9 +2043,13 @@ class ImageStack(NodeRef):
             if cfg.background is None:
                 canvas = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
             elif isinstance(cfg.background, str):
-                canvas = Image.new('RGBA', (canvas_w, canvas_h), cfg.background)
+                canvas = Image.new(
+                    'RGBA', (canvas_w, canvas_h), cfg.background
+                )
             else:
-                canvas = Image.new('RGBA', (canvas_w, canvas_h), cfg.background)
+                canvas = Image.new(
+                    'RGBA', (canvas_w, canvas_h), cfg.background
+                )
             background_source = 'params'
             background_value = cfg.background
 
@@ -2048,6 +2162,31 @@ class ImageStack(NodeRef):
 
             lw, lh = layer.size
 
+            placement_xy = _resolve_position_xy(
+                position,
+                canvas_w,
+                canvas_h,
+                layer.width,
+                layer.height,
+                anchor_xy,
+            )
+
+            if layer_spec.color_transfer > 0.0:
+                visible = _visible_layer_and_canvas_crops(
+                    canvas,
+                    layer,
+                    placement_xy=placement_xy,
+                    anchor_xy=anchor_xy,
+                )
+                if visible is not None:
+                    layer_box, layer_crop, canvas_crop = visible
+                    matched_crop = match_lab_color_statistics(
+                        layer_crop,
+                        canvas_crop,
+                        strength=layer_spec.color_transfer,
+                    )
+                    layer.paste(matched_crop, layer_box)
+
             # Apply feathering through alpha-channel handling.
             if feather_is_nonzero(layer_spec.feather):
                 r, g, b, a = layer.split()
@@ -2108,15 +2247,6 @@ class ImageStack(NodeRef):
                         a = ImageChops.darker(a_soft, a)
                         layer = Image.merge('RGBA', (r, g, b, a))
 
-            placement_xy = _resolve_position_xy(
-                position,
-                canvas_w,
-                canvas_h,
-                layer.width,
-                layer.height,
-                anchor_xy,
-            )
-
             if layer_spec.alpha < 1.0:
                 r, g, b, a = layer.split()
                 a = a.point(lambda v: int(round(v * layer_spec.alpha)))
@@ -2162,6 +2292,7 @@ class ImageStack(NodeRef):
                             'bottom_left': ls.corner_offsets.bottom_left,
                         },
                         'brightness': ls.brightness,
+                        'color_transfer': ls.color_transfer,
                         'feather': ls.feather,
                         'corner_radius': ls.corner_radius,
                         'alpha': ls.alpha,
