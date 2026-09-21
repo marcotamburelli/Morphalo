@@ -313,7 +313,9 @@ class ImageSequenceRegistry:
     runtime image sequence. Additional images are declared here using integer
     indexes and are appended after the default image(s), ordered from the
     smallest index to the largest. If no default input is wired, the ordered
-    registry images form the whole image sequence.
+    registry images form the whole image sequence. If neither default nor
+    indexed images are provided, the resolved sequence is empty; nodes decide
+    whether that is valid for their model semantics.
     """
 
     INPUT_PREFIX = 'image'
@@ -378,6 +380,10 @@ class ImageSequenceRegistry:
 class ImageSequenceBundle:
     """
     Runtime resolver for indexed image sequence inputs.
+
+    The bundle intentionally permits an empty sequence. Some foundation models
+    can run either as text-to-image or as image-conditioned editors. Nodes that
+    require at least one image should validate ``bundle.images`` themselves.
     """
 
     def __init__(
@@ -413,11 +419,6 @@ class ImageSequenceBundle:
                 )
             for path in _payload_image_paths(upstream, input_id=input_id):
                 entries.append((input_id, path))
-
-        if not entries:
-            raise ValueError(
-                'Image sequence requires at least one input image.'
-            )
 
         self._images = [Image.open(path).convert('RGB') for _, path in entries]
         self._metadata = [

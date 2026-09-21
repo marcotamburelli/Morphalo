@@ -13,6 +13,7 @@ from morphalo.nodes.evaluate.face_scorer import FaceScorer
 from morphalo.nodes.evaluate.person_scorer import PersonScorer
 from morphalo.nodes.evaluate.prompt_scorer import PromptScorer
 from morphalo.nodes.face_id_embed_image import FaceIdEmbedImage
+from morphalo.nodes.foundation.flux2_klein import Flux2Klein
 from morphalo.nodes.foundation.omnigen import OmniGen
 from morphalo.nodes.foundation.qwen_image import QwenImage
 from morphalo.nodes.foundation.qwen_image_edit import QwenImageEdit
@@ -162,6 +163,28 @@ def test_qwen_nodes_are_cuda_nodes(tmp_path, node_cls: type):
         node = node_cls(name='node')
 
     assert node.uses_cuda is True
+
+
+@pytest.mark.parametrize(
+    ('device', 'expected'),
+    [
+        ('cpu', False),
+        ('cuda', True),
+        ('cuda:0', True),
+    ],
+)
+def test_flux2_klein_follows_configured_device(
+    tmp_path,
+    device: str,
+    expected: bool,
+):
+    with DAG(f'flux2_klein_{device.replace(":", "_")}', tmp_path):
+        node = Flux2Klein(
+            name='node',
+            spec={'model': {'device': device}},
+        )
+
+    assert node.uses_cuda is expected
 
 
 @pytest.mark.parametrize('node_cls', [PersonScorer, VideoPoseMap])

@@ -880,9 +880,12 @@ class ProcessNodeExecutor:
             raise KeyboardInterrupt
 
     def _restart_if_needed_before(self, node: NodeRef) -> None:
-        if node.uses_cuda and self._cuda_count >= self.max_cuda_nodes:
+        force_cooldown = node.forces_cuda_cooldown
+        limit_reached = node.uses_cuda and self._cuda_count >= self.max_cuda_nodes
+        if (force_cooldown and self._process is not None) or limit_reached:
             print(
                 f'[ProcessNodeExecutor] restarting worker before node {node.id!r}: '
+                f'forced={force_cooldown}, '
                 f'cuda_count={self._cuda_count}/{self.max_cuda_nodes}, '
                 f'shutdown_min_wait={self.cuda_shutdown_min_wait}, '
                 f'cooldown_after={self.cuda_cooldown_after_restart}',

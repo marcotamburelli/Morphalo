@@ -6,12 +6,13 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.io import write_json
 from morphalo.nodes.image_output import ImageOutputMixin
+from morphalo.nodes.prompt_output import PromptOutputMixin
 
 Output = Dict[str, Any]
 
 
 @dataclass
-class Tap(ImageOutputMixin, NodeRef):
+class Tap(ImageOutputMixin, PromptOutputMixin, NodeRef):
     """
     Minimal pass-through checkpoint node.
 

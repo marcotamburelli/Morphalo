@@ -13,6 +13,7 @@ import pytest
 
 import morphalo.dag.process_executor as process_executor_mod
 from morphalo.dag import DAG, NodeRef
+from morphalo.dag.control_nodes import CudaCooldown
 from morphalo.dag.process_executor import (
     NodeResult,
     ProcessNodeExecutionError,
@@ -159,6 +160,44 @@ def test_node_ref_does_not_use_cuda_by_default(tmp_path):
         node = SourceNode(name='source', value=1)
 
     assert node.uses_cuda is False
+    assert node.forces_cuda_cooldown is False
+
+
+def test_forced_cooldown_restarts_and_runs_node_below_limit(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(process_executor_mod.time, 'sleep', sleeps.append)
+    with DAG('forced_cooldown', out_dir=tmp_path):
+        node = CudaCooldown(name='cooldown')
+    output = {'image': 'image.png'}
+    executor = FakeStartedExecutor(NodeResult(ok=True, output=output))
+    executor._ensure_started()
+    old_process = executor._process
+    executor._cuda_count = 2
+    executor._worker_used_cuda = True
+    try:
+        assert executor.run(
+            node=node, out_dir=str(tmp_path), input_map={'default': output},
+        ) == output
+        assert old_process.closed
+        assert executor._process is not old_process
+        assert executor._cuda_count == 0
+        assert sleeps == [executor.cuda_cooldown_after_restart]
+        assert executor.put_items[-1].node is node
+    finally:
+        executor.close()
+
+
+def test_forced_cooldown_without_worker_does_not_sleep(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(process_executor_mod.time, 'sleep', sleeps.append)
+    with DAG('initial_cooldown', out_dir=tmp_path):
+        node = CudaCooldown(name='cooldown')
+    executor = FakeStartedExecutor(NodeResult(ok=True, output={}))
+    try:
+        assert executor.run(node=node, out_dir=str(tmp_path), input_map={}) == {}
+        assert sleeps == []
+    finally:
+        executor.close()
 
 
 def test_restarts_before_next_cuda_node_but_keeps_cpu_nodes_queued(tmp_path, monkeypatch):

@@ -21,54 +21,118 @@ else:
     SDXLPipeline = Any
 
 
-def _load_lora_into_unet_only(pipe: SDXLPipeline, spec) -> None:
-    kwargs = {
-        'return_lora_metadata': True,
-    }
-    if spec.weight_name is not None:
-        kwargs['weight_name'] = spec.weight_name
-    if hasattr(pipe, 'unet') and hasattr(pipe.unet, 'config'):
-        kwargs['unet_config'] = pipe.unet.config
+def _normalize_sdxl_lora_keys(mapping, pipe):
+    """Match converted SDXL LoRA weight/alpha keys to the actual CLIP layout.
 
-    state_dict, network_alphas, metadata = pipe.lora_state_dict(
-        spec.model_id,
-        **kwargs,
-    )
-    pipe.load_lora_into_unet(
-        state_dict,
-        network_alphas=network_alphas,
-        unet=pipe.unet,
-        adapter_name=spec.adapter_name,
-        metadata=metadata,
-        _pipeline=pipe,
-    )
+    For each text encoder without a ``text_model`` wrapper, remove that
+    segment from keys such as ``text_encoder.text_model.encoder.layers...``.
+    Validate the resulting target against ``named_modules()`` before renaming;
+    reject unknown targets and key collisions. Encoders that retain the wrapper
+    (including CLIPTextModelWithProjection), UNet keys, and tensor values are
+    left unchanged. Legacy attention names are resolved only for validation;
+    their conversion is still handled by Diffusers.
+
+    Transformers >=5.6 flattened CLIPTextModel, but Diffusers' LoRA conversion
+    can still produce keys containing ``text_model``. Its text-encoder loader
+    then finds no matching modules, builds an empty rank dictionary, and raises
+    IndexError. This is reported in the open Diffusers issue #13984 for FLUX;
+    SDXL uses the same affected text-encoder loading helper:
+    https://github.com/huggingface/diffusers/issues/13984
+
+    Removing the obsolete wrapper aligns both weight and alpha keys with the
+    real module paths. The official loader can therefore infer adapter ranks
+    and attach the weights to the correct layers without dropping the textual
+    part of the LoRA. This was verified with both text encoders extracted from
+    Juggernaut: all 528 adapter tensors matched and adapter scales were checked.
+    """
+    if mapping is None:
+        return None
+    flattened = {}
+    for prefix in ('text_encoder', 'text_encoder_2'):
+        encoder = getattr(pipe, prefix, None)
+        if encoder is not None and not hasattr(encoder, 'text_model'):
+            flattened[prefix] = dict(encoder.named_modules())
+
+    result = {}
+    for key, value in mapping.items():
+        new_key = key
+        for prefix, modules in flattened.items():
+            old_prefix = f'{prefix}.text_model.'
+            if not key.startswith(old_prefix):
+                continue
+            relative = key[len(old_prefix):]
+            # Diffusers' Kohya conversion retains legacy attention names.
+            module = relative.split('.lora', 1)[0]
+            for old, new in (('to_q_lora', 'q_proj'), ('to_k_lora', 'k_proj'),
+                             ('to_v_lora', 'v_proj'), ('to_out_lora', 'out_proj')):
+                if old in module:
+                    module = module.split(old, 1)[0] + new
+                    break
+            module = module.removesuffix('.alpha')
+            if module not in modules:
+                raise ValueError(f'Unknown SDXL LoRA text encoder target: {key}')
+            new_key = f'{prefix}.{relative}'
+            break
+        if new_key in result:
+            raise ValueError(f'SDXL LoRA key collision: {new_key}')
+        result[new_key] = value
+    return result
 
 
-def _set_lora_adapters(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
-    if all(spec.load_text_encoder for spec in lora_bundle.specs):
-        pipe.set_adapters(
-            lora_bundle.adapter_names_arg,
-            adapter_weights=lora_bundle.adapter_weights_arg,
-        )
-        return
+def _load_sdxl_lora_weights(pipe, model_id, **kwargs):
+    """Load a complete SDXL LoRA through Diffusers with CLIP key compatibility.
 
-    pipe.unet.set_adapters(
-        lora_bundle.adapter_names_arg,
-        lora_bundle.adapter_weights_arg,
-    )
+    ``load_lora_weights`` calls ``lora_state_dict`` internally, then loads the
+    UNet and both text encoders. Temporarily wrap that conversion method on this
+    pipeline instance so weight and network-alpha keys can be normalized before
+    any component is loaded. The original conversion still reads the checkpoint;
+    the official loader still owns adapter injection, offloading, and loading
+    options. No component of the adapter is deliberately skipped.
 
-    text_specs = [spec for spec in lora_bundle.specs if spec.load_text_encoder]
-    if not text_specs:
-        return
+    This works around the Transformers 5 CLIP prefix mismatch described in
+    https://github.com/huggingface/diffusers/issues/13984
+    Diffusers exposes no post-conversion callback here. Passing only a converted
+    weight dictionary back to ``load_lora_weights`` would not preserve the
+    separately returned network alphas; manually invoking each component loader
+    would duplicate the official loading lifecycle.
 
-    from diffusers.loaders.lora_base import set_adapters_for_text_encoder
+    The override is instance-local, synchronous, and restored in ``finally``,
+    including after errors; any pre-existing instance override is preserved.
+    Do not load concurrently on the same pipeline instance. Adapter metadata
+    requiring prefix normalization is rejected because its module references
+    have not been normalized or verified. Other loading errors propagate.
 
-    names = [spec.adapter_name for spec in text_specs]
-    weights = [spec.adapter_weight for spec in text_specs]
-    for component in ('text_encoder', 'text_encoder_2'):
-        text_encoder = getattr(pipe, component, None)
-        if text_encoder is not None:
-            set_adapters_for_text_encoder(names, text_encoder, weights)
+    Remove this wrapper once the installed Diffusers version handles the prefix
+    mismatch throughout rank inference AND adapter injection. Verify complete
+    text-encoder tensors and scales first: avoiding IndexError alone is not
+    sufficient evidence that the upstream fix loads the whole adapter correctly.
+    """
+    # Keep the official loading lifecycle and alpha/metadata handling intact.
+    # The override is instance-local and exists only during this synchronous load.
+    original = pipe.lora_state_dict
+    had_override = 'lora_state_dict' in vars(pipe)
+    previous = vars(pipe).get('lora_state_dict')
+
+    def normalized_state_dict(*args, **state_kwargs):
+        state, alphas, metadata = original(*args, **state_kwargs)
+        if metadata and any(
+            getattr(pipe, prefix, None) is not None
+            and not hasattr(getattr(pipe, prefix), 'text_model')
+            and any(key.startswith(f'{prefix}.text_model.') for key in state)
+            for prefix in ('text_encoder', 'text_encoder_2')
+        ):
+            raise ValueError('SDXL LoRA prefix normalization with adapter metadata is not supported')
+        return (_normalize_sdxl_lora_keys(state, pipe),
+                _normalize_sdxl_lora_keys(alphas, pipe), metadata)
+
+    pipe.lora_state_dict = normalized_state_dict
+    try:
+        pipe.load_lora_weights(model_id, **kwargs)
+    finally:
+        if had_override:
+            pipe.lora_state_dict = previous
+        else:
+            del pipe.lora_state_dict
 
 
 def _as_image_list(x: Union[Image.Image, Sequence[Image.Image]]) -> List[Image.Image]:
@@ -255,19 +319,25 @@ def apply_lora(lora_bundle: LoraBundle, pipe: SDXLPipeline) -> None:
         return
 
     for spec in lora_bundle.specs:
-        if not spec.load_text_encoder:
-            _load_lora_into_unet_only(pipe, spec)
-            continue
-
         kwargs = {
             'adapter_name': spec.adapter_name,
         }
         if spec.weight_name is not None:
             kwargs['weight_name'] = spec.weight_name
+        if spec.low_cpu_mem_usage is not None:
+            kwargs['low_cpu_mem_usage'] = spec.low_cpu_mem_usage
 
-        pipe.load_lora_weights(spec.model_id, **kwargs)
+        from diffusers.loaders import StableDiffusionXLLoraLoaderMixin
 
-    _set_lora_adapters(lora_bundle, pipe)
+        if isinstance(pipe, StableDiffusionXLLoraLoaderMixin):
+            _load_sdxl_lora_weights(pipe, spec.model_id, **kwargs)
+        else:
+            pipe.load_lora_weights(spec.model_id, **kwargs)
+
+    pipe.set_adapters(
+        lora_bundle.adapter_names_arg,
+        adapter_weights=lora_bundle.adapter_weights_arg,
+    )
 
 
 def apply_ip_adapter(

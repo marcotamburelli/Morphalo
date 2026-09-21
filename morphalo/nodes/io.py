@@ -24,6 +24,7 @@ def finalize_image_output(
     face_id_specs: List[FaceIdSpec] = None,
     lora_specs: List[LoraSpec] = None,
     model_info: Optional[dict] = None,
+    sampling_scheduler: Optional[str] = None,
 ) -> dict:
     """
     Build the final output payload and write a single JSON sidecar for the node.
@@ -77,6 +78,9 @@ def finalize_image_output(
         LoRA configuration metadata.
     model_info : dict, optional
         Additional model metadata.
+    sampling_scheduler : str, optional
+        Sampling scheduler profile used for this generation, when it is part of
+        the node spec and distinct from model identity.
 
     Returns
     -------
@@ -139,6 +143,9 @@ def finalize_image_output(
 
     if model_info is not None:
         out['model'] = model_info
+
+    if sampling_scheduler is not None:
+        out['sampling_scheduler'] = sampling_scheduler
 
     meta_anchor = min(img_paths, key=lambda p: str(p))
     meta_path = write_json_sidecar(meta_anchor, out)
@@ -209,7 +216,6 @@ def lora_meta(lora_specs: List[LoraSpec]) -> list[dict]:
             'weight_name': lora.weight_name,
             'adapter_name': lora.adapter_name,
             'adapter_weight': lora.adapter_weight,
-            'load_text_encoder': lora.load_text_encoder,
         }
         for lora in (lora_specs or [])
     ]

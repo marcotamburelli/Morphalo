@@ -4,6 +4,7 @@ from .image_merge import ImageMerge
 from .img2img import Img2Img
 from .inpaint import Inpaint
 from .prompt import Prompt
+from .prompt_merge import PromptMerge
 from .tap import Tap
 from .txt2img import Txt2Img
 
@@ -14,6 +15,7 @@ __all__ = [
     'Img2Img',
     'Inpaint',
     'Prompt',
+    'PromptMerge',
     'Tap',
     'Txt2Img',
 ]

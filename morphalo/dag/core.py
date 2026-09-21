@@ -945,6 +945,11 @@ class NodeRef:
         return self
 
     @property
+    def forces_cuda_cooldown(self) -> bool:
+        """Request worker recycling before execution by ProcessNodeExecutor."""
+        return False
+
+    @property
     def uses_cuda(self) -> bool:
         """Return whether this node executes work on a CUDA device."""
         return False

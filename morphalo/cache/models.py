@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,11 +7,44 @@ import torch
 
 from morphalo.cache import CacheKey, ModelCache
 
+
+def _checkpoint_key(checkpoint: Any) -> str:
+    if checkpoint is None:
+        return '<default>'
+    if isinstance(checkpoint, dict):
+        repo_id = checkpoint.get('id')
+        weight_name = checkpoint.get('weight_name')
+        return f'{repo_id}/{weight_name}'
+    return str(checkpoint)
+
+
+def _resolve_single_file_checkpoint(checkpoint: Any) -> Optional[str]:
+    if checkpoint is None:
+        return None
+
+    if isinstance(checkpoint, dict):
+        repo_id = checkpoint.get('id')
+        weight_name = checkpoint.get('weight_name')
+        if not repo_id or not weight_name:
+            raise ValueError(
+                "checkpoint dict must define both 'id' and 'weight_name'"
+            )
+
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=weight_name,
+        )
+
+    return str(checkpoint)
+
+
 if TYPE_CHECKING:
     from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
                            OmniGenPipeline, QwenImageControlNetInpaintPipeline,
                            QwenImageControlNetModel, QwenImageEditPipeline,
-                           QwenImageEditPlusPipeline,
+                           QwenImageEditPlusPipeline, Flux2KleinPipeline,
                            StableDiffusionXLPipeline, T2IAdapter)
     from insightface.app import FaceAnalysis
     from transformers import (CLIPVisionModelWithProjection,
@@ -738,6 +770,8 @@ def get_qwen_image_edit_plus_pipe(
     model_id: str,
     dtype: torch.dtype,
     device_map: str = 'balanced',
+    checkpoint: Any = None,
+    sampling_scheduler: Optional[str] = None,
 ) -> QwenImageEditPlusPipeline:
     """
     Load and cache a Qwen Image Edit Plus Diffusers pipeline.
@@ -747,33 +781,74 @@ def get_qwen_image_edit_plus_pipe(
     model_id : str
         Hugging Face model identifier or local model directory.
     dtype : torch.dtype
-        Torch dtype used for loading weights.
+        Torch dtype used to load model weights.
     device_map : str, default='balanced'
-        Accelerate device map passed to ``from_pretrained``.
+        Accelerate device map applied when constructing the complete pipeline.
+    checkpoint : dict, str, or None, optional
+        Experimental single-file transformer checkpoint override. When
+        provided, the checkpoint replaces the transformer supplied by
+        ``model_id`` while the remaining pipeline components are loaded from
+        ``model_id``. This path is intended for probing fused checkpoints and
+        may not work with every Diffusers device-map, offload, quantization, or
+        adapter configuration. A dict uses
+        ``{'id': repo_id, 'weight_name': filename}`` and is resolved via
+        ``huggingface_hub.hf_hub_download``. A string is treated as a local path
+        or direct URL.
+    sampling_scheduler : str or None, optional
+        Optional Qwen sampling scheduler profile. When provided, the resolved
+        scheduler replaces the pipeline default.
 
     Returns
     -------
-    object
-        Cached ``QwenImageEditPlusPipeline`` instance.
+    QwenImageEditPlusPipeline
+        Cached Qwen Image Edit Plus pipeline.
     """
     key = CacheKey(
         kind='qwen_image_edit_plus',
         ref=model_id,
         device=str(device_map),
         dtype=dtype_key(dtype),
-        extra=f'device_map={device_map if device_map is not None else "<none>"}',
+        extra=(
+            f'device_map={device_map if device_map is not None else "<none>"}'
+            f'|checkpoint={_checkpoint_key(checkpoint)}'
+            f'|sampling_scheduler={sampling_scheduler or "<default>"}'
+        ),
     )
 
     cached = ModelCache.get(key)
     if cached is not None:
         return cached
 
-    from diffusers import QwenImageEditPlusPipeline
+    from diffusers import (
+        QwenImageEditPlusPipeline,
+        QwenImageTransformer2DModel,
+    )
+    from morphalo.cache.qwen_sampling import resolve_qwen_sampling_scheduler
+
+    scheduler = resolve_qwen_sampling_scheduler(sampling_scheduler)
+
+    kwargs = {
+        'torch_dtype': dtype,
+        'device_map': device_map,
+    }
+
+    checkpoint_path = _resolve_single_file_checkpoint(checkpoint)
+    if checkpoint_path is not None:
+        transformer = QwenImageTransformer2DModel.from_single_file(
+            checkpoint_path,
+            config=model_id,
+            subfolder='transformer',
+            torch_dtype=dtype,
+            device_map=device_map,
+        )
+        kwargs['transformer'] = transformer
+
+    if scheduler is not None:
+        kwargs['scheduler'] = scheduler
 
     pipe = QwenImageEditPlusPipeline.from_pretrained(
         model_id,
-        torch_dtype=dtype,
-        device_map=device_map,
+        **kwargs,
     )
 
     return ModelCache.put(key, pipe)
@@ -784,12 +859,74 @@ def evict_qwen_image_edit_plus_pipe(
     model_id: str,
     dtype: torch.dtype,
     device_map: str = 'balanced',
+    checkpoint: Any = None,
+    sampling_scheduler: Optional[str] = None,
 ) -> QwenImageEditPlusPipeline:
     key = CacheKey(
         kind='qwen_image_edit_plus',
         ref=model_id,
         device=str(device_map),
         dtype=dtype_key(dtype),
+        extra=(
+            f'device_map={device_map if device_map is not None else "<none>"}'
+            f'|checkpoint={_checkpoint_key(checkpoint)}'
+            f'|sampling_scheduler={sampling_scheduler or "<default>"}'
+        ),
+    )
+
+    return ModelCache.pop(key)
+
+
+def get_flux2_klein_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: str = 'cuda',
+    cpu_offload: bool = True,
+) -> Flux2KleinPipeline:
+    """
+    Load and cache a FLUX.2 Klein Diffusers pipeline.
+    """
+    key = CacheKey(
+        kind='flux2_klein',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+        extra=f'cpu_offload={cpu_offload}',
+    )
+
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    from diffusers import Flux2KleinPipeline
+
+    pipe = Flux2KleinPipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    )
+
+    if str(device).startswith('cuda') and cpu_offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
+
+    return ModelCache.put(key, pipe)
+
+
+def evict_flux2_klein_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: str = 'cuda',
+    cpu_offload: bool = True,
+) -> Flux2KleinPipeline:
+    key = CacheKey(
+        kind='flux2_klein',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+        extra=f'cpu_offload={cpu_offload}',
     )
 
     return ModelCache.pop(key)

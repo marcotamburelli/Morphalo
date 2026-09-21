@@ -7,6 +7,9 @@ from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import (BoxCrop, FaceCrop, ImageStack,
                                        ImgAuxMap, ResizeImage, SubjectCrop)
+from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
+from morphalo.nodes.preprocess.utils.geometry import \
+    expand_clip_bbox_by_size_expr
 
 FineRegion = Literal[
     'face',
@@ -18,6 +21,51 @@ FineRegion = Literal[
     'right-eyebrow',
     'head',
 ]
+
+SegmentAxis = Literal['x', 'y']
+SegmentOrder = Literal['forward', 'reverse']
+
+
+def _validate_controlnet_lists(
+    *,
+    name: str,
+    controlnet_models: list[str] | None = None,
+    controlnet_conditioning_scales: list[float] | None = None,
+    aux_map_specs: list[SpecInput] | None = None,
+) -> None:
+    """
+    Validate parallel ControlNet argument lists.
+    """
+    used = any(
+        value is not None
+        for value in (
+            controlnet_models,
+            controlnet_conditioning_scales,
+            aux_map_specs,
+        )
+    )
+
+    if not used:
+        return
+
+    if (
+        controlnet_models is None
+        or controlnet_conditioning_scales is None
+        or aux_map_specs is None
+    ):
+        raise ValueError(
+            f'{name}: controlnet_models, controlnet_conditioning_scales '
+            'and aux_map_specs must all be set or all be None'
+        )
+    if not (
+        len(controlnet_models)
+        == len(controlnet_conditioning_scales)
+        == len(aux_map_specs)
+    ):
+        raise ValueError(
+            f'{name}: controlnet_models, controlnet_conditioning_scales '
+            'and aux_map_specs must have the same length'
+        )
 
 
 SUBJECT_MODEL_SPEC = {
@@ -742,6 +790,90 @@ def _sliding_window_bboxes_xyxy(
     ]
 
 
+def _band_segment_bboxes_xyxy(
+    *,
+    image_size: tuple[int, int],
+    axis: SegmentAxis = 'y',
+    start: SizeExpr = 0,
+    end: SizeExpr | None = None,
+    segments: int = 4,
+    overlap: SizeExpr = 0,
+    order: SegmentOrder = 'forward',
+) -> list[tuple[int, int, int, int]]:
+    """
+    Build full-width or full-height segment boxes along one image axis.
+
+    ``axis='y'`` creates horizontal bands. ``axis='x'`` creates vertical bands.
+    ``start``, ``end`` and ``overlap`` accept the shared size-expression syntax:
+    integer pixels, ``"120px"``, or percentages such as ``"25%"`` resolved
+    against the selected axis length.
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        raise ValueError('image_size values must be > 0')
+
+    if axis not in ('x', 'y'):
+        raise ValueError("axis must be 'x' or 'y'")
+
+    if order not in ('forward', 'reverse'):
+        raise ValueError("order must be 'forward' or 'reverse'")
+
+    if segments < 1:
+        raise ValueError('segments must be >= 1')
+
+    axis_size = height if axis == 'y' else width
+    start_px = resolve_size_expr(
+        start,
+        reference=axis_size,
+        min_size=0,
+        allow_unitless=True,
+    )
+    end_px = (
+        axis_size
+        if end is None
+        else resolve_size_expr(
+            end,
+            reference=axis_size,
+            min_size=0,
+            allow_unitless=True,
+        )
+    )
+    overlap_px = resolve_size_expr(
+        overlap,
+        reference=axis_size,
+        min_size=0,
+        allow_unitless=True,
+    )
+
+    start_px = max(0, min(axis_size, start_px))
+    end_px = max(0, min(axis_size, end_px))
+    if end_px <= start_px:
+        raise ValueError('segment end must be greater than segment start')
+
+    span = end_px - start_px
+    boxes: list[tuple[int, int, int, int]] = []
+
+    for idx in range(segments):
+        band_start = start_px + round(span * idx / segments)
+        band_end = start_px + round(span * (idx + 1) / segments)
+
+        band_start = max(start_px, band_start - overlap_px)
+        band_end = min(end_px, band_end + overlap_px)
+
+        if band_end <= band_start:
+            continue
+
+        if axis == 'y':
+            boxes.append((0, band_start, width, band_end))
+        else:
+            boxes.append((band_start, 0, band_end, height))
+
+    if order == 'reverse':
+        boxes.reverse()
+
+    return boxes
+
+
 def refine_sliding_tiles_group(
     name: str,
     *,
@@ -959,13 +1091,14 @@ def refine_sliding_tiles_with_controlnet_group(
     image_size: tuple[int, int],
     grid: tuple[int, int] = (3, 3),
     window_fraction: tuple[float, float] = (0.5, 0.5),
-    controlnet_model: str = 'diffusers/controlnet-depth-sdxl-1.0',
-    controlnet_conditioning_scale: float = 0.7,
-    aux_map_spec: SpecInput = {
-        'processor': 'depth_midas',
-    },
+    controlnet_models: list[str] | None = None,
+    controlnet_conditioning_scales: list[float] | None = None,
+    aux_map_specs: list[SpecInput] | None = None,
     adapter_weight_names: list[str] | None = None,
     adapter_scales: list[float | dict] | None = None,
+    adapter_tile_indices: dict[int, list[int]] | None = None,
+    lora_models: list[str | dict] | None = None,
+    lora_weights: list[float] | None = None,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
 ) -> NodeGroup:
@@ -973,10 +1106,12 @@ def refine_sliding_tiles_with_controlnet_group(
     Create a reusable NodeGroup that refines an image through overlapping tiles
     with ControlNet.
 
-    The upstream image is first resized to ``image_size``. Each tile is then
-    cropped from the progressively refined image, converted into an auxiliary
-    conditioning map, refined with ``Img2Img`` using IP-Adapter and ControlNet
-    constraints, and composited back into the same coordinate space.
+    The upstream image is first resized to ``image_size`` and converted once
+    into a full-image auxiliary conditioning map. Each tile is then cropped
+    from the progressively refined image, while the matching ControlNet crop is
+    taken from the original full auxiliary map. The tile is refined with
+    ``Img2Img`` using IP-Adapter and ControlNet constraints, and composited back
+    into the same coordinate space.
 
     Parameters
     ----------
@@ -1000,22 +1135,54 @@ def refine_sliding_tiles_with_controlnet_group(
         Tile size as a fraction of ``image_size``, expressed as
         ``(width_fraction, height_fraction)``. Default is ``(0.5, 0.5)``.
 
-    controlnet_model : str, optional
-        ControlNet model identifier used by every tile refinement node.
+    controlnet_models : list[str] or None, optional
+        ControlNet model identifiers. When ``None`` and no legacy single
+        ControlNet arguments are provided, no ControlNet is added.
 
-    controlnet_conditioning_scale : float, optional
-        Conditioning scale for the ControlNet adapter.
+    controlnet_conditioning_scales : list[float] or None, optional
+        Conditioning scales aligned with ``controlnet_models``.
 
-    aux_map_spec : SpecInput, optional
-        Spec for every internal ``ImgAuxMap`` node used to generate the geometric
-        constraint. By default this uses MiDaS depth, matching
-        ``controlnet_model``.
+    aux_map_specs : list[SpecInput] or None, optional
+        ``ImgAuxMap`` specs aligned with ``controlnet_models``.
 
     adapter_weight_names : list[str] or None, optional
         IP-Adapter weight names. When ``None``, no style adapters are added.
 
     adapter_scales : list[float | dict] or None, optional
         IP-Adapter scales aligned with ``adapter_weight_names``.
+
+    adapter_tile_indices : dict[int, list[int]] or None, optional
+        Map each adapter index to the tile indices it influences. Both indices
+        are zero-based: adapter ``0`` refers to ``adapter_weight_names[0]``
+        and port ``style_1``. Tiles are numbered left to right, top to bottom.
+
+        An adapter absent from the mapping influences every tile. A mapped
+        adapter influences only its listed tiles; an empty list disables that
+        adapter on every tile. ``None`` and ``{}`` therefore apply all adapters
+        to all tiles, preserving the default behavior.
+
+        For example, ``{0: [0, 1], 1: []}`` limits adapter 0 to tiles 0 and 1,
+        disables adapter 1, and leaves any other adapters active on every tile.
+        A tile receives no adapters when all adapters are explicitly mapped
+        and none lists that tile. Selected adapters retain their original
+        order and scales. Invalid indices and duplicate tile indices are
+        rejected.
+
+    lora_models : list[str | dict] or None, optional
+        LoRA models applied to every tile, independently of
+        ``adapter_tile_indices``. Each entry is a repository ID or local path,
+        or a dictionary with required ``id`` and optional ``weight_name`` to
+        select a particular weight file. Other dictionary keys are rejected.
+        No additional input ports are needed.
+
+        Example: ``['org/detail', {'id': 'org/repo',
+        'weight_name': 'style.safetensors'}]``.
+
+    lora_weights : list[float] or None, optional
+        Adapter weights aligned with ``lora_models``, passed to
+        ``LoraRegistry.add`` as ``adapter_weight``. Both lists must be supplied
+        together and have the same length. ``None`` for both, or two empty
+        lists, adds no LoRAs. Declaration order is preserved on every tile.
 
     layer_feather : int or str, optional
         Feather applied when compositing every refined tile.
@@ -1043,9 +1210,9 @@ def refine_sliding_tiles_with_controlnet_group(
     accumulate refinements instead of having every tile compete directly against
     the original image.
 
-    The auxiliary map is generated only for the current tile, not for the full
-    image. This keeps ControlNet conditioning spatially aligned with the local
-    refinement.
+    Auxiliary maps are generated once from the resized input image, then cropped
+    per tile. This keeps ControlNet conditioning spatially aligned with every
+    local refinement while anchoring all tiles to the same original geometry.
 
     Recommended settings:
         - strength <= 0.30
@@ -1072,6 +1239,13 @@ def refine_sliding_tiles_with_controlnet_group(
     if not bboxes:
         raise ValueError(f'{name}: no tile boxes were generated')
 
+    _validate_controlnet_lists(
+        name=name,
+        controlnet_models=controlnet_models,
+        controlnet_conditioning_scales=controlnet_conditioning_scales,
+        aux_map_specs=aux_map_specs,
+    )
+
     if (adapter_weight_names is None) != (adapter_scales is None):
         raise ValueError(
             f'{name}: adapter_weight_names and adapter_scales must both be set '
@@ -1084,6 +1258,54 @@ def refine_sliding_tiles_with_controlnet_group(
             f'{name}: adapter_weight_names and adapter_scales must have the '
             'same length'
         )
+
+    if (lora_models is None) != (lora_weights is None):
+        raise ValueError(
+            f'{name}: lora_models and lora_weights must both be set or both be None'
+        )
+    if lora_models is not None and len(lora_models) != len(lora_weights):
+        raise ValueError(f'{name}: lora_models and lora_weights must have the same length')
+    for model in lora_models or []:
+        if isinstance(model, str):
+            valid = bool(model.strip())
+        elif isinstance(model, dict):
+            valid = (
+                not (model.keys() - {'id', 'weight_name'})
+                and isinstance(model.get('id'), str)
+                and bool(model['id'].strip())
+                and (
+                    model.get('weight_name') is None
+                    or isinstance(model['weight_name'], str)
+                    and bool(model['weight_name'].strip())
+                )
+            )
+        else:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f'{name}: each lora_models entry must be a nonempty ID '
+                'or a dictionary with id and optional weight_name'
+            )
+
+    adapter_tile_indices = adapter_tile_indices or {}
+    adapter_count = len(adapter_weight_names or [])
+    for style_idx, tile_indices in adapter_tile_indices.items():
+        if type(style_idx) is not int or not 0 <= style_idx < adapter_count:
+            raise ValueError(f'{name}: invalid adapter index {style_idx!r}')
+        if not isinstance(tile_indices, list):
+            raise ValueError(
+                f'{name}: tile indices for adapter {style_idx} must be a list'
+            )
+        for tile_idx in tile_indices:
+            if type(tile_idx) is not int or not 0 <= tile_idx < len(bboxes):
+                raise ValueError(
+                    f'{name}: invalid tile index {tile_idx!r} '
+                    f'for adapter {style_idx}'
+                )
+        if len(set(tile_indices)) != len(tile_indices):
+            raise ValueError(
+                f'{name}: duplicate tile indices for adapter {style_idx}'
+            )
 
     with NodeGroup(name) as g:
         # -------------------
@@ -1108,7 +1330,17 @@ def refine_sliding_tiles_with_controlnet_group(
             },
         )
 
+        aux_maps = [
+            ImgAuxMap(
+                name=f'aux_map_{idx + 1:02d}',
+                spec=spec,
+            )
+            for idx, spec in enumerate(aux_map_specs or [])
+        ]
+
         tap_image >> resized_image
+        for aux_map in aux_maps:
+            resized_image >> aux_map
         previous_image = resized_image
 
         for idx, bbox in enumerate(bboxes):
@@ -1127,13 +1359,18 @@ def refine_sliding_tiles_with_controlnet_group(
                 },
             )
 
-            # -------------------
-            # Generate auxiliary map from the cropped tile
-            # -------------------
-            aux_map = ImgAuxMap(
-                name=f'aux_map_{idx:02d}',
-                spec=aux_map_spec,
-            )
+            crop_aux_maps = [
+                BoxCrop(
+                    name=f'crop_aux_{idx:02d}_{control_idx + 1:02d}',
+                    spec={
+                        'params': {
+                            'bbox_format': 'xyxy',
+                            'bbox': list(bbox),
+                        },
+                    },
+                )
+                for control_idx in range(len(controlnet_models or []))
+            ]
 
             # -------------------
             # Refine tile with style adapters and geometric constraint
@@ -1143,29 +1380,44 @@ def refine_sliding_tiles_with_controlnet_group(
                 spec=refine_spec,
             )
 
+            for model, weight in zip(lora_models or [], lora_weights or []):
+                refine_tile.lora.add(
+                    model if isinstance(model, str) else model['id'],
+                    weight_name=None if isinstance(model, str) else model.get('weight_name'),
+                    adapter_weight=weight,
+                )
+
             resize_tile = ResizeImage(
                 name=f'resize_{idx:02d}',
                 spec={},
             )
 
+            style_indices = [
+                style_idx for style_idx in range(adapter_count)
+                if style_idx not in adapter_tile_indices
+                or idx in adapter_tile_indices[style_idx]
+            ]
             adapter_sinks = []
-            for style_idx, (weight_name, scale) in enumerate(zip(
-                adapter_weight_names or [],
-                adapter_scales or [],
-            )):
+            for style_idx in style_indices:
                 adapter_sinks.append(refine_tile.ip_adapter.add(
                     'h94/IP-Adapter',
                     subfolder='sdxl_models',
-                    weight_name=weight_name,
-                    scale=scale,
+                    weight_name=adapter_weight_names[style_idx],
+                    scale=adapter_scales[style_idx],
                     key=f'style_{style_idx + 1}',
                 ))
 
-            controlnet_sink = refine_tile.controlnet.add(
-                controlnet_model,
-                conditioning_scale=controlnet_conditioning_scale,
-                key='geometry',
-            )
+            controlnet_sinks = [
+                refine_tile.controlnet.add(
+                    model,
+                    conditioning_scale=float(scale),
+                    key=f'geometry_{control_idx + 1}',
+                )
+                for control_idx, (model, scale) in enumerate(zip(
+                    controlnet_models or [],
+                    controlnet_conditioning_scales or [],
+                ))
+            ]
 
             # -------------------
             # Composite refined tile back
@@ -1183,15 +1435,20 @@ def refine_sliding_tiles_with_controlnet_group(
             # 2) Crop the current tile from the progressively refined image.
             previous_image >> crop_tile
 
-            # 3) Generate the auxiliary map from the cropped tile.
-            crop_tile >> aux_map
+            # 3) Crop every stable full-image auxiliary map for this tile.
+            for aux_map, crop_aux_map in zip(aux_maps, crop_aux_maps):
+                aux_map >> crop_aux_map
 
             # 4) Refine the tile with all constraints.
             crop_tile >> refine_tile
             tap_prompt >> refine_tile.prompt()
-            for tap_style, adapter_sink in zip(tap_styles, adapter_sinks):
-                tap_style >> adapter_sink
-            aux_map >> controlnet_sink
+            for style_idx, adapter_sink in zip(style_indices, adapter_sinks):
+                tap_styles[style_idx] >> adapter_sink
+            for crop_aux_map, controlnet_sink in zip(
+                crop_aux_maps,
+                controlnet_sinks,
+            ):
+                crop_aux_map >> controlnet_sink
 
             # 5) Restore the refined tile to the original crop size before
             #    compositing. Img2Img may emit a different resolution, while
@@ -1214,6 +1471,266 @@ def refine_sliding_tiles_with_controlnet_group(
 
         g.register_ports(
             tap_image,
+            tap_prompt,
+            *tap_styles,
+        )
+
+    return g
+
+
+def refine_mask_segments_with_controlnet_group(
+    name: str,
+    *,
+    refine_spec: SpecInput,
+    image_size: tuple[int, int],
+    axis: SegmentAxis = 'y',
+    start: SizeExpr = 0,
+    end: SizeExpr | None = None,
+    segments: int = 4,
+    overlap: SizeExpr = 0,
+    order: SegmentOrder = 'forward',
+    bbox_margin: SizeExpr = 0,
+    mask_feather: int | str = 0,
+    layer_feather: int | str = 40,
+    layer_corner_radius: int | str = 0,
+    controlnet_models: list[str] | None = None,
+    controlnet_conditioning_scales: list[float] | None = None,
+    aux_map_specs: list[SpecInput] | None = None,
+    adapter_weight_names: list[str] | None = None,
+    adapter_scales: list[float | dict] | None = None,
+) -> NodeGroup:
+    """
+    Refine a full-frame masked region through sequential axis-aligned segments.
+
+    This macro is meant for cases where an upstream semantic crop has already
+    produced a full-frame mask. The mask is split into horizontal or vertical
+    bands, and each band is used as the inpaint mask for one sequential
+    full-frame ``Inpaint`` pass. Every segment bbox may be expanded by
+    ``bbox_margin`` before cropping, so nearby context can be included without
+    changing the segment-generation range.
+
+    Ports
+    -----
+    ``in_image``
+        Image to refine. It must already use the same coordinate space as
+        ``image_size``.
+
+    ``in_mask``
+        Full-frame mask to segment. It must already use the same coordinate
+        space as ``image_size``. It is cropped per band, then placed back onto
+        a black full-frame canvas with
+        ``mask_feather`` using ``ImageStack`` and the crop transform metadata.
+
+    ``in_prompt``
+        Prompt forwarded to every internal ``Inpaint`` node.
+
+    ``style_N``
+        Optional IP-Adapter style ports, one for each item in
+        ``adapter_weight_names``.
+
+    Notes
+    -----
+    ``axis='y'`` creates horizontal bands between ``start`` and ``end``.
+    ``axis='x'`` creates vertical bands. ``start``, ``end`` and ``overlap`` use
+    the shared size-expression syntax: pixels, ``"120px"``, or percentages.
+
+    The refined segment is cropped from the full-frame inpaint result and
+    composited back onto the progressively updated image with ``layer_feather``.
+    This keeps ``BoxCrop`` purely geometric while ``ImageStack`` owns the
+    blending behavior.
+
+    ControlNet auxiliary maps are generated once from the input image and
+    reused for every segment, matching the stable-geometry behavior of
+    ``refine_sliding_tiles_with_controlnet_group``.
+    """
+    base_bboxes = _band_segment_bboxes_xyxy(
+        image_size=image_size,
+        axis=axis,
+        start=start,
+        end=end,
+        segments=segments,
+        overlap=overlap,
+        order=order,
+    )
+    bboxes = [
+        expand_clip_bbox_by_size_expr(
+            x1,
+            y1,
+            x2,
+            y2,
+            int(image_size[0]),
+            int(image_size[1]),
+            bbox_margin,
+        )
+        for x1, y1, x2, y2 in base_bboxes
+    ]
+
+    if not bboxes:
+        raise ValueError(f'{name}: no segment boxes were generated')
+
+    _validate_controlnet_lists(
+        name=name,
+        controlnet_models=controlnet_models,
+        controlnet_conditioning_scales=controlnet_conditioning_scales,
+        aux_map_specs=aux_map_specs,
+    )
+
+    if (adapter_weight_names is None) != (adapter_scales is None):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must both be set '
+            'or both be None'
+        )
+    if adapter_weight_names is not None and (
+        len(adapter_weight_names) != len(adapter_scales)
+    ):
+        raise ValueError(
+            f'{name}: adapter_weight_names and adapter_scales must have the '
+            'same length'
+        )
+
+    with NodeGroup(name) as g:
+        tap_image = Tap(name='in_image')
+        tap_mask = Tap(name='in_mask')
+        tap_prompt = Tap(name='in_prompt', strict=False)
+        tap_styles = [
+            Tap(name=f'style_{idx + 1}')
+            for idx in range(len(adapter_weight_names or []))
+        ]
+
+        stack_spec = {
+            'params': {
+                'width': int(image_size[0]),
+                'height': int(image_size[1]),
+            },
+        }
+        mask_stack_spec = {
+            'params': {
+                'width': int(image_size[0]),
+                'height': int(image_size[1]),
+                'background': [0, 0, 0, 255],
+                'out_mode': 'RGB',
+            },
+        }
+
+        aux_maps = [
+            ImgAuxMap(
+                name=f'aux_map_{idx + 1:02d}',
+                spec=spec,
+            )
+            for idx, spec in enumerate(aux_map_specs or [])
+        ]
+        for aux_map in aux_maps:
+            tap_image >> aux_map
+
+        previous_image = tap_image
+
+        for idx, bbox in enumerate(bboxes):
+            is_last = idx == len(bboxes) - 1
+
+            crop_image = BoxCrop(
+                name=f'crop_image_{idx:02d}',
+                spec={
+                    'params': {
+                        'bbox_format': 'xyxy',
+                        'bbox': list(bbox),
+                    },
+                },
+            )
+
+            crop_mask = BoxCrop(
+                name=f'crop_mask_{idx:02d}',
+                spec={
+                    'params': {
+                        'bbox_format': 'xyxy',
+                        'bbox': list(bbox),
+                    },
+                },
+            )
+
+            segment_mask = ImageStack(
+                name=f'segment_mask_{idx:02d}',
+                spec=mask_stack_spec,
+            )
+
+            refine_segment = Inpaint(
+                name=f'inpaint_{idx:02d}',
+                spec=refine_spec,
+            )
+
+            crop_refined = BoxCrop(
+                name=f'crop_refined_{idx:02d}',
+                spec={
+                    'params': {
+                        'bbox_format': 'xyxy',
+                        'bbox': list(bbox),
+                    },
+                },
+            )
+
+            stack = ImageStack(
+                name='out' if is_last else f'stack_{idx:02d}',
+                spec=stack_spec,
+            )
+
+            adapter_sinks = []
+            for style_idx, (weight_name, scale) in enumerate(zip(
+                adapter_weight_names or [],
+                adapter_scales or [],
+            )):
+                adapter_sinks.append(refine_segment.ip_adapter.add(
+                    'h94/IP-Adapter',
+                    subfolder='sdxl_models',
+                    weight_name=weight_name,
+                    scale=scale,
+                    key=f'style_{style_idx + 1}',
+                ))
+
+            previous_image >> crop_image
+            tap_mask >> crop_mask
+
+            mask_layer = segment_mask.image(
+                1,
+                position='center',
+                feather=mask_feather,
+            )
+            crop_mask >> mask_layer
+            crop_mask >> mask_layer.transform()
+
+            previous_image >> refine_segment
+            segment_mask >> refine_segment.mask()
+            tap_prompt >> refine_segment.prompt()
+
+            for tap_style, adapter_sink in zip(tap_styles, adapter_sinks):
+                tap_style >> adapter_sink
+
+            for control_idx, (aux_map, model, scale) in enumerate(zip(
+                aux_maps,
+                controlnet_models or [],
+                controlnet_conditioning_scales or [],
+            )):
+                aux_map >> refine_segment.controlnet.add(
+                    model,
+                    conditioning_scale=float(scale),
+                    key=f'geometry_{control_idx + 1}',
+                )
+
+            previous_image >> stack.image(0)
+            refine_segment >> crop_refined
+
+            layer = stack.image(
+                1,
+                position='center',
+                feather=layer_feather,
+                corner_radius=layer_corner_radius,
+            )
+            crop_refined >> layer
+            crop_image >> layer.transform()
+
+            previous_image = stack
+
+        g.register_ports(
+            tap_image,
+            tap_mask,
             tap_prompt,
             *tap_styles,
         )

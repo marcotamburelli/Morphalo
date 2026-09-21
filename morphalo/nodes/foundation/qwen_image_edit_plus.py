@@ -74,6 +74,23 @@ class QwenImageEditPlus(
             improved consistency and editing capabilities.
           - ``'Qwen/Qwen-Image-Edit-2509'``: previous model, useful for
             reproducibility or comparison with older runs.
+        - ``checkpoint`` : dict or str, optional
+          Experimental single-file transformer checkpoint override. When
+          provided, the pipeline loads the remaining components from
+          ``model.id`` but replaces the transformer with this checkpoint. This
+          is useful for probing fused Qwen Image Edit variants such as LightX2V
+          Lightning checkpoints, where the speed-up is baked into the
+          transformer weights rather than applied as a LoRA adapter.
+
+          This path is experimental because fused checkpoints can depend on
+          loading, quantization, and offload behavior that is not always
+          supported by the standard Diffusers ``QwenImageEditPlusPipeline``.
+          Prefer the base model path for production DAGs unless the checkpoint
+          has been validated in the target runtime.
+
+          Recommended form for Hugging Face files:
+          ``{'id': '<repo-id>', 'weight_name': '<file.safetensors>'}``.
+          Strings are treated as local paths or direct URLs.
         - ``dtype`` : str, optional
           Torch dtype used to load model weights. Defaults to ``'bf16'``.
         - ``device_map`` : {'balanced'}, optional
@@ -83,6 +100,18 @@ class QwenImageEditPlus(
           devices while balancing memory pressure, which helps run large Qwen
           models on domestic hardware with limited VRAM. The node always loads the
           model through ``device_map`` and does not call ``pipe.to(device)``.
+
+        ``sampling`` keys:
+
+        - ``scheduler`` : str, optional
+          Optional scheduler profile used only for this node run. When omitted,
+          the pipeline default scheduler is used.
+
+          Supported values:
+          - ``'lightx2v-lightning'``: scheduler profile matching the official LightX2V
+            Qwen Image Lightning Diffusers inference recipe. Use this when applying
+            LoRAs such as ``lightx2v/Qwen-Image-Edit-2511-Lightning``; pair it with the
+            LoRA-specific step count and typically ``params.true_cfg_scale=1.0``.
 
         ``params`` keys:
 
@@ -155,6 +184,9 @@ class QwenImageEditPlus(
     - LoRA adapters may be declared with ``node.lora.add(...)``. Qwen Image
       LoRAs are loaded via Diffusers ``load_lora_weights`` and activated via
       ``set_adapters``; SDXL-only ``cross_attention_kwargs`` are not passed.
+    - Step-distilled Lightning LoRAs may require a matching sampling scheduler.
+      For LightX2V Qwen Image Edit Lightning LoRAs, set
+      ``spec["sampling"]["scheduler"]`` to ``'lightx2v-lightning'``.
     """
 
     spec: SpecInput = field(default_factory=dict)
@@ -227,6 +259,10 @@ class QwenImageEditPlus(
         image_bundle = self.build_image_sequence_bundle(input)
         images = image_bundle.images
         image_metadata = image_bundle.metadata
+        if not images:
+            raise ValueError(
+                'QwenImageEditPlus requires at least one input image.'
+            )
 
         # Prompt
         pb = PromptBundle(spec=spec, input=input)
@@ -254,12 +290,15 @@ class QwenImageEditPlus(
         # Seed / generator
         seed = resolve_qwen_seed(spec)
         gen = qwen_cpu_generator(seed)
+        sampling_name = (spec.get('sampling') or {}).get('scheduler')
 
         # Pipeline
         pipe = get_qwen_image_edit_plus_pipe(
             model_id=model_cfg.model_id,
             dtype=model_cfg.dtype,
             device_map=model_cfg.device_map,
+            checkpoint=model_cfg.checkpoint,
+            sampling_scheduler=sampling_name,
         )
         lora_bundle = self.build_lora_bundle()
 
@@ -311,8 +350,12 @@ class QwenImageEditPlus(
             dt_s=dt_s,
             cuda_mem=mem,
             lora_specs=self.lora.specs,
+            sampling_scheduler=sampling_name,
             model_info={
                 'id': model_cfg.model_id,
+                **({} if model_cfg.checkpoint is None else {
+                    'checkpoint': model_cfg.checkpoint,
+                }),
                 'device_map': model_cfg.device_map,
                 'dtype': dtype_key(model_cfg.dtype),
                 'pipeline': 'QwenImageEditPlusPipeline',
@@ -350,14 +393,18 @@ class QwenImageEditPlus(
                 model_id=model_cfg.model_id,
                 dtype=model_cfg.dtype,
                 device_map=model_cfg.device_map,
+                checkpoint=model_cfg.checkpoint,
+                sampling_scheduler=(spec.get('sampling') or {}).get('scheduler'),
             )
 
             if obj is None:
                 raise RuntimeError(
                     'QwenImageEditPlus cache model not found for eviction: '
                     f'model_id={model_cfg.model_id!r}, '
+                    f'checkpoint={model_cfg.checkpoint!r}, '
                     f'device_map={model_cfg.device_map!r}, '
-                    f'dtype={model_cfg.dtype!r}'
+                    f'dtype={model_cfg.dtype!r}, '
+                    f'sampling_scheduler={(spec.get("sampling") or {}).get("scheduler")!r}'
                 )
 
             del obj

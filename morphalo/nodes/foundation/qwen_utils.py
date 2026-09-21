@@ -24,6 +24,7 @@ class QwenModelConfig:
     """
 
     model_id: str
+    checkpoint: Any
     dtype: torch.dtype
     device_map: str
 
@@ -115,9 +116,10 @@ def resolve_qwen_model_config(
     """
     Resolve common Qwen model settings from a node spec.
 
-    Reads ``model.id``, ``model.dtype``, and ``model.device_map``; applies the
-    node-specific default model id; converts dtype through ``resolve_dtype``; and
-    validates the shared device-map restriction.
+    Reads ``model.id``, experimental ``model.checkpoint``, ``model.dtype``,
+    and ``model.device_map``; applies the node-specific default model id;
+    converts dtype through ``resolve_dtype``; and validates the shared
+    device-map restriction.
     """
     model = _model_section(spec)
     device_map = model.get('device_map', 'balanced')
@@ -128,6 +130,7 @@ def resolve_qwen_model_config(
     )
     return QwenModelConfig(
         model_id=model.get('id', default_model_id),
+        checkpoint=model.get('checkpoint'),
         dtype=resolve_dtype(model.get('dtype', 'bf16')),
         device_map=device_map,
     )

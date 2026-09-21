@@ -1,13 +1,14 @@
 '''
 Foundation nodes demo (minimal).
 
-This module contains five small DAGs covering the minimal foundation workflows:
+This module contains six small DAGs covering the minimal foundation workflows:
 
 1) QwenImage      - text-to-image generation (no input image)
 2) QwenImageEdit  - instruction-based image editing (requires one input image)
 3) QwenImageEditPlus - multi-image instruction editing with ordered image refs
 4) QwenImageInpaint - masked inpainting with an AnyCrop-generated mask
 5) OmniGen        - multimodal generation/editing with wired images referenced in the prompt
+6) Flux2Klein     - unified FLUX.2 Klein text-to-image / optional reference editing
 
 How to run
 ----------
@@ -16,6 +17,7 @@ How to run
     ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_edit_plus_min
     ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_inpaint_tshirt_min
     ./bin/run_dag.sh demo.10_foundation_minimal --dag omnigen_style_transfer_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag flux2_klein_min
 '''
 
 from pathlib import Path
@@ -23,6 +25,7 @@ from pathlib import Path
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage, Prompt
 from morphalo.nodes.foundation import (
+    Flux2Klein,
     OmniGen,
     QwenImage,
     QwenImageEdit,
@@ -399,4 +402,64 @@ with DAG(
     style_img >> out.image.add(key='style')
 
     # Lateral: prompt -> OmniGen
+    prompt >> out.prompt()
+
+
+# -----------------------------------------------------------------------------
+# 6) FLUX.2 Klein (unified txt2img / optional reference editing)
+# -----------------------------------------------------------------------------
+#
+# Flux2Klein accepts zero or more ordered input images:
+# - no images: pure text-to-image generation;
+# - one image: instruction-driven edit/reference generation;
+# - multiple images: multi-reference generation.
+#
+with DAG(
+    name='flux2_klein_min',
+    out_dir=ROOT / 'outputs' / 'flux2_klein_min',
+):
+
+    prompt = Prompt(
+        name='prompt',
+        spec={
+            'lang': 'eng_Latn',
+            'prompt': [
+                'A cinematic product photo of a translucent glass compass.',
+                'The compass rests on wet black stone with small brass markings.',
+                'Sharp macro detail, controlled studio lighting, realistic reflections.',
+            ],
+        },
+    )
+
+    out = Flux2Klein(
+        name='out',
+        spec={
+            'model': {
+                # Defaults to 'black-forest-labs/FLUX.2-klein-base-4B'.
+                # Use 'black-forest-labs/FLUX.2-klein-base-9B' explicitly
+                # when the local environment has enough memory.
+                'dtype': 'bf16',
+                'device': 'cuda',
+
+                # Matches the official Diffusers example and lowers VRAM use.
+                'cpu_offload': True,
+            },
+            'params': {
+                'steps': 50,
+                'cfg': 4.0,
+                'width': 1024,
+                'height': 1024,
+
+                # Reference/edit mode can use long_side instead of width/height.
+                # It resolves the output aspect ratio from the first input image.
+                # 'long_side': 1024,
+            },
+            'seed': 1234,
+        },
+    )
+
+    # To use reference/edit mode, wire images into ordered slots:
+    # source_img >> out.image.add(idx=0)
+    # style_img >> out.image.add(idx=1)
+
     prompt >> out.prompt()

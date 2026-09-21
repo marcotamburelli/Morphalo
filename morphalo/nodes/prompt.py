@@ -10,6 +10,7 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.prompt_output import PromptOutputMixin
 from morphalo.nodes.wiring.prompt import PromptValue, norm_prompt_pair
 
 DEFAULT_MODEL = 'facebook/nllb-200-distilled-600M'
@@ -131,7 +132,7 @@ def translate_prompt_value(
 
 
 @dataclass
-class Prompt(CudaPostRunMixin, NodeRef):
+class Prompt(PromptOutputMixin, CudaPostRunMixin, NodeRef):
     """
     Prepare and normalize text prompts from a configuration specification.
 

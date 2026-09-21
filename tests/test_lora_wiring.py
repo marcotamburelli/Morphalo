@@ -1,8 +1,79 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+import torch
+
 from morphalo.nodes.sdxl_pipe_builder import build_cross_attention_kwargs
 from morphalo.nodes.wiring.conditioning import apply_lora, cleanup_adapters
 from morphalo.nodes.wiring.lora import LoraBundle, LoraRegistry
+from morphalo.nodes.wiring.conditioning import (
+    _load_sdxl_lora_weights, _normalize_sdxl_lora_keys,
+)
+
+
+def test_normalization_loads_complete_text_adapter():
+    from transformers import CLIPTextConfig, CLIPTextModel
+    from diffusers.loaders import StableDiffusionXLLoraLoaderMixin as Loader
+
+    model = CLIPTextModel(CLIPTextConfig(
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2,
+    ))
+    pipe = SimpleNamespace(text_encoder=model, text_encoder_2=None)
+    root = 'text_encoder.text_model.encoder.layers.0.self_attn'
+    state = {
+        f'{root}.to_q_lora.down.weight': torch.randn(2, 8),
+        f'{root}.to_q_lora.up.weight': torch.randn(8, 2),
+        f'{root}.to_out_lora.down.weight': torch.randn(2, 8),
+        f'{root}.to_out_lora.up.weight': torch.randn(8, 2),
+    }
+    alphas = {f'{root}.to_q_lora.down.weight.alpha': 4.,
+              f'{root}.to_out_lora.down.weight.alpha': 4.}
+    fixed = _normalize_sdxl_lora_keys(state, pipe)
+    fixed_alphas = _normalize_sdxl_lora_keys(alphas, pipe)
+    Loader.load_lora_into_text_encoder(
+        fixed, fixed_alphas, model, prefix='text_encoder', adapter_name='test')
+    layer = model.encoder.layers[0].self_attn.q_proj
+    assert torch.equal(layer.lora_A['test'].weight, state[f'{root}.to_q_lora.down.weight'])
+    assert torch.equal(layer.lora_B['test'].weight, state[f'{root}.to_q_lora.up.weight'])
+    assert layer.scaling['test'] == 2.
+
+
+def test_normalization_preserves_wrapped_encoder_and_unet():
+    pipe = SimpleNamespace(text_encoder=None,
+                           text_encoder_2=SimpleNamespace(text_model=object()))
+    state = {'text_encoder_2.text_model.foo.lora_A.weight': object(),
+             'unet.foo.lora_A.weight': object()}
+    assert _normalize_sdxl_lora_keys(state, pipe) == state
+
+
+def test_normalization_rejects_unknown_targets_and_collisions():
+    encoder = SimpleNamespace(named_modules=lambda: [('encoder.foo', object())])
+    pipe = SimpleNamespace(text_encoder=encoder, text_encoder_2=None)
+    with pytest.raises(ValueError, match='Unknown'):
+        _normalize_sdxl_lora_keys({'text_encoder.text_model.unknown.lora_A.weight': 1}, pipe)
+    with pytest.raises(ValueError, match='collision'):
+        _normalize_sdxl_lora_keys({
+            'text_encoder.text_model.encoder.foo.lora_A.weight': 1,
+            'text_encoder.encoder.foo.lora_A.weight': 2,
+        }, pipe)
+
+
+def test_sdxl_loading_restores_state_dict_method_on_failure():
+    pipe = FakePipe()
+    original = pipe.lora_state_dict
+
+    def fail(*args, **kwargs):
+        pipe.lora_state_dict('repo', return_lora_metadata=True)
+        raise RuntimeError('loading failed')
+
+    pipe.load_lora_weights = fail
+    with pytest.raises(RuntimeError, match='loading failed'):
+        _load_sdxl_lora_weights(pipe, 'repo')
+    assert pipe.lora_state_dict == original
+    assert 'lora_state_dict' not in vars(pipe)
 
 
 class FakePipe:
@@ -102,14 +173,13 @@ def test_apply_lora_loads_weights_and_sets_adapter_weights():
     ]
 
 
-def test_apply_lora_can_skip_text_encoder_for_unet_only_lora():
+def test_apply_lora_unet_only_uses_official_api():
     registry = LoraRegistry(owner=object())
     registry.add(
         'TonariNoTaku/SDXL_sufficient_nudity',
         weight_name='nudity_v03XL_i1762_prod256n128b2_swn2_offset_e5.safetensors',
         adapter_name='sufficient_nudity',
         adapter_weight=0.6,
-        load_text_encoder=False,
     )
 
     pipe = FakePipe()
@@ -119,26 +189,14 @@ def test_apply_lora_can_skip_text_encoder_for_unet_only_lora():
 
     assert pipe.calls == [
         (
-            'lora_state_dict',
+            'load_lora_weights',
             'TonariNoTaku/SDXL_sufficient_nudity',
             {
-                'return_lora_metadata': True,
-                'weight_name': 'nudity_v03XL_i1762_prod256n128b2_swn2_offset_e5.safetensors',
-                'unet_config': pipe.unet.config,
-            },
-        ),
-        (
-            'load_lora_into_unet',
-            {'unet.foo.lora.down.weight': 'weight'},
-            {
-                'network_alphas': None,
-                'unet': pipe.unet,
                 'adapter_name': 'sufficient_nudity',
-                'metadata': None,
-                '_pipeline': pipe,
+                'weight_name': 'nudity_v03XL_i1762_prod256n128b2_swn2_offset_e5.safetensors',
             },
         ),
-        ('unet.set_adapters', ['sufficient_nudity'], [0.6]),
+        ('set_adapters', ['sufficient_nudity'], [0.6]),
     ]
 
 
