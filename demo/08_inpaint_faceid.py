@@ -1,8 +1,10 @@
 """
-Inpaint + FaceID demo.
+Inpaint + FaceID and FaceSwap demos.
 
-This example demonstrates how to perform inpainting while constraining identity
-using FaceID (PlusV2).
+This module demonstrates two ways of transferring a face identity:
+
+1. Inpainting constrained with FaceID PlusV2.
+2. Direct face replacement with SimSwap.
 
 Conceptual graph
 ----------------
@@ -12,25 +14,30 @@ FaceIdEmbedImage (identity embeds) - - > Inpaint  -> Output image
 Mask (inpaint region) - - - - - - - - -^
 Source image (base)  ------------------->
 
+Target image --------------------------> FaceSwap -> Output image
+Identity image ------------------------> FaceSwap.source()
+
 How to run
 ----------
     ./bin/run_dag.sh demo.08_inpaint_faceid --dag inpaint_faceid
+    ./bin/run_dag.sh demo.08_inpaint_faceid --dag face_swap
 
 Inputs (local paths)
 -------------------
-- source image: the base image to inpaint
+- source image: the base image to inpaint or use as the FaceSwap target
 - mask image: white = region to inpaint, black = keep original
-- face reference: used to extract FaceID embeddings
+- face reference: used for FaceID embeddings or as the FaceSwap identity source
 """
 
 from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FaceIdEmbedImage, FileImage, Inpaint, Prompt
+from morphalo.nodes.process import FaceSwap
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SOURCE_IMG = '~/images/input_img.png'
+SOURCE_IMG = '~/images/init_img_3.png'
 FACE_REF = '~/images/identity_face.png'
 STYLE_MASK = '~/images/style_mask.png'
 
@@ -139,3 +146,51 @@ with DAG(
         # clip_strength=0.5,
         key='id',
     )
+
+
+# -----------------------------------------------------------------------------
+# FaceSwap (direct identity transfer)
+# -----------------------------------------------------------------------------
+#
+# Unlike the FaceID inpainting DAG above, this workflow does not regenerate a
+# masked image region with a diffusion model. It directly replaces the largest
+# face detected in the target image while preserving the target pose,
+# expression, body, and surrounding scene.
+#
+with DAG(
+    name='face_swap',
+    out_dir=ROOT / 'outputs' / 'face_swap',
+):
+
+    # Image whose face will be replaced.
+    target = FileImage(
+        name='target',
+        path=SOURCE_IMG,
+    )
+
+    # Reference image providing the identity transferred onto the target.
+    identity = FileImage(
+        name='identity',
+        path=FACE_REF,
+    )
+
+    swap = FaceSwap(
+        name='swap',
+        spec={
+            'model': {
+                'device': 'cpu',
+                'model_name': 'buffalo_l',
+                'det_size': [640, 640],
+                'swapper': 'simswap_unofficial_512',
+            },
+            'debug': {
+                'save_debug': True,
+            },
+        },
+    )
+
+    # Main flow: the target image supplies pose, expression, and composition.
+    target >> swap
+
+    # Lateral input: the source attachment supplies the identity to transfer.
+    identity >> swap.source()

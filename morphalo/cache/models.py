@@ -1,11 +1,56 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
 from morphalo.cache import CacheKey, ModelCache
+
+
+@dataclass(frozen=True)
+class FaceSwapperRuntime:
+    """
+    Cached sessions and preprocessing contract for a face swapper.
+
+    Attributes
+    ----------
+    converter : Any
+        ONNX Runtime session converting ArcFace embeddings to SimSwap space.
+    swapper : Any
+        ONNX Runtime session generating the swapped face crop.
+    size : int
+        Square input resolution expected by the swapper.
+    mean : tuple[float, float, float]
+        Per-channel RGB normalization mean.
+    std : tuple[float, float, float]
+        Per-channel RGB normalization standard deviation.
+    """
+
+    converter: Any
+    swapper: Any
+    size: int
+    mean: Tuple[float, float, float]
+    std: Tuple[float, float, float]
+
+
+_FACE_SWAPPER_MODELS = {
+    'simswap_256': {
+        'repo_id': 'facefusion/models-3.0.0',
+        'filename': 'simswap_256.onnx',
+        'size': 256,
+        'mean': (0.485, 0.456, 0.406),
+        'std': (0.229, 0.224, 0.225),
+    },
+    'simswap_unofficial_512': {
+        'repo_id': 'facefusion/models-3.0.0',
+        'filename': 'simswap_unofficial_512.onnx',
+        'size': 512,
+        'mean': (0.0, 0.0, 0.0),
+        'std': (1.0, 1.0, 1.0),
+    },
+}
 
 
 def _checkpoint_key(checkpoint: Any) -> str:
@@ -1115,6 +1160,83 @@ def get_insightface(
     )
 
     return ModelCache.put(key, app)
+
+
+def get_face_swapper(*, model_name: str, device: str) -> FaceSwapperRuntime:
+    """
+    Load or retrieve a cached SimSwap runtime.
+
+    The selected swapper and its CrossFace embedding converter are downloaded
+    from the corresponding FaceFusion model repositories. Sessions are cached
+    together because they form one backend-specific inference contract.
+
+    Parameters
+    ----------
+    model_name : str
+        Supported SimSwap model identifier.
+    device : str
+        Runtime device, such as ``'cpu'`` or ``'cuda'``.
+
+    Returns
+    -------
+    FaceSwapperRuntime
+        Cached ONNX sessions, input size, and normalization parameters.
+
+    Raises
+    ------
+    ValueError
+        If ``model_name`` is not supported.
+    RuntimeError
+        If CUDA is requested but unavailable in ONNX Runtime.
+    """
+    try:
+        model = _FACE_SWAPPER_MODELS[model_name]
+    except KeyError as exc:
+        supported = ', '.join(sorted(_FACE_SWAPPER_MODELS))
+        raise ValueError(
+            f'Unsupported face swapper {model_name!r}; expected one of: {supported}'
+        ) from exc
+
+    key = CacheKey(
+        kind='face_swapper',
+        ref=model_name,
+        device=device,
+        dtype='float32',
+    )
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+
+    swapper_path = hf_hub_download(
+        repo_id=model['repo_id'],
+        filename=model['filename'],
+    )
+    converter_path = hf_hub_download(
+        repo_id='facefusion/models-3.4.0',
+        filename='crossface_simswap.onnx',
+    )
+
+    available = set(ort.get_available_providers())
+    providers = ['CPUExecutionProvider']
+    if str(device).lower().startswith('cuda'):
+        if 'CUDAExecutionProvider' not in available:
+            raise RuntimeError(
+                'CUDA was requested for FaceSwap, but ONNX Runtime does not '
+                'provide CUDAExecutionProvider'
+            )
+        providers.insert(0, 'CUDAExecutionProvider')
+
+    runtime = FaceSwapperRuntime(
+        converter=ort.InferenceSession(converter_path, providers=providers),
+        swapper=ort.InferenceSession(swapper_path, providers=providers),
+        size=int(model['size']),
+        mean=model['mean'],
+        std=model['std'],
+    )
+    return ModelCache.put(key, runtime)
 
 
 def get_mediapipe_face_landmarker(

@@ -146,7 +146,8 @@ def test_tiles_reject_invalid_adapter_mapping(selection, message):
         )
 
 
-def test_tiles_apply_all_loras_independently_of_style_selection():
+@pytest.mark.parametrize('selection', [None, {}])
+def test_tiles_apply_all_loras_by_default(selection):
     declarations = [
         {
             'id': 'org/upper',
@@ -164,6 +165,7 @@ def test_tiles_apply_all_loras_independently_of_style_selection():
         adapter_tile_indices={0: [0]},
         lora_models=declarations,
         lora_weights=[0.6, 0.3],
+        lora_tile_indices=selection,
     )
     tiles = [node for node in group.nodes if node.name.startswith('refine_')]
 
@@ -179,6 +181,51 @@ def test_tiles_apply_all_loras_independently_of_style_selection():
         assert second.adapter_weight == 0.3
     assert tiles[0].lora.specs[0] is not tiles[1].lora.specs[0]
     assert declarations[0] == {'id': 'org/upper', 'weight_name': 'upper.safetensors'}
+
+
+def test_tiles_select_loras_and_preserve_original_order():
+    group = refine_sliding_tiles_with_controlnet_group(
+        'tiles',
+        refine_spec={'params': {'steps': 1}},
+        image_size=(64, 64),
+        grid=(3, 1),
+        lora_models=['org/upper', 'org/lower', 'org/common'],
+        lora_weights=[0.6, 0.4, 0.2],
+        lora_tile_indices={0: [0], 1: [], 2: [0, 2]},
+    )
+    tiles = {
+        node.name: node for node in group.nodes
+        if node.name.startswith('refine_')
+    }
+
+    assert [spec.model_id for spec in tiles['refine_00'].lora.specs] == [
+        'org/upper', 'org/common',
+    ]
+    assert [spec.adapter_weight for spec in tiles['refine_00'].lora.specs] == [
+        0.6, 0.2,
+    ]
+    assert tiles['refine_01'].lora.specs == []
+    assert [spec.model_id for spec in tiles['refine_02'].lora.specs] == [
+        'org/common',
+    ]
+
+
+def test_unmapped_lora_is_applied_to_every_tile():
+    group = refine_sliding_tiles_with_controlnet_group(
+        'tiles',
+        refine_spec={'params': {'steps': 1}},
+        image_size=(64, 64),
+        grid=(2, 1),
+        lora_models=['org/local', 'org/global'],
+        lora_weights=[0.6, 0.2],
+        lora_tile_indices={0: [0]},
+    )
+    tiles = [node for node in group.nodes if node.name.startswith('refine_')]
+
+    assert [spec.model_id for spec in tiles[0].lora.specs] == [
+        'org/local', 'org/global',
+    ]
+    assert [spec.model_id for spec in tiles[1].lora.specs] == ['org/global']
 
 
 @pytest.mark.parametrize('models, weights, message', [
@@ -198,4 +245,27 @@ def test_tiles_validate_lora_lists(models, weights, message):
             grid=(1, 1),
             lora_models=models,
             lora_weights=weights,
+        )
+
+
+@pytest.mark.parametrize('selection, message', [
+    ({-1: []}, 'invalid LoRA index'),
+    ({2: []}, 'invalid LoRA index'),
+    ({True: []}, 'invalid LoRA index'),
+    ({0: [-1]}, 'invalid tile index'),
+    ({0: [2]}, 'invalid tile index'),
+    ({0: [True]}, 'invalid tile index'),
+    ({0: [0, 0]}, 'duplicate tile indices'),
+    ({0: (0,)}, 'must be a list'),
+])
+def test_tiles_reject_invalid_lora_mapping(selection, message):
+    with pytest.raises(ValueError, match=message):
+        refine_sliding_tiles_with_controlnet_group(
+            'tiles',
+            refine_spec={'params': {'steps': 1}},
+            image_size=(64, 64),
+            grid=(2, 1),
+            lora_models=['org/upper', 'org/lower'],
+            lora_weights=[0.6, 0.4],
+            lora_tile_indices=selection,
         )

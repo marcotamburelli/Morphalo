@@ -1099,6 +1099,7 @@ def refine_sliding_tiles_with_controlnet_group(
     adapter_tile_indices: dict[int, list[int]] | None = None,
     lora_models: list[str | dict] | None = None,
     lora_weights: list[float] | None = None,
+    lora_tile_indices: dict[int, list[int]] | None = None,
     layer_feather: int | str = 40,
     layer_corner_radius: int | str = 60,
 ) -> NodeGroup:
@@ -1183,6 +1184,20 @@ def refine_sliding_tiles_with_controlnet_group(
         ``LoraRegistry.add`` as ``adapter_weight``. Both lists must be supplied
         together and have the same length. ``None`` for both, or two empty
         lists, adds no LoRAs. Declaration order is preserved on every tile.
+
+    lora_tile_indices : dict[int, list[int]] or None, optional
+        Map each zero-based LoRA index in ``lora_models`` to the zero-based tile
+        indices it influences. Tiles are numbered left to right, top to bottom.
+
+        A LoRA absent from the mapping influences every tile. A mapped LoRA
+        influences only its listed tiles; an empty list disables that LoRA on
+        every tile. ``None`` and ``{}`` therefore apply all LoRAs to all tiles.
+
+        For example, ``{0: [0, 1], 1: []}`` limits LoRA 0 to tiles 0 and 1,
+        disables LoRA 1, and leaves any other LoRAs active on every tile. A tile
+        receives no LoRAs when all LoRAs are explicitly mapped and none lists
+        that tile. Selected LoRAs retain their original order and weights.
+        Invalid indices and duplicate tile indices are rejected.
 
     layer_feather : int or str, optional
         Feather applied when compositing every refined tile.
@@ -1287,6 +1302,26 @@ def refine_sliding_tiles_with_controlnet_group(
                 'or a dictionary with id and optional weight_name'
             )
 
+    lora_tile_indices = lora_tile_indices or {}
+    lora_count = len(lora_models or [])
+    for lora_idx, tile_indices in lora_tile_indices.items():
+        if type(lora_idx) is not int or not 0 <= lora_idx < lora_count:
+            raise ValueError(f'{name}: invalid LoRA index {lora_idx!r}')
+        if not isinstance(tile_indices, list):
+            raise ValueError(
+                f'{name}: tile indices for LoRA {lora_idx} must be a list'
+            )
+        for tile_idx in tile_indices:
+            if type(tile_idx) is not int or not 0 <= tile_idx < len(bboxes):
+                raise ValueError(
+                    f'{name}: invalid tile index {tile_idx!r} '
+                    f'for LoRA {lora_idx}'
+                )
+        if len(set(tile_indices)) != len(tile_indices):
+            raise ValueError(
+                f'{name}: duplicate tile indices for LoRA {lora_idx}'
+            )
+
     adapter_tile_indices = adapter_tile_indices or {}
     adapter_count = len(adapter_weight_names or [])
     for style_idx, tile_indices in adapter_tile_indices.items():
@@ -1380,11 +1415,17 @@ def refine_sliding_tiles_with_controlnet_group(
                 spec=refine_spec,
             )
 
-            for model, weight in zip(lora_models or [], lora_weights or []):
+            lora_indices = [
+                lora_idx for lora_idx in range(lora_count)
+                if lora_idx not in lora_tile_indices
+                or idx in lora_tile_indices[lora_idx]
+            ]
+            for lora_idx in lora_indices:
+                model = lora_models[lora_idx]
                 refine_tile.lora.add(
                     model if isinstance(model, str) else model['id'],
                     weight_name=None if isinstance(model, str) else model.get('weight_name'),
-                    adapter_weight=weight,
+                    adapter_weight=lora_weights[lora_idx],
                 )
 
             resize_tile = ResizeImage(

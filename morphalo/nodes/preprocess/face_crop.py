@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -8,7 +7,7 @@ import torch
 from PIL import Image
 
 from morphalo.cache.models import (get_mediapipe_face_landmarker,
-                                   get_mediapipe_pose_landmarker, get_sam)
+                                   get_mediapipe_pose_landmarker)
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
@@ -19,22 +18,22 @@ from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              expand_bbox_toward_ratio,
                                              parse_crop_mode,
-                                             positive_points_for_sam,
                                              read_shape_cleanup_config,
                                              validate_size_expr)
 from morphalo.nodes.preprocess.utils.geometry import (
-    expand_clip_bbox, expand_clip_bbox_by_size_expr, offset_bbox_xyxy,
+    expand_clip_bbox_by_size_expr, offset_bbox_xyxy,
     offset_landmarks_xy, tight_mask_bbox)
 from morphalo.nodes.preprocess.utils.mask_ops import (
-    cleanup_shape_mask, cleanup_shape_mask_by_parts, invert_mask_inside_box,
-    prepare_output_mask)
+    cleanup_shape_mask, cleanup_shape_mask_by_parts, prepare_output_mask)
 from morphalo.nodes.preprocess.utils.mask_selection import \
     select_image_side_mask_candidate
-from morphalo.nodes.preprocess.utils.sam import predict_sam_mask
+from morphalo.nodes.preprocess.utils.sapiens2_seg import (SAPIENS2_CLASSES,
+                                                         predict_segments)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from morphalo.nodes.vision.face_region import (eye_mask_from_landmarks,
                                                eyebrow_mask_from_landmarks,
                                                face_bbox_xyxy_from_landmarks,
+                                               face_side_of_jaw_mask,
                                                mp_face_landmarks)
 from morphalo.nodes.vision.human import (crop_head_area_from_pose,
                                          mp_pose_landmarks_xy)
@@ -43,6 +42,7 @@ FACE_BBOX_EXPANSION = 1.15
 HEAD_AREA_EXPANSION = 1.6
 FACE_TARGETS = (
     'face',
+    'face-neck',
     'eyes',
     'left-eye',
     'right-eye',
@@ -74,11 +74,11 @@ ANATOMICAL_FACE_TARGETS = {
 class Config:
     device: str
     dtype: torch.dtype
-    sam_model: Optional[str]
+    segment_model: str
     mode: str
     crop_mode: Optional[CropModeSpec]
     box_margin: SizeExpr
-    prompt_expansion: float
+    chin_margin: float
     save_debug: bool
     dilate_radius: int
     close_radius: int
@@ -134,28 +134,28 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             f"'{node_id}': invalid expansion={expansion!r} (expected >= 0)"
         )
 
-    sam_model = None
-    if target == 'face':
-        sam_model = str(model.get('sam_model', 'facebook/sam-vit-large'))
+    segment_model = str(
+        model.get('segment_model', 'facebook/sapiens2-seg-0.4b')
+    )
 
     box_margin = params.get('box_margin', '12%')
     validate_size_expr(box_margin)
 
-    prompt_expansion = float(params.get('prompt_expansion', 0.0))
-    if prompt_expansion < 0:
+    chin_margin = float(params.get('chin_margin', 0.03))
+    if chin_margin < 0:
         raise ValueError(
-            f"'{node_id}': invalid prompt_expansion={prompt_expansion!r} "
+            f"'{node_id}': invalid chin_margin={chin_margin!r} "
             '(expected >= 0)'
         )
 
     return Config(
         device=device,
         dtype=dtype,
-        sam_model=sam_model,
+        segment_model=segment_model,
         mode=mode,
         crop_mode=crop_mode,
         box_margin=box_margin,
-        prompt_expansion=prompt_expansion,
+        chin_margin=chin_margin,
         save_debug=bool(debug.get('save_debug', False)),
         dilate_radius=int(params.get('dilate_radius', 0)),
         close_radius=int(params.get('close_radius', 0)),
@@ -256,11 +256,91 @@ def _face_feature_mask_from_landmarks(
     raise ValueError(f'Invalid facial feature kind={kind!r}.')
 
 
+def _semantic_face_mask(
+    segments: np.ndarray,
+    *,
+    face_bbox: tuple[int, int, int, int],
+    jaw_keep_mask: Optional[np.ndarray],
+) -> tuple[np.ndarray, list[np.ndarray], list[str]]:
+    """
+    Build a facial mask from a Sapiens2 semantic label map.
+
+    Both public targets combine the Sapiens2 ``face-neck`` class with lips,
+    teeth, and tongue so that the mouth is part of the visible facial region.
+    Mouth pixels are restricted to ``face_bbox`` so labels elsewhere in the
+    image are not included. No connected-component or subject selection is
+    performed.
+
+    With ``jaw_keep_mask=None``, the combined mask implements ``face-neck``.
+    When a jaw mask is provided, every semantic part is intersected with the
+    face side of the MediaPipe jaw boundary to implement ``face``.
+
+    Parameters
+    ----------
+    segments : np.ndarray
+        Two-dimensional Sapiens2 integer label map in full-image coordinates.
+
+    face_bbox : tuple[int, int, int, int]
+        End-exclusive full-image face box ``(x1, y1, x2, y2)`` derived from
+        MediaPipe landmarks. The box limits mouth-class selection for both
+        targets. It does not restrict the Sapiens2 ``face-neck`` class.
+
+    jaw_keep_mask : np.ndarray or None
+        Boolean full-frame mask containing the facial side of the MediaPipe jaw
+        curve. ``None`` returns the combined face and neck without jaw clipping.
+
+    Returns
+    -------
+    tuple[np.ndarray, list[np.ndarray], list[str]]
+        ``(mask, part_masks, label_names)`` where ``mask`` is the combined
+        boolean facial mask, ``part_masks`` contains each non-empty semantic
+        part for independent structural cleanup, and ``label_names`` records
+        the Sapiens2 classes considered for the target.
+
+    Raises
+    ------
+    RuntimeError
+        If the Sapiens2 label map contains no ``face-neck`` pixels.
+
+    Notes
+    -----
+    The function assumes a facial close-up containing one relevant face. Since
+    the complete ``face-neck`` label is retained, multiple people in the label
+    map may contribute to the output.
+    """
+    face_neck = segments == int(SAPIENS2_CLASSES['face-neck'])
+    if not np.any(face_neck):
+        raise RuntimeError('Sapiens2 returned an empty face-neck mask.')
+
+    x1, y1, x2, y2 = face_bbox
+    face_support = np.zeros_like(face_neck, dtype=bool)
+    face_support[y1:y2, x1:x2] = True
+
+    label_names = [
+        'face-neck',
+        'lower-lip',
+        'upper-lip',
+        'lower-teeth',
+        'upper-teeth',
+        'tongue',
+    ]
+    part_masks = [face_neck]
+    for label_name in label_names[1:]:
+        part_masks.append(
+            (segments == int(SAPIENS2_CLASSES[label_name]))
+            & face_support
+        )
+    if jaw_keep_mask is not None:
+        part_masks = [part & jaw_keep_mask for part in part_masks]
+    part_masks = [part for part in part_masks if np.any(part)]
+    return np.logical_or.reduce(part_masks), part_masks, label_names
+
+
 @dataclass
 class FaceCrop(CudaPostRunMixin, NodeRef):
     """
     Face-aware crop and inpaint-mask generator using MediaPipe Pose,
-    MediaPipe Face Landmarker, and optional SAM-compatible segmentation.
+    MediaPipe Face Landmarker, and Sapiens2 semantic segmentation.
 
     ``FaceCrop`` detects facial regions of interest and produces either:
 
@@ -268,9 +348,19 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     - a full-frame inpaint mask aligned to the input image
       (``mode='mask'`` or ``mode='negative-mask'``).
 
+    Intended input
+    --------------
+    This preprocessor is intended for facial close-ups and portraits where one
+    face occupies a substantial part of the image. It does not perform person
+    detection or subject selection. In images containing multiple people,
+    Sapiens2 may assign ``face-neck`` to more than one person and those regions
+    may be combined in the output. Use a subject-selection or person-cropping
+    stage before ``FaceCrop`` when the relevant face is not already dominant.
+
     Supported targets are:
 
-    - ``face``: expanded face bbox segmented with SAM;
+    - ``face``: Sapiens2 facial semantics clipped below the MediaPipe jaw;
+    - ``face-neck``: Sapiens2 face, mouth, and neck semantics without jaw clipping;
     - ``eyes``: landmark-derived mask for both eyes;
     - ``left-eye``: landmark-derived mask for the eye on the left side of the image;
     - ``right-eye``: landmark-derived mask for the eye on the right side of the image;
@@ -312,7 +402,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     - Face landmarks are first obtained in head-area local coordinates.
     - Local face landmarks and local bboxes are remapped to full-image
       coordinates.
-    - Downstream crop, mask, SAM prompting, and metadata logic operate in
+    - Downstream crop, mask, segmentation, and metadata logic operate in
       full-image coordinates.
 
     This pose-guided search area improves robustness when the face is small
@@ -329,12 +419,10 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
           avoid overly tight crops around internal facial landmarks.
         - The expanded local face bbox is remapped to full-image coordinates.
         - Face landmarks are also remapped to full-image coordinates.
-        - ``prompt_expansion`` optionally expands the full-image SAM prompt bbox.
-        - SAM segments the face using the expanded face bbox and a sparse subset
-          of positive face-landmark points.
-        - A face-landmark coverage check is used to detect occasional SAM
-          polarity mistakes. If too few face landmarks fall inside the selected
-          mask, the mask is inverted locally inside the prompt bbox.
+        - Sapiens2 supplies ``face-neck`` and mouth-part semantic masks.
+        - The jaw arc from landmarks 172 through 152 to 397 is connected at
+          both ends to the nearest Sapiens2 mask boundary, with ``chin_margin``
+          preserving a small amount of space below the chin.
         - The final crop region is derived from the selected mask and then
           optionally expanded using ``box_margin``.
 
@@ -346,7 +434,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - A landmark-derived bbox and mask are computed for both eyes.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates both eyes.
 
     ``target='left-eye'``
@@ -357,7 +444,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - The mask whose bbox center appears leftmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates only the left eye in image/viewer
           perspective.
 
@@ -369,7 +455,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - The mask whose bbox center appears rightmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates only the right eye in image/viewer
           perspective.
 
@@ -381,7 +466,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - A landmark-derived bbox and mask are computed for both eyebrows.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates both eyebrows.
 
     ``target='left-eyebrow'``
@@ -392,7 +476,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - The mask whose bbox center appears leftmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates only the left eyebrow in image/viewer
           perspective.
 
@@ -404,7 +487,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         - The mask whose bbox center appears rightmost in the image is selected.
         - The bbox is remapped to full-image coordinates.
         - The local mask is pasted into a full-frame boolean mask.
-        - SAM is skipped.
         - The final crop region isolates only the right eyebrow in image/viewer
           perspective.
 
@@ -426,20 +508,13 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
     Target-specific segmentation
     ----------------------------
-    ``target='face'`` uses SAM because a landmark-tight face box often captures
-    only internal facial structure and may not describe the visible face
-    silhouette well.
+    Both ``target='face-neck'`` and ``target='face'`` combine the Sapiens2
+    ``face-neck`` class with lips, teeth, and tongue. ``target='face'`` then
+    intersects every part with the face side of the MediaPipe jaw curve.
 
-    Eye and eyebrow targets skip SAM and rely directly on landmark-derived
+    Eye and eyebrow targets rely directly on landmark-derived
     masks. This is intentional: these regions are small, geometrically
     well-defined, and may naturally consist of multiple disconnected components.
-
-    For connected-component cleanup:
-
-    - feature targets keep all non-background connected components, because both
-      eyes or both eyebrows may be intentionally disjoint;
-    - the full face target keeps a single connected component to avoid attaching
-      unrelated fragments.
 
     Parameters
     ----------
@@ -462,17 +537,14 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                 Default: ``'cuda'``.
 
             ``dtype`` : str, optional
-                Torch dtype used to load the SAM-compatible segmentation model.
+                Torch dtype used to load the Sapiens2 segmentation model.
                 Supported values follow ``resolve_dtype`` conventions, e.g.
                 ``'bf16'``, ``'float16'`` or ``'float32'``.
                 Default: ``'bf16'``.
 
-            ``sam_model`` : str, optional
-                Hugging Face SAM-compatible model identifier used for full-face
-                mask generation. Default: ``'facebook/sam-vit-large'``.
-
-                This parameter is used only when ``target='face'``. Eye and
-                eyebrow targets use landmark-derived masks and skip SAM.
+            ``segment_model`` : str, optional
+                Hugging Face Sapiens2 model used by ``face`` and ``face-neck``.
+                Default: ``'facebook/sapiens2-seg-0.4b'``.
 
             ``pose_landmarker_task`` : str
                 MediaPipe PoseLandmarker ``.task`` path. Required for all
@@ -486,7 +558,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                 targets.
 
         ``params`` : dict
-            ``target`` : {'face', 'eyes', 'left-eye', 'right-eye',
+            ``target`` : {'face', 'face-neck', 'eyes', 'left-eye', 'right-eye',
             'anatomical-left-eye', 'anatomical-right-eye', 'eyebrows',
             'left-eyebrow', 'right-eyebrow', 'anatomical-left-eyebrow',
             'anatomical-right-eyebrow'}, optional
@@ -554,13 +626,9 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
                 Default: ``'12%'``.
 
-            ``prompt_expansion`` : float, optional
-                Advanced SAM prompt padding ratio for ``target='face'``.
-                This expands the bbox passed to SAM before segmentation while
-                leaving output crop geometry controlled by the post-processed
-                mask and ``box_margin``.
-
-                Default: 0.0.
+            ``chin_margin`` : float, optional
+                Fraction of the landmark forehead-to-chin distance retained
+                below the jaw boundary for ``target='face'``. Default: 0.03.
 
             ``postprocess`` : dict, optional
                 Structural cleanup applied to the selected facial silhouette
@@ -614,10 +682,8 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
                   expands the landmark-derived eye bbox / mask;
                 - for eyebrow targets:
                   expands the landmark-derived eyebrow bbox / mask;
-                - for ``target='face'``:
-                  the landmark-derived face bbox is expanded internally by
-                  ``FACE_BBOX_EXPANSION``; optional prompt padding is controlled
-                  by ``prompt_expansion``.
+                Face and face-neck targets use the fixed internal
+                ``FACE_BBOX_EXPANSION`` for local facial geometry.
 
                 Default: ``1.0``.
 
@@ -711,8 +777,8 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
 
         ``model`` : dict
             Resolved model/runtime metadata, including the selected
-            ``sam_model`` when SAM is used, MediaPipe task paths, device, and
-            dtype.
+            ``segment_model`` when Sapiens2 is used, MediaPipe task paths,
+            device, and dtype.
 
         ``crop`` : dict
             Crop metadata useful for reinsertion/compositing:
@@ -747,20 +813,16 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
     - ``dilate_radius``, ``close_radius`` and ``smoothing_radius`` affect only
       full-frame mask outputs. In ``mode='default'``, the RGBA alpha is derived
       directly from the selected mask after connected-component cleanup.
-    - ``target='face'`` uses SAM; eye and eyebrow targets skip SAM.
-    - ``model.sam_model`` is ignored for eye and eyebrow targets.
-    - For ``target='face'``, SAM prompt points use full-image face landmark
-      coordinates, not local head-area coordinates.
+    - ``target='face'`` and ``target='face-neck'`` use Sapiens2.
+    - Eye and eyebrow targets do not load Sapiens2.
     - For eye and eyebrow targets, the selected mask is derived directly from
       MediaPipe face landmarks.
     - Eye and eyebrow masks may contain multiple disconnected components by
       design.
     - Side-specific targets use image/viewer perspective.
     - Heavy models are retrieved via the global model cache where available.
-    - The segmentation backend is loaded through Hugging Face Transformers via
-      ``get_sam(...)`` and cached as a ``(processor, model)`` pair.
-    - This node does not require a local ``sam_checkpoint`` / ``sam_model_type``
-      pair. Use ``model.sam_model`` to select the Hugging Face model id.
+    - The segmentation backend is loaded through the shared Sapiens2 model
+      cache.
     - For ``crop_mode='bbox[w:h]'``, the requested aspect ratio is treated as a
       target, not a hard guarantee. Near the image boundaries the final crop may
       deviate from the requested ratio.
@@ -776,7 +838,7 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         spec = resolve_spec(self.spec)
         target = spec.get('params', {}).get('target', 'face')
         return (
-            target == 'face'
+            target in ('face', 'face-neck')
             and is_cuda_device(spec.get('model', {}).get('device', 'cuda'))
         )
 
@@ -837,14 +899,17 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
             dy=a_y,
         )
 
-        # Feature targets such as eyes and eyebrows skip SAM and use a
-        # landmark-derived full-frame mask. The full face target uses SAM instead.
+        # Eye and eyebrow targets use landmark geometry directly. Face targets
+        # combine the same landmarks with Sapiens2 semantic segmentation.
         feature_mask: Optional[np.ndarray] = None
         shape_part_masks: Optional[np.ndarray | list[np.ndarray]] = None
+        resolved_labels: list[str] = []
+        segment_model_id: Optional[str] = None
+        runtime_dtype = cfg.dtype
 
-        if cfg.target == 'face':
-            # Compute the face bbox in head-area local coordinates, then remap it to
-            # full-image coordinates for SAM prompting and crop metadata.
+        if cfg.target in ('face', 'face-neck'):
+            # Compute the face bbox in head-area local coordinates, then remap it
+            # to full-image coordinates for semantic face selection.
             r_x1, r_y1, r_x2, r_y2 = face_bbox_xyxy_from_landmarks(
                 face_xy_local,
                 image_shape=head_area_rgb.shape,
@@ -939,96 +1004,34 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
         else:
             raise ValueError(f"'{node_id}': invalid target={cfg.target!r}")
 
-        # Only the full face target uses SAM. Keep prompt padding separate from
-        # output crop margin.
-        if cfg.prompt_expansion > 0 and cfg.target == 'face':
-            bx1, by1, bx2, by2 = expand_clip_bbox(
-                bx1, by1, bx2, by2, w, h, cfg.prompt_expansion
-            )
-
-        if cfg.target == 'face':
-            sam_model_id = cfg.sam_model
-            if sam_model_id is None:
-                raise RuntimeError(
-                    f"FaceCrop node '{node_id}': SAM model is not configured."
-                )
-
-            processor, sam_model = get_sam(
-                model_id=sam_model_id,
+        if cfg.target in ('face', 'face-neck'):
+            segment_model_id = cfg.segment_model
+            segments, runtime_dtype = predict_segments(
+                Image.fromarray(img_rgb),
+                model_id=segment_model_id,
                 device=cfg.device,
                 dtype=cfg.dtype,
+                error_prefix='FaceCrop',
             )
-
-            # SAM expects full-image coordinates. Use the remapped face landmarks, not the
-            # local head-area landmarks.
-            point_coords, point_labels = positive_points_for_sam(
-                xy=face_xy_global,
-                bbox=(bx1, by1, bx2, by2),
-                max_points=16,
+            mask, semantic_parts, resolved_labels = _semantic_face_mask(
+                segments,
+                face_bbox=(bx1, by1, bx2, by2),
+                jaw_keep_mask=None,
             )
-
-            masks, scores = predict_sam_mask(
-                img_rgb=img_rgb,
-                bbox=(bx1, by1, bx2, by2),
-                processor=processor,
-                model=sam_model,
-                device=cfg.device,
-                point_coords=point_coords,
-                point_labels=point_labels,
-            )
-
-            if masks is None or len(masks) == 0:
-                raise RuntimeError(
-                    f"FaceCrop node '{node_id}': SAM returned no masks."
+            if cfg.target == 'face':
+                jaw_keep_mask = face_side_of_jaw_mask(
+                    face_xy_global,
+                    img_rgb.shape,
+                    support_mask=mask,
+                    margin_ratio=cfg.chin_margin,
                 )
-
-            best_mask = None
-            best_key = None
-
-            for i in range(len(masks)):
-                score_i = (
-                    float(scores[i])
-                    if scores is not None and i < len(scores)
-                    else 0.0
-                )
-                if best_key is None or score_i > best_key:
-                    best_key = score_i
-                    best_mask = masks[i].astype(bool)
-
-            if best_mask is None:
-                raise RuntimeError(
-                    f"FaceCrop node '{node_id}': failed to select a SAM mask."
-                )
-
-            mask = best_mask
-
-            # SAM can occasionally return the local background instead of the face region.
-            # Use face-landmark coverage as a polarity sanity check and invert only inside
-            # the prompt bbox if too few landmarks are covered.
-            valid = (
-                (face_xy_global[:, 0] >= 0) &
-                (face_xy_global[:, 1] >= 0)
-            )
-            pts = face_xy_global[valid]
-
-            if len(pts) > 0:
-                inside = 0
-                mask_h, mask_w = mask.shape
-
-                for px, py in pts:
-                    px = int(px)
-                    py = int(py)
-
-                    if 0 <= px < mask_w and 0 <= py < mask_h and mask[py, px]:
-                        inside += 1
-
-                min_inside = max(1, int(math.ceil(len(pts) * 0.25)))
-
-                if inside < min_inside:
-                    mask = invert_mask_inside_box(
-                        mask=mask,
-                        box=(bx1, by1, bx2, by2),
-                    )
+                mask &= jaw_keep_mask
+                semantic_parts = [
+                    part & jaw_keep_mask
+                    for part in semantic_parts
+                    if np.any(part & jaw_keep_mask)
+                ]
+            shape_part_masks = semantic_parts
 
         else:
             if feature_mask is None:
@@ -1038,31 +1041,6 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
             mask = feature_mask
             if shape_part_masks is None:
                 shape_part_masks = feature_mask
-            sam_model_id = None
-
-        cm = mask.astype(np.uint8)
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(
-            cm, connectivity=8
-        )
-
-        # Eye and eyebrow masks may intentionally contain multiple disconnected
-        # components. Keep all feature components, but reduce the full face mask
-        # to a single component to avoid attaching unrelated fragments.
-        if num > 1:
-            if cfg.target != 'face':
-                mask = (labels != 0)
-            else:
-                cx = int((bx1 + bx2) // 2)
-                cy = int((by1 + by2) // 2)
-                target = 0
-                if 0 <= cx < w and 0 <= cy < h:
-                    target = int(labels[cy, cx])
-
-                if target == 0:
-                    areas = stats[1:, cv2.CC_STAT_AREA]
-                    target = 1 + int(np.argmax(areas))
-
-                mask = (labels == target)
 
         if shape_part_masks is not None:
             shape_mask = cleanup_shape_mask_by_parts(
@@ -1196,26 +1174,29 @@ class FaceCrop(CudaPostRunMixin, NodeRef):
             'mode': cfg.mode,
             'image': str(out_path),
             'model': {
-                **({} if sam_model_id is None else {
-                    'sam_model': sam_model_id,
+                **({} if segment_model_id is None else {
+                    'segment_model': segment_model_id,
                 }),
                 'face_landmarker_task': cfg.face_landmarker_task,
                 'pose_landmarker_task': cfg.pose_landmarker_task,
                 'device': cfg.device,
-                'dtype': str(cfg.dtype).replace('torch.', ''),
+                'dtype': str(runtime_dtype).replace('torch.', ''),
             },
             'params': {
                 'target': cfg.target,
                 'mode': cfg.mode,
                 'crop_mode': None if cfg.crop_mode is None else cfg.crop_mode.raw,
                 'box_margin': cfg.box_margin,
-                'prompt_expansion': cfg.prompt_expansion,
+                'chin_margin': cfg.chin_margin,
                 'dilate_radius': cfg.dilate_radius,
                 'close_radius': cfg.close_radius,
                 'expansion': cfg.expansion,
                 'smoothing_radius': cfg.smoothing_radius,
                 'postprocess': cfg.shape_cleanup,
             },
+            **({} if not resolved_labels else {
+                'segmentation': {'labels': resolved_labels},
+            }),
             'crop': {
                 'anchor_xy': [
                     int(anchor_x - out_x1),

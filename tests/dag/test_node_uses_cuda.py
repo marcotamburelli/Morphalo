@@ -132,11 +132,12 @@ def test_aux_nodes_require_checkpoint_and_cuda_device(
     [
         ('face', 'cuda', True),
         ('face', 'cpu', False),
+        ('face-neck', 'cuda:0', True),
         ('eyes', 'cuda', False),
         ('left-eyebrow', 'cuda:0', False),
     ],
 )
-def test_face_crop_uses_cuda_only_for_sam_target(
+def test_face_crop_uses_cuda_only_for_semantic_targets(
     tmp_path,
     target: str,
     device: str,
