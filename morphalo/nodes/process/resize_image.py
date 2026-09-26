@@ -148,7 +148,7 @@ class ResizeImage(NodeRef):
     """
     Resize an input image to an explicit target size.
 
-    ``ResizeImage`` is a purely geometric preprocessing node. It does not run
+    ``ResizeImage`` is a purely geometric image-processing node. It does not run
     model inference, analyze image content, or change the image mode. The node
     reads a single upstream image, resolves a target size, resamples the whole
     image, and writes the resized image as a PNG.

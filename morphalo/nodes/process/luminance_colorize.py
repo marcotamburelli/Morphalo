@@ -8,25 +8,25 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.io import write_json_sidecar
-from morphalo.nodes.preprocess.utils.color_ops import (read_color_op_config,
-                                                       tint_by_luminance)
+from morphalo.nodes.preprocess.utils.color_ops import (colorize_by_luminance,
+                                                       read_color_op_config)
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 
 
 @dataclass
-class ColorTint(NodeRef):
+class LuminanceColorize(NodeRef):
     """
-    Tint an input image toward a target color using pixel luminance as strength.
+    Colorize an input image by mapping luminance to a target RGB color.
 
-    ``ColorTint`` is a deterministic preprocessing node. It reads a single
-    upstream image, computes each pixel's luma from its RGB channels, uses that
-    luma to scale ``strength``, blends the original RGB pixel toward the target
-    color, and writes the result as a PNG.
+    ``LuminanceColorize`` is a deterministic image-processing node. It reads a
+    single upstream image, computes each pixel's luma from its RGB channels,
+    multiplies that scalar brightness by a target color, blends the result with
+    the original RGB pixels according to ``strength``, and writes the result as
+    a PNG.
 
-    Dark pixels receive little or no tint. Brighter pixels move more strongly
-    toward the target color. At full strength, black pixels remain black and
-    white pixels become exactly the target color. The alpha channel is preserved
-    unchanged.
+    At full strength, black pixels map to black, white pixels map to the chosen
+    color, and intermediate luminance values map to darker versions of that
+    color. The alpha channel is preserved unchanged.
 
     Parameters
     ----------
@@ -49,8 +49,8 @@ class ColorTint(NodeRef):
                 accepted. Default is ``'#ffffff'``.
 
             ``strength`` : float, optional
-                Maximum tint amount in ``[0, 1]``. The effective per-pixel blend
-                amount is ``luminance * strength``. Default is ``1``.
+                Blend amount in ``[0, 1]`` between the original RGB pixels and
+                the luminance colorized pixels. Default is ``1``.
 
     Inputs
     ------
@@ -66,13 +66,13 @@ class ColorTint(NodeRef):
         The most important fields are:
 
         ``image`` : str
-            Path to the tinted PNG image.
+            Path to the colorized PNG image.
 
         ``input_size`` / ``output_size`` : list[int]
             Image size as ``[width, height]``. This transform preserves size.
 
-        ``tint`` : dict
-            Resolved tint metadata, including ``color``, ``hex_color``,
+        ``colorize`` : dict
+            Resolved colorization metadata, including ``color``, ``hex_color``,
             ``strength``, ``mode`` and alpha handling.
 
         ``params`` : dict
@@ -82,9 +82,8 @@ class ColorTint(NodeRef):
     -----
     - RGB luma is computed with Rec.601 weights:
       ``0.299 * R + 0.587 * G + 0.114 * B``.
-    - The tint formula is
-      ``out_rgb = lerp(rgb, target_color, luminance * strength)``.
     - ``strength = 0`` returns the original RGB pixels.
+    - ``strength = 1`` returns the fully luminance-colorized RGB pixels.
     - This node does not run model inference.
     """
 
@@ -109,12 +108,12 @@ class ColorTint(NodeRef):
 
         img = Image.open(img_path)
         input_width, input_height = img.size
-        tinted = tint_by_luminance(
+        colorized = colorize_by_luminance(
             img,
             color=cfg.color,
             strength=cfg.strength,
         )
-        out_width, out_height = tinted.size
+        out_width, out_height = colorized.size
 
         out_dir = Path(output_dir)
         out_path = make_node_output_path(
@@ -123,7 +122,7 @@ class ColorTint(NodeRef):
             ext='png',
         )
 
-        tinted.save(out_path)
+        colorized.save(out_path)
 
         out = {
             'ok': True,
@@ -133,7 +132,7 @@ class ColorTint(NodeRef):
             'image': str(out_path),
             'input_size': [int(input_width), int(input_height)],
             'output_size': [int(out_width), int(out_height)],
-            'tint': {
+            'colorize': {
                 'color': list(cfg.color),
                 'hex_color': '#%02x%02x%02x' % cfg.color,
                 'strength': cfg.strength,

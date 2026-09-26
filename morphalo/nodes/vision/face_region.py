@@ -1,98 +1,13 @@
 import numpy as np
 
-from morphalo.nodes.preprocess.utils.geometry import (offset_bbox_xyxy,
-                                                      offset_landmarks_xy)
+from morphalo.nodes.common.geometry import offset_bbox_xyxy, offset_landmarks_xy
+from morphalo.nodes.vision.face_landmarks import mp_face_landmarks
 
 
 MEDIAPIPE_JAWLINE = (
     172, 136, 150, 149, 176, 148, 152,
     377, 400, 378, 379, 365, 397,
 )
-
-
-def mp_face_landmarks(
-    img_rgb: np.ndarray,
-    *,
-    face_landmarker,
-) -> np.ndarray:
-    """
-    Detect MediaPipe face landmarks and select the largest detected face.
-
-    Every MediaPipe hypothesis is converted from normalized coordinates to
-    clipped integer pixel coordinates. When multiple faces are present, the
-    hypothesis with the largest axis-aligned landmark bbox is returned.
-
-    Parameters
-    ----------
-    img_rgb : np.ndarray
-        RGB image with shape ``(height, width, 3)``.
-
-    face_landmarker : object
-        Initialized MediaPipe FaceLandmarker exposing ``detect``.
-
-    Returns
-    -------
-    np.ndarray
-        Integer landmark coordinates with shape ``(N, 2)`` in ``(x, y)``
-        pixel order, clipped to the image bounds.
-
-    Raises
-    ------
-    RuntimeError
-        If MediaPipe detects no faces or every detected landmark set produces
-        an invalid bbox.
-
-    Notes
-    -----
-    Selection is based only on projected landmark area. The function does not
-    perform identity tracking or associate the face with a particular person.
-    """
-    import mediapipe as mp
-
-    h, w = img_rgb.shape[:2]
-
-    mp_image = mp.Image(
-        image_format=mp.ImageFormat.SRGB,
-        data=img_rgb,
-    )
-
-    result = face_landmarker.detect(mp_image)
-    face_landmarks_list = result.face_landmarks or []
-
-    if not face_landmarks_list:
-        raise RuntimeError('MediaPipe found no face landmarks.')
-
-    best_xy = None
-    best_area = None
-
-    for landmarks in face_landmarks_list:
-        face_xy = np.empty((len(landmarks), 2), dtype=np.int32)
-
-        for i, lm in enumerate(landmarks):
-            x = int(round(float(lm.x) * w))
-            y = int(round(float(lm.y) * h))
-            x = max(0, min(w - 1, x))
-            y = max(0, min(h - 1, y))
-            face_xy[i] = (x, y)
-
-        x1 = np.min(face_xy[:, 0])
-        y1 = np.min(face_xy[:, 1])
-        x2 = np.max(face_xy[:, 0]) + 1
-        y2 = np.max(face_xy[:, 1]) + 1
-
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        area = float((x2 - x1) * (y2 - y1))
-
-        if best_area is None or area > best_area:
-            best_area = area
-            best_xy = face_xy
-
-    if best_xy is None:
-        raise RuntimeError('Could not derive valid face landmarks.')
-
-    return best_xy
 
 
 def face_bbox_xyxy_from_landmarks(

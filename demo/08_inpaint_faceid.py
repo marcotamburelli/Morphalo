@@ -1,10 +1,12 @@
 """
 Inpaint + FaceID and FaceSwap demos.
 
-This module demonstrates two ways of transferring a face identity:
+This module demonstrates two identity-transfer workflows and one comparative
+face-geometry experiment:
 
 1. Inpainting constrained with FaceID PlusV2.
 2. Direct face replacement with SimSwap.
+3. 3D source-landmark transfer processed as depth, Canny, and lineart.
 
 Conceptual graph
 ----------------
@@ -17,10 +19,15 @@ Source image (base)  ------------------->
 Target image --------------------------> FaceSwap -> Output image
 Identity image ------------------------> FaceSwap.source()
 
+Target image -------------------------> FaceGeometryMap -> Processor map
+Source image -------------------------> FaceGeometryMap.source()       |
+Original target + prompt + identity ----------------------------------------> Img2Img
+
 How to run
 ----------
     ./bin/run_dag.sh demo.08_inpaint_faceid --dag inpaint_faceid
     ./bin/run_dag.sh demo.08_inpaint_faceid --dag face_swap
+    ./bin/run_dag.sh demo.08_inpaint_faceid --dag face_geometry_maps
 
 Inputs (local paths)
 -------------------
@@ -32,12 +39,14 @@ Inputs (local paths)
 from pathlib import Path
 
 from morphalo.dag import DAG
-from morphalo.nodes import FaceIdEmbedImage, FileImage, Inpaint, Prompt
+from morphalo.nodes import (FaceIdEmbedImage, FileImage, Img2Img, Inpaint,
+                            Prompt)
+from morphalo.nodes.preprocess import FaceGeometryMap
 from morphalo.nodes.process import FaceSwap
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SOURCE_IMG = '~/images/init_img_3.png'
+SOURCE_IMG = '~/images/generated_2.png'
 FACE_REF = '~/images/identity_face.png'
 STYLE_MASK = '~/images/style_mask.png'
 
@@ -194,3 +203,217 @@ with DAG(
 
     # Lateral input: the source attachment supplies the identity to transfer.
     identity >> swap.source()
+
+
+# -----------------------------------------------------------------------------
+# FaceGeometryMap (depth, Canny, and lineart comparison)
+# -----------------------------------------------------------------------------
+with DAG(
+    name='face_geometry_maps',
+    out_dir=ROOT / 'outputs' / 'face_geometry_maps',
+):
+
+    target = FileImage(
+        name='target',
+        path=SOURCE_IMG,
+    )
+
+    source = FileImage(
+        name='source',
+        path='~/images/face_x',
+    )
+
+    depth_transfer = FaceGeometryMap(
+        name='depth_map',
+        spec={
+            'model': {
+                'device': 'cpu',
+                'face_landmarker_task': (
+                    '~/models/mediapipe/face_landmarker.task'
+                ),
+            },
+            'params': {
+                'processor': 'depth_midas',
+                'detail_gain': 0.0,
+                'processor_device': 'cuda',
+                'processor_params': {
+                    'detect_resolution': 1024,
+                    'image_resolution': 1024,
+                },
+            },
+        },
+    )
+
+    canny_transfer = FaceGeometryMap(
+        name='canny_map',
+        spec={
+            'model': {
+                'device': 'cpu',
+                'face_landmarker_task': (
+                    '~/models/mediapipe/face_landmarker.task'
+                ),
+            },
+            'params': {
+                'processor': 'canny',
+                'detail_gain': 1.75,
+                'processor_params': {
+                    'low_threshold': 30,
+                    'high_threshold': 100,
+                    'detect_resolution': 1024,
+                    'image_resolution': 1024,
+                },
+            },
+        },
+    )
+
+    lineart_transfer = FaceGeometryMap(
+        name='lineart_map',
+        spec={
+            'model': {
+                'device': 'cpu',
+                'face_landmarker_task': (
+                    '~/models/mediapipe/face_landmarker.task'
+                ),
+            },
+            'params': {
+                'processor': 'lineart_realistic',
+                'detail_gain': 1.25,
+                'processor_device': 'cuda',
+                'processor_params': {
+                    'detect_resolution': 1024,
+                    'image_resolution': 1024,
+                },
+            },
+        },
+    )
+
+    comparison_prompt = Prompt(
+        name='prompt',
+        spec={
+            'lang': 'eng_Latn',
+            'prompt': {
+                'content': ['standing young woman'],
+            },
+        },
+    )
+
+    depth_out = Img2Img(
+        name='depth_out',
+        spec={
+            'model': {
+                'path': (
+                    '~/models/juggernaut/'
+                    'juggernautXL_ragnarokBy.safetensors'
+                ),
+                'dtype': 'bf16',
+                'device': 'cuda',
+            },
+            'params': {
+                'steps': 30,
+                'cfg': 0.3,
+                'strength': 0.7,
+                'width': 1024,
+                'height': 1024,
+            },
+            'seed': 1234,
+        },
+    )
+
+    canny_out = Img2Img(
+        name='canny_out',
+        spec={
+            'model': {
+                'path': (
+                    '~/models/juggernaut/'
+                    'juggernautXL_ragnarokBy.safetensors'
+                ),
+                'dtype': 'bf16',
+                'device': 'cuda',
+            },
+            'params': {
+                'steps': 30,
+                'cfg': 0.3,
+                'strength': 0.6,
+                'width': 1024,
+                'height': 1024,
+            },
+            'seed': 1234,
+        },
+    )
+
+    lineart_out = Img2Img(
+        name='lineart_out',
+        spec={
+            'model': {
+                'path': (
+                    '~/models/juggernaut/'
+                    'juggernautXL_ragnarokBy.safetensors'
+                ),
+                'dtype': 'bf16',
+                'device': 'cuda',
+            },
+            'params': {
+                'steps': 30,
+                'cfg': 0.3,
+                'strength': 0.6,
+                'width': 1024,
+                'height': 1024,
+            },
+            'seed': 1234,
+        },
+    )
+
+    target >> depth_transfer
+    source >> depth_transfer.source()
+    target >> canny_transfer
+    source >> canny_transfer.source()
+    target >> lineart_transfer
+    source >> lineart_transfer.source()
+
+    # Keep every generation input identical except for map and ControlNet.
+    target >> depth_out
+    target >> canny_out
+    target >> lineart_out
+    comparison_prompt >> depth_out.prompt()
+    comparison_prompt >> canny_out.prompt()
+    comparison_prompt >> lineart_out.prompt()
+
+    depth_transfer >> depth_out.controlnet.add(
+        'diffusers/controlnet-depth-sdxl-1.0',
+        conditioning_scale=1.0,
+        key='depth',
+    )
+    canny_transfer >> canny_out.controlnet.add(
+        'diffusers/controlnet-canny-sdxl-1.0',
+        conditioning_scale=1.0,
+        key='canny',
+    )
+    lineart_transfer >> lineart_out.controlnet.add(
+        'ShermanG/ControlNet-Standard-Lineart-for-SDXL',
+        conditioning_scale=1.0,
+        key='lineart',
+    )
+
+    # The same source views used to fuse facial geometry provide appearance
+    # and identity details through the same face-specific SDXL IP-Adapter.
+    source >> depth_out.ip_adapter.add(
+        'h94/IP-Adapter',
+        subfolder='sdxl_models',
+        weight_name='ip-adapter-plus-face_sdxl_vit-h.bin',
+        scale=0.7,
+        key='identity',
+    )
+    source >> canny_out.ip_adapter.add(
+        'h94/IP-Adapter',
+        subfolder='sdxl_models',
+        weight_name='ip-adapter-plus-face_sdxl_vit-h.bin',
+        scale=0.7,
+        key='identity',
+    )
+    source >> lineart_out.ip_adapter.add(
+        'h94/IP-Adapter',
+        subfolder='sdxl_models',
+        weight_name='ip-adapter-plus-face_sdxl_vit-h.bin',
+        scale=0.7,
+        key='identity',
+    )

@@ -3,11 +3,10 @@ import numpy as np
 from PIL import Image
 
 from morphalo.dag import DAG
-from morphalo.nodes.preprocess import (
-    BoxCrop,
+from morphalo.nodes.preprocess import BoxCrop, ImageLayerPlacement
+from morphalo.nodes.process import (
     ColorTint,
     FlipImage,
-    ImageLayerPlacement,
     ImageStack,
     LuminanceColorize,
     ResizeImage,

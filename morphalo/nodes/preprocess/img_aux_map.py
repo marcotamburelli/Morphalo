@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from morphalo.cache.models import get_controlnet_aux_annotator
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
@@ -18,6 +17,7 @@ from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,
                                              resolve_min_component_area,
                                              round_up,
                                              validate_min_component_area)
+from morphalo.nodes.preprocess.utils.aux_annotator import build_aux_annotator
 from morphalo.nodes.preprocess.utils.mask_ops import remove_small_components
 from morphalo.nodes.sdxl_resolve import resolve_single_image_path
 from third_party.controlnet_aux.processor import MODEL_PARAMS, MODELS
@@ -546,26 +546,6 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             and is_cuda_device(spec.get('device', 'cuda'))
         )
 
-    def _build_annotator(self, processor: str, device: str):
-        if processor not in MODELS:
-            raise ValueError(
-                f'Unknown processor={processor}. Allowed: {list(MODELS.keys())}')
-
-        cls = MODELS[processor]['class']
-        is_ckpt = bool(MODELS[processor]['checkpoint'])
-
-        # NOTE: dwpose in controlnet-aux is not hub-loadable in your env (no .from_pretrained)
-        if processor == 'dwpose':
-            raise ValueError(
-                'dwpose is not available out-of-the-box in controlnet-aux (no from_pretrained). '
-                'Use openpose_* for now, or install a dedicated DWPose backend later.'
-            )
-
-        if is_ckpt:
-            return get_controlnet_aux_annotator(processor=processor, cls=cls, device=device)
-        else:
-            return cls()
-
     def run(self, output_dir: str | Path, input: Optional[Dict[str, Dict]] = None) -> Dict[str, Any]:
         t0 = time.perf_counter()
 
@@ -647,7 +627,7 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             target_w = round_up(target_w, pad_to_multiple_of)
             target_h = round_up(target_h, pad_to_multiple_of)
 
-        annotator = self._build_annotator(processor, device=device)
+        annotator = build_aux_annotator(processor, device=device)
 
         # controlnet-aux detectors take PIL/RGB and perform their native resizing.
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)

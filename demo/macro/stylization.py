@@ -2,8 +2,9 @@ from morphalo.dag import NodeGroup
 from morphalo.nodes import Img2Img, Tap, Txt2Img
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.evaluate import PersonScorer, PromptScorer
-from morphalo.nodes.preprocess import (BoxCrop, ImageStack, ImgAuxMap,
+from morphalo.nodes.preprocess import (BoxCrop, ImgAuxMap,
                                        SubjectCrop)
+from morphalo.nodes.process import ImageStack
 from morphalo.nodes.wiring.ip_adapter import IpAdapterScale
 
 

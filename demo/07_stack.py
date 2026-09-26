@@ -46,7 +46,8 @@ from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage
-from morphalo.nodes.preprocess import ImageStack, SubjectCrop
+from morphalo.nodes.preprocess import SubjectCrop
+from morphalo.nodes.process import ImageStack
 
 ROOT = Path(__file__).resolve().parents[1]
 

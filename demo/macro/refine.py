@@ -5,11 +5,12 @@ from typing import Literal, Optional
 from morphalo.dag import NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from morphalo.nodes.common.config_resolve import SpecInput
-from morphalo.nodes.preprocess import (BoxCrop, FaceCrop, ImageStack,
-                                       ImgAuxMap, ResizeImage, SubjectCrop)
+from morphalo.nodes.preprocess import (BoxCrop, FaceCrop,
+                                       ImgAuxMap, SubjectCrop)
 from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
 from morphalo.nodes.preprocess.utils.geometry import \
     expand_clip_bbox_by_size_expr
+from morphalo.nodes.process import ImageStack, ResizeImage
 
 FineRegion = Literal[
     'face',

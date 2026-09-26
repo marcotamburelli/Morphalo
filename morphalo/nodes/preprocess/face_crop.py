@@ -14,6 +14,8 @@ from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
 from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
+from morphalo.nodes.common.geometry import (offset_bbox_xyxy,
+                                            offset_landmarks_xy)
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              expand_bbox_toward_ratio,
@@ -21,8 +23,7 @@ from morphalo.nodes.preprocess.utils import (CropModeSpec, SizeExpr,
                                              read_shape_cleanup_config,
                                              validate_size_expr)
 from morphalo.nodes.preprocess.utils.geometry import (
-    expand_clip_bbox_by_size_expr, offset_bbox_xyxy,
-    offset_landmarks_xy, tight_mask_bbox)
+    expand_clip_bbox_by_size_expr, tight_mask_bbox)
 from morphalo.nodes.preprocess.utils.mask_ops import (
     cleanup_shape_mask, cleanup_shape_mask_by_parts, prepare_output_mask)
 from morphalo.nodes.preprocess.utils.mask_selection import \

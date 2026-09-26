@@ -45,7 +45,7 @@ class TransposeImage(NodeRef):
     """
     Rotate an input image by one quarter turn without resampling.
 
-    ``TransposeImage`` is a purely geometric preprocessing node for discrete
+    ``TransposeImage`` is a geometric image-processing node for discrete
     90-degree image transposition. It does not run model inference, analyze image
     content, or perform arbitrary-angle rotation. The node reads a single
     upstream image, rotates the whole image either clockwise or anti-clockwise,

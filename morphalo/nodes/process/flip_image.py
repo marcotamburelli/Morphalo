@@ -45,7 +45,7 @@ class FlipImage(NodeRef):
     """
     Mirror an input image along one image axis.
 
-    ``FlipImage`` is a purely geometric preprocessing node for horizontal or
+    ``FlipImage`` is a purely geometric image-processing node for horizontal or
     vertical mirroring. It does not run model inference, analyze image content,
     or resize the image. The node reads a single upstream image, flips the whole
     image along the requested axis, and writes the transformed image as a PNG.

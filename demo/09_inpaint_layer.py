@@ -34,7 +34,8 @@ from pathlib import Path
 
 from morphalo.dag import DAG
 from morphalo.nodes import FileImage, Inpaint
-from morphalo.nodes.preprocess import AnyCrop, ImageStack, MaskInsertLayer
+from morphalo.nodes.preprocess import AnyCrop, MaskInsertLayer
+from morphalo.nodes.process import ImageStack
 
 ROOT = Path(__file__).resolve().parents[1]
 

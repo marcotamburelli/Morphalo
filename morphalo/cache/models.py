@@ -1243,6 +1243,7 @@ def get_mediapipe_face_landmarker(
     *,
     model_asset_path: str,
     device: str,
+    output_facial_transformation_matrixes: bool = False,
 ):
     """
     Cached MediaPipe FaceLandmarker (Tasks API).
@@ -1261,7 +1262,11 @@ def get_mediapipe_face_landmarker(
         raise FileNotFoundError(f"MediaPipe model not found: {model_path}")
 
     key = CacheKey(
-        kind="mediapipe_face_landmarker",
+        kind=(
+            'mediapipe_face_landmarker_with_transform'
+            if output_facial_transformation_matrixes
+            else 'mediapipe_face_landmarker'
+        ),
         ref=str(model_path),
         device=str(device),
         dtype="na",
@@ -1277,9 +1282,10 @@ def get_mediapipe_face_landmarker(
         base_options=base_options,
         running_mode=mp_vision.RunningMode.IMAGE,
         num_faces=1,
-        # Keep these off unless you explicitly need them:
         output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False,
+        output_facial_transformation_matrixes=(
+            output_facial_transformation_matrixes
+        ),
     )
 
     landmarker = mp_vision.FaceLandmarker.create_from_options(options)
