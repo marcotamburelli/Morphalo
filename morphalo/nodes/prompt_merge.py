@@ -90,6 +90,29 @@ def _join_prompt_parts(parts: list[str], *, joiner: str) -> str:
     return joiner.join(part for part in parts if part).strip()
 
 
+def _join_prompt_2_parts(
+    prompt_2_parts: list[str],
+    prompt_parts: list[str],
+    *,
+    joiner: str,
+) -> str:
+    """
+    Join prompt_2 parts, falling back per source to the corresponding prompt.
+
+    The fallback is activated only when at least one source provides a non-empty
+    prompt_2 value. If every prompt_2 value is absent, an empty result preserves
+    the downstream pipeline's normal whole-prompt fallback.
+    """
+    if not any(prompt_2_parts):
+        return ''
+
+    effective_parts = [
+        prompt_2 or prompt
+        for prompt_2, prompt in zip(prompt_2_parts, prompt_parts)
+    ]
+    return _join_prompt_parts(effective_parts, joiner=joiner)
+
+
 @dataclass(kw_only=True)
 class PromptMerge(PromptOutputMixin, NodeRef):
     """
@@ -102,6 +125,11 @@ class PromptMerge(PromptOutputMixin, NodeRef):
     Positive prompt channels (``prompt`` and ``prompt_2``) are concatenated
     with newlines. Negative prompt channels (``negative_prompt`` and
     ``negative_prompt_2``) are concatenated with ``, ``.
+
+    When at least one source defines a secondary channel, sources without that
+    channel contribute their corresponding primary value instead. If no source
+    defines the secondary channel, it remains omitted so downstream pipelines
+    can apply their native fallback behavior.
     """
 
     source_names: Tuple[str, ...] = field(default_factory=tuple)
@@ -158,13 +186,18 @@ class PromptMerge(PromptOutputMixin, NodeRef):
                 collected[field].append(parts[field])
 
         prompt = _join_prompt_parts(collected['prompt'], joiner='\n')
-        prompt_2 = _join_prompt_parts(collected['prompt_2'], joiner='\n')
+        prompt_2 = _join_prompt_2_parts(
+            collected['prompt_2'],
+            collected['prompt'],
+            joiner='\n',
+        )
         negative_prompt = _join_prompt_parts(
             collected['negative_prompt'],
             joiner=', ',
         )
-        negative_prompt_2 = _join_prompt_parts(
+        negative_prompt_2 = _join_prompt_2_parts(
             collected['negative_prompt_2'],
+            collected['negative_prompt'],
             joiner=', ',
         )
 

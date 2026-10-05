@@ -46,9 +46,11 @@ def test_prompt_merge_run_concatenates_prompt_fields_in_input_order(tmp_path):
     assert out['node'] == 'promptmerge'
     assert out['id'] == 'merge'
     assert out['prompt'] == 'subject\nwardrobe\npose'
-    assert out['prompt_2'] == 'subject style\nwardrobe style'
+    assert out['prompt_2'] == 'subject style\nwardrobe style\npose'
     assert out['negative_prompt'] == 'bad anatomy, low quality'
-    assert out['negative_prompt_2'] == 'flat lighting, washed out'
+    assert out['negative_prompt_2'] == (
+        'flat lighting, washed out, low quality'
+    )
     assert out['sources'] == ['a', 'b', 'c']
     metadata = Path(out['metadata'])
     assert metadata.parent.name == 'merge'
@@ -115,3 +117,27 @@ def test_prompt_merge_run_rejects_payload_without_prompt_fields(tmp_path):
 
     with pytest.raises(RuntimeError, match='has no prompt fields'):
         merge.run(tmp_path, input={'prompt:0': {'image': 'not-a-prompt.png'}})
+
+
+def test_prompt_merge_omits_secondary_channels_when_none_are_defined(tmp_path):
+    with DAG('prompt_merge_no_secondary', out_dir=tmp_path):
+        merge = PromptMerge(name='merge')
+
+    out = merge.run(
+        tmp_path,
+        input={
+            'prompt:0': {
+                'prompt': 'subject',
+                'negative_prompt': 'bad anatomy',
+            },
+            'prompt:1': {
+                'prompt': 'pose',
+                'negative_prompt': 'low quality',
+            },
+        },
+    )
+
+    assert out['prompt'] == 'subject\npose'
+    assert out['negative_prompt'] == 'bad anatomy, low quality'
+    assert 'prompt_2' not in out
+    assert 'negative_prompt_2' not in out
