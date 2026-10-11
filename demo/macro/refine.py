@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from morphalo.dag import NodeGroup
+from morphalo.dag import AttachmentSink, NodeGroup
 from morphalo.nodes import FaceIdEmbedImage, Img2Img, Inpaint, Tap
 from morphalo.nodes.common.config_resolve import SpecInput
 from morphalo.nodes.preprocess import (BoxCrop, FaceCrop,
@@ -11,6 +11,8 @@ from morphalo.nodes.preprocess.utils import SizeExpr, resolve_size_expr
 from morphalo.nodes.preprocess.utils.geometry import \
     expand_clip_bbox_by_size_expr
 from morphalo.nodes.process import ImageStack, ResizeImage
+from morphalo.nodes.process.image_stack import EdgeValues, expand_css_values
+from morphalo.nodes.prompt_merge import PromptMerge
 
 FineRegion = Literal[
     'face',
@@ -875,6 +877,31 @@ def _band_segment_bboxes_xyxy(
     return boxes
 
 
+def _tile_edge_smoothing(
+    bbox: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+    feather: EdgeValues,
+    corner_radius: EdgeValues,
+) -> tuple[tuple[SizeExpr, ...], tuple[SizeExpr, ...]]:
+    """Suppress smoothing on canvas boundaries, retaining internal seams."""
+    x1, y1, x2, y2 = bbox
+    width, height = image_size
+    external = (y1 <= 0, x2 >= width, y2 >= height, x1 <= 0)
+    sides = tuple(
+        0 if boundary else value
+        for value, boundary in zip(expand_css_values(feather), external)
+    )
+    top, right, bottom, left = external
+    corners = tuple(
+        0 if boundary else value
+        for value, boundary in zip(
+            expand_css_values(corner_radius),
+            (top or left, top or right, bottom or right, bottom or left),
+        )
+    )
+    return sides, corners
+
+
 def refine_sliding_tiles_group(
     name: str,
     *,
@@ -884,8 +911,8 @@ def refine_sliding_tiles_group(
     window_fraction: tuple[float, float] = (0.5, 0.5),
     adapter_weight_names: list[str] | None = None,
     adapter_scales: list[float | dict] | None = None,
-    layer_feather: int | str = 40,
-    layer_corner_radius: int | str = 60,
+    layer_feather: EdgeValues = 40,
+    layer_corner_radius: EdgeValues = 60,
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines an image through overlapping tiles.
@@ -1064,11 +1091,14 @@ def refine_sliding_tiles_group(
             crop_tile >> resize_tile.transform()
 
             # 5) Composite the resized refined tile back using crop metadata.
+            tile_feather, tile_corners = _tile_edge_smoothing(
+                bbox, image_size, layer_feather, layer_corner_radius,
+            )
             layer = stack.image(
                 1,
                 position='center',
-                feather=layer_feather,
-                corner_radius=layer_corner_radius,
+                feather=tile_feather,
+                corner_radius=tile_corners,
             )
 
             resize_tile >> layer
@@ -1097,12 +1127,13 @@ def refine_sliding_tiles_with_controlnet_group(
     aux_map_specs: list[SpecInput] | None = None,
     adapter_weight_names: list[str] | None = None,
     adapter_scales: list[float | dict] | None = None,
-    adapter_tile_indices: dict[int, list[int]] | None = None,
+    adapter_tile_indices: dict[str | int, list[int]] | None = None,
+    prompt_tile_indices: dict[str, list[int]] | None = None,
     lora_models: list[str | dict] | None = None,
     lora_weights: list[float] | None = None,
     lora_tile_indices: dict[int, list[int]] | None = None,
-    layer_feather: int | str = 40,
-    layer_corner_radius: int | str = 60,
+    layer_feather: EdgeValues = 40,
+    layer_corner_radius: EdgeValues = 60,
 ) -> NodeGroup:
     """
     Create a reusable NodeGroup that refines an image through overlapping tiles
@@ -1146,6 +1177,8 @@ def refine_sliding_tiles_with_controlnet_group(
 
     aux_map_specs : list[SpecInput] or None, optional
         ``ImgAuxMap`` specs aligned with ``controlnet_models``.
+        Output sizing is overridden to exactly match ``image_size`` using
+        stretch mode without padding. Native annotator resolutions are preserved.
 
     adapter_weight_names : list[str] or None, optional
         IP-Adapter weight names. When ``None``, no style adapters are added.
@@ -1153,22 +1186,34 @@ def refine_sliding_tiles_with_controlnet_group(
     adapter_scales : list[float | dict] or None, optional
         IP-Adapter scales aligned with ``adapter_weight_names``.
 
-    adapter_tile_indices : dict[int, list[int]] or None, optional
-        Map each adapter index to the tile indices it influences. Both indices
-        are zero-based: adapter ``0`` refers to ``adapter_weight_names[0]``
-        and port ``style_1``. Tiles are numbered left to right, top to bottom.
+    adapter_tile_indices : dict[str | int, list[int]] or None, optional
+        Map each style port name to the tile indices it influences, for example
+        ``{'style_1': [0, 1], 'style_2': []}``. Style names correspond to the
+        input ports: ``style_1`` refers to ``adapter_weight_names[0]``.
+        Zero-based adapter indices are also accepted for compatibility.
+        Tile indices are zero-based and numbered left to right, top to bottom.
 
         An adapter absent from the mapping influences every tile. A mapped
         adapter influences only its listed tiles; an empty list disables that
         adapter on every tile. ``None`` and ``{}`` therefore apply all adapters
         to all tiles, preserving the default behavior.
 
-        For example, ``{0: [0, 1], 1: []}`` limits adapter 0 to tiles 0 and 1,
+        For example, ``{'style_1': [0, 1], 'style_2': []}`` limits adapter 0 to tiles 0 and 1,
         disables adapter 1, and leaves any other adapters active on every tile.
         A tile receives no adapters when all adapters are explicitly mapped
         and none lists that tile. Selected adapters retain their original
         order and scales. Invalid indices and duplicate tile indices are
-        rejected.
+        rejected. Specifying the same adapter by both name and index is rejected.
+
+    prompt_tile_indices : dict[str, list[int]] or None, optional
+        Map dedicated prompt ports, such as ``prompt_1``, to zero-based tile
+        indices. Port names must be ``prompt_<n>`` with a positive integer n.
+        Tiles without assignments use ``in_prompt``. Assigned tiles use only
+        their dedicated prompts, never the main prompt. Multiple assignments
+        are merged in mapping insertion order, including negative and secondary
+        prompt channels. Empty lists assign no tiles. ``None`` and ``{}``
+        preserve the default behavior. Invalid names, invalid tile indices,
+        and repeated tile indices within one list are rejected.
 
     lora_models : list[str | dict] or None, optional
         LoRA models applied to every tile, independently of
@@ -1323,11 +1368,22 @@ def refine_sliding_tiles_with_controlnet_group(
                 f'{name}: duplicate tile indices for LoRA {lora_idx}'
             )
 
-    adapter_tile_indices = adapter_tile_indices or {}
     adapter_count = len(adapter_weight_names or [])
-    for style_idx, tile_indices in adapter_tile_indices.items():
+    style_port_indices = {
+        f'style_{idx + 1}': idx for idx in range(adapter_count)
+    }
+    normalized_adapter_tiles: dict[int, list[int]] = {}
+    for style_key, tile_indices in (adapter_tile_indices or {}).items():
+        if isinstance(style_key, str):
+            if style_key not in style_port_indices:
+                raise ValueError(f'{name}: invalid adapter port {style_key!r}')
+            style_idx = style_port_indices[style_key]
+        else:
+            style_idx = style_key
         if type(style_idx) is not int or not 0 <= style_idx < adapter_count:
             raise ValueError(f'{name}: invalid adapter index {style_idx!r}')
+        if style_idx in normalized_adapter_tiles:
+            raise ValueError(f'{name}: duplicate adapter selection for style_{style_idx + 1}')
         if not isinstance(tile_indices, list):
             raise ValueError(
                 f'{name}: tile indices for adapter {style_idx} must be a list'
@@ -1342,6 +1398,24 @@ def refine_sliding_tiles_with_controlnet_group(
             raise ValueError(
                 f'{name}: duplicate tile indices for adapter {style_idx}'
             )
+        normalized_adapter_tiles[style_idx] = tile_indices
+    adapter_tile_indices = normalized_adapter_tiles
+
+    prompt_tile_indices = prompt_tile_indices or {}
+    for port_name, tile_indices in prompt_tile_indices.items():
+        suffix = port_name.removeprefix('prompt_') if isinstance(port_name, str) else ''
+        if (
+            not suffix.isascii() or not suffix.isdigit() or int(suffix) < 1
+            or port_name != f'prompt_{int(suffix)}'
+        ):
+            raise ValueError(f'{name}: invalid prompt port {port_name!r}')
+        if not isinstance(tile_indices, list):
+            raise ValueError(f'{name}: tile indices for {port_name} must be a list')
+        for tile_idx in tile_indices:
+            if type(tile_idx) is not int or not 0 <= tile_idx < len(bboxes):
+                raise ValueError(f'{name}: invalid tile index {tile_idx!r} for {port_name}')
+        if len(set(tile_indices)) != len(tile_indices):
+            raise ValueError(f'{name}: duplicate tile indices for {port_name}')
 
     with NodeGroup(name) as g:
         # -------------------
@@ -1349,6 +1423,11 @@ def refine_sliding_tiles_with_controlnet_group(
         # -------------------
         tap_image = Tap(name='in_image')
         tap_prompt = Tap(name='in_prompt', strict=False)
+        tile_prompts = {
+            port_name: Tap(name=port_name, strict=False)
+            for port_name in prompt_tile_indices
+        }
+        used_prompt_ports = set()
         tap_styles = [
             Tap(name=f'style_{idx + 1}')
             for idx in range(len(adapter_weight_names or []))
@@ -1369,7 +1448,12 @@ def refine_sliding_tiles_with_controlnet_group(
         aux_maps = [
             ImgAuxMap(
                 name=f'aux_map_{idx + 1:02d}',
-                spec=spec,
+                spec=[spec, {
+                    'out_width': int(image_size[0]),
+                    'out_height': int(image_size[1]),
+                    'pad_to_multiple_of': 1,
+                    'output_resize_mode': 'stretch',
+                }],
             )
             for idx, spec in enumerate(aux_map_specs or [])
         ]
@@ -1483,7 +1567,23 @@ def refine_sliding_tiles_with_controlnet_group(
 
             # 4) Refine the tile with all constraints.
             crop_tile >> refine_tile
-            tap_prompt >> refine_tile.prompt()
+            selected_prompts = [
+                tile_prompts[port_name]
+                for port_name, tile_indices in prompt_tile_indices.items()
+                if idx in tile_indices
+            ]
+            if not selected_prompts:
+                tap_prompt >> refine_tile.prompt()
+                used_prompt_ports.add('in_prompt')
+            elif len(selected_prompts) == 1:
+                selected_prompts[0] >> refine_tile.prompt()
+                used_prompt_ports.add(selected_prompts[0].name)
+            else:
+                merged_prompt = PromptMerge(name=f'prompt_merge_{idx:02d}')
+                for prompt_idx, prompt_node in enumerate(selected_prompts):
+                    prompt_node >> merged_prompt.prompt(prompt_idx)
+                    used_prompt_ports.add(prompt_node.name)
+                merged_prompt >> refine_tile.prompt()
             for style_idx, adapter_sink in zip(style_indices, adapter_sinks):
                 tap_styles[style_idx] >> adapter_sink
             for crop_aux_map, controlnet_sink in zip(
@@ -1499,11 +1599,14 @@ def refine_sliding_tiles_with_controlnet_group(
             crop_tile >> resize_tile.transform()
 
             # 6) Composite the resized refined tile back using crop metadata.
+            tile_feather, tile_corners = _tile_edge_smoothing(
+                bbox, image_size, layer_feather, layer_corner_radius,
+            )
             layer = stack.image(
                 1,
                 position='center',
-                feather=layer_feather,
-                corner_radius=layer_corner_radius,
+                feather=tile_feather,
+                corner_radius=tile_corners,
             )
 
             resize_tile >> layer
@@ -1511,9 +1614,20 @@ def refine_sliding_tiles_with_controlnet_group(
 
             previous_image = stack
 
+        # Keep unused prompt ports from becoming extra group outputs. ImageStack
+        # ignores these metadata inputs; no refinement receives their prompts.
+        for prompt_node in [tap_prompt, *tile_prompts.values()]:
+            if prompt_node.name not in used_prompt_ports:
+                prompt_node >> AttachmentSink(
+                    name=f'unused_{prompt_node.name}',
+                    target=previous_image,
+                    input_id=f'unused_prompt:{prompt_node.name}',
+                )
+
         g.register_ports(
             tap_image,
             tap_prompt,
+            *tile_prompts.values(),
             *tap_styles,
         )
 

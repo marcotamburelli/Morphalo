@@ -882,5 +882,6 @@ Morphalo is licensed under the [Apache License 2.0](LICENSE).
 Copyright 2026 Marco Tamburelli.
 
 Third-party components under `third_party/` remain subject to their respective
-licenses and attribution notices. Model weights and other externally downloaded
-assets are distributed separately and may have additional license terms.
+licenses and attribution notices.
+
+Model weights and other externally downloaded assets are not distributed as part of Morphalo and remain subject to their respective licenses. The Apache License 2.0 covering Morphalo does not grant any rights to use third-party model weights or assets. Some models may restrict commercial use or impose additional conditions; users should review the applicable model license before using such models and determine whether any restrictions apply to the intended use of their outputs.

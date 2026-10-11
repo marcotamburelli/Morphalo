@@ -224,21 +224,25 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
 
     The node uses two separate sizing stages:
 
-    1. Annotator inference resize
+    1. Annotator-native resizing
         The source image is passed to the selected ``controlnet-aux`` annotator.
-        Native annotator parameters such as ``detect_resolution`` and
-        ``image_resolution`` may be supplied at the top level of ``spec`` or
-        inside ``params``.
+        ``detect_resolution`` sets the image scale used to detect features;
+        ``image_resolution`` sets the returned map scale after detection or
+        rendering. Both may be supplied at the top level of ``spec`` or inside
+        ``params``.
 
     2. Final output resize
         The annotator result is resized to the final control-map canvas. This is
         controlled by ``out_width``, ``out_height``, ``pad_to_multiple_of``, and
         ``output_resize_mode``.
 
-    These two stages are intentionally independent. ``detect_resolution`` and
-    ``image_resolution`` follow the underlying ``controlnet-aux`` implementation:
-    in the bundled processors they are interpreted as short-side resolutions and
-    rounded to multiples of 64. They do not define the final output canvas.
+    These two stages are intentionally independent. Annotators using the bundled
+    ``resize_image`` helper scale the short side to the requested resolution,
+    round both dimensions to the nearest multiple of 64, and resize the entire
+    image to those dimensions. This introduces a small aspect-ratio change;
+    it does not add padding or crop the image. Processor-specific behavior may
+    differ, and some processors may ignore these parameters. Neither native
+    resolution defines the final output canvas written by this node.
 
     Processing flow
     ---------------
@@ -327,16 +331,30 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
         **Annotator-native sizing**
 
         - ``detect_resolution`` : int, optional
-            Native ``controlnet-aux`` inference resolution.
+            Requested short-side resolution of the image used for feature
+            detection. Defaults to ``512`` when not supplied in either location
+            or in the processor defaults.
 
-            For the bundled processors this is interpreted as a short-side
-            resolution and rounded internally to a multiple of 64.
+            For annotators using the bundled resize helper, the long side is
+            scaled proportionally, then both dimensions are rounded to the
+            nearest multiple of 64 and the image is resized without adding
+            borders. Increasing this value changes the scale at which the
+            annotator analyzes the image and may increase memory use and runtime.
 
         - ``image_resolution`` : int, optional
-            Native ``controlnet-aux`` map resolution after detection/rendering.
+            Requested short-side resolution of the map returned by the annotator,
+            after feature detection or rendering. Defaults to ``512`` when not
+            supplied in either location or in the processor defaults.
 
-            For the bundled processors this is also interpreted as a short-side
-            resolution and rounded internally to a multiple of 64.
+            Annotators using the bundled resize helper also round these output
+            dimensions to the nearest multiple of 64, using resize without
+            adding borders. Raising this value alone does not run detection at
+            a higher resolution; it changes the returned map size. ``ImgAuxMap``
+            subsequently resizes this map again to its final output canvas.
+
+            For example, setting both native resolutions to ``1024`` requests
+            analysis and an intermediate map at approximately 1024 pixels on
+            the short side. It does not request a final 1024-by-1024 map.
 
         **Final output sizing**
 
@@ -360,6 +378,10 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
             pipelines that expect or prefer dimensions aligned to a fixed multiple.
 
             Use ``1`` or ``0`` to disable output-size alignment.
+
+            Despite its name, this option only rounds the target dimensions.
+            With ``'stretch'``, the map is resized to fill that larger canvas;
+            black borders are added only by ``'contain'``.
 
         - ``output_resize_mode`` : {'stretch', 'contain'}, optional
             Strategy used to adapt the annotator output to the final canvas.
@@ -512,6 +534,12 @@ class ImgAuxMap(CudaPostRunMixin, NodeRef):
 
     - The final control map should usually have the same size as the image that will
       be generated or transformed downstream.
+
+      To match an input image exactly, leave ``out_width`` and ``out_height``
+      unset and use ``pad_to_multiple_of=1`` with ``output_resize_mode='stretch'``.
+      To match a different target, also set ``out_width`` and ``out_height`` to
+      that target's exact width and height. These keys belong at the top level
+      of ``spec``, outside the annotator's ``params`` dictionary.
 
     - ``output_resize_mode='stretch'`` is generally the safest default for
       ControlNet-style workflows where the conditioning image must match the target

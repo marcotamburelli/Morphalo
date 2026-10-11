@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from math import ceil, floor
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
 
@@ -17,6 +18,7 @@ BBoxFormat = Literal['xyxy', 'xywh', 'xyl']
 class Config:
     bbox_format: BBoxFormat
     bbox: Optional[tuple[int, ...]]
+    scale_transform_to_image: bool = False
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -34,6 +36,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         return Config(
             bbox_format=bbox_format,  # type: ignore[arg-type]
             bbox=None,
+            scale_transform_to_image=bool(params.get('scale_transform_to_image', False)),
         )
 
     if not isinstance(bbox_value, (list, tuple)):
@@ -54,6 +57,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     return Config(
         bbox_format=bbox_format,  # type: ignore[arg-type]
         bbox=bbox,
+        scale_transform_to_image=bool(params.get('scale_transform_to_image', False)),
     )
 
 
@@ -237,6 +241,23 @@ class BoxCrop(NodeRef):
                 Manual bounding box values in the selected format. This is
                 required unless a transform input provides ``crop.bbox_xyxy``.
 
+            ``scale_transform_to_image`` : bool, optional
+                Convert a bbox received through the ``transform`` input from
+                the coordinate space described by ``transform.input_size`` to
+                the current image's coordinate space. Default is ``False``.
+
+                Set this in ``spec['params']`` when the bbox was obtained from
+                a resized version of the full image. The transform must include
+                ``input_size = [width, height]`` with two positive dimensions
+                describing the image on which the bbox was measured, not the
+                size of the cropped region.
+
+                X coordinates are multiplied by current width / source width;
+                Y coordinates by current height / source height. Minimum bounds
+                are rounded down and maximum bounds up, then clamped to the
+                current image. Only coordinates are scaled; the image itself
+                is not resized. This option does not affect ``params.bbox``.
+
     Inputs
     ------
     default : dict, optional
@@ -247,6 +268,12 @@ class BoxCrop(NodeRef):
         ``crop.bbox_xyxy``, those coordinates override ``params.bbox``. This is
         useful for cropping one image with the geometry emitted by another node,
         for example cropping a full-frame mask to match a ``SubjectCrop`` ROI.
+
+        ``crop.bbox_xyxy`` contains end-exclusive ``[x1, y1, x2, y2]`` bounds;
+        ``params.bbox_format`` does not apply to these coordinates. By default,
+        they are used directly as pixels in the current image. When
+        ``params.scale_transform_to_image=True``, ``input_size`` is also required
+        and identifies their source coordinate space.
 
     Outputs
     -------
@@ -259,7 +286,8 @@ class BoxCrop(NodeRef):
             Path to the cropped image.
 
         ``original_bbox_xyxy`` : list[int]
-            User-provided bbox normalized to xyxy coordinates before clamping.
+            Bbox in current-image xyxy coordinates before clamping, after any
+            transform scaling.
 
         ``bbox_xyxy`` : list[int]
             Effective clamped bbox used to crop the image.
@@ -273,10 +301,49 @@ class BoxCrop(NodeRef):
             - ``bbox_size``: width and height of the effective crop.
             - ``bbox_xyxy``: effective clamped bbox.
 
+    Examples
+    --------
+    Suppose ``original.png`` is 1600 x 1200 pixels, and a region was detected on
+    an 800 x 600 resized copy. The detected bbox is ``[100, 50, 300, 250]`` in
+    that copy's coordinates. To crop the same region from the original image::
+
+        crop = BoxCrop(
+            name='crop_original',
+            path='original.png',
+            spec={'params': {'scale_transform_to_image': True}},
+        )
+        result = crop.run(
+            output_dir='outputs',
+            input={
+                'transform': {
+                    'input_size': [800, 600],
+                    'crop': {'bbox_xyxy': [100, 50, 300, 250]},
+                },
+            },
+        )
+
+    Both scale factors are 2, so ``result['bbox_xyxy']`` is
+    ``[200, 100, 600, 500]`` and the saved crop is 400 x 400 pixels. With the
+    default ``False``, the bbox would instead remain ``[100, 50, 300, 250]``
+    in original-image pixels, selecting a different, smaller region.
+
+    In a DAG, wire the full image to the default input and the node that produced
+    the proxy's crop metadata to the transform attachment::
+
+        original_image >> crop
+        proxy_crop >> crop.transform()
+
+    Here ``original_image`` supplies the full-size image and ``proxy_crop``
+    supplies ``crop.bbox_xyxy`` plus ``input_size`` for the resized full image.
+    ``path`` can be omitted when the image is supplied through this wiring.
+
     Notes
     -----
     - If both ``params.bbox`` and ``transform.crop.bbox_xyxy`` are provided, the
       transform bbox wins.
+    - Transform scaling assumes both images show the same full frame, related
+      only by resizing. It does not compensate for padding, cropping, rotation,
+      or translation in the proxy image.
     - All crop metadata is computed after clamping the bbox to the source image
       bounds. This guarantees that ``crop.anchor_xy``, ``crop.position`` and
       ``crop.bbox_size`` are coherent with the image actually written by the
@@ -296,6 +363,10 @@ class BoxCrop(NodeRef):
         ``bbox_xyxy``. When this input is wired, it overrides ``params.bbox`` and
         lets ``BoxCrop`` crop one image using the geometry emitted by another
         node, for example a full-frame mask using the bbox from ``SubjectCrop``.
+
+        Set ``spec['params']['scale_transform_to_image'] = True`` to convert
+        coordinates from a resized full-image proxy. The upstream payload must
+        then also contain ``input_size = [width, height]`` for that proxy.
 
         Returns
         -------
@@ -333,9 +404,25 @@ class BoxCrop(NodeRef):
 
         if transform_bbox is not None:
             orig_x1, orig_y1, orig_x2, orig_y2 = transform_bbox
+            if cfg.scale_transform_to_image:
+                source_size = input['transform'].get('input_size')
+                if (
+                    not isinstance(source_size, (list, tuple))
+                    or len(source_size) != 2
+                    or any(not isinstance(v, (int, float)) or v <= 0 for v in source_size)
+                ):
+                    raise ValueError(
+                        f'{node_id}: scale_transform_to_image requires '
+                        'transform.input_size with two positive dimensions'
+                    )
+                source_width, source_height = source_size
+                orig_x1 = floor(orig_x1 * width / source_width)
+                orig_y1 = floor(orig_y1 * height / source_height)
+                orig_x2 = ceil(orig_x2 * width / source_width)
+                orig_y2 = ceil(orig_y2 * height / source_height)
             bbox_source = 'transform'
             bbox_format = 'xyxy'
-            bbox_value = list(transform_bbox)
+            bbox_value = [orig_x1, orig_y1, orig_x2, orig_y2]
         elif cfg.bbox is not None:
             orig_x1, orig_y1, orig_x2, orig_y2 = _bbox_to_xyxy(
                 cfg.bbox,

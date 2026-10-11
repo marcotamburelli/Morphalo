@@ -591,6 +591,60 @@ def test_box_crop_accepts_transform_bbox_without_params_bbox(tmp_path):
     assert out['crop']['bbox_size'] == [5, 5]
 
 
+@pytest.mark.parametrize(
+    'source_size, bbox, expected',
+    [
+        ([8, 6], [1, 1, 5, 4], [2, 2, 10, 8]),
+        ([10, 8], [1, 1, 5, 4], [1, 1, 8, 6]),
+        ([8, 6], [-1, 1, 10, 8], [0, 2, 16, 12]),
+    ],
+)
+def test_box_crop_scales_proxy_bbox_to_input_image(tmp_path, source_size, bbox, expected):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (16, 12), color=(255, 0, 0)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop', path=src,
+            spec={'params': {'scale_transform_to_image': True}},
+        )
+    out = node.run(tmp_path, input={'transform': {
+        'input_size': source_size,
+        'crop': {'bbox_xyxy': bbox},
+    }})
+    assert out['crop']['bbox_xyxy'] == expected
+    assert Image.open(out['image']).size == (
+        expected[2] - expected[0], expected[3] - expected[1],
+    )
+
+
+@pytest.mark.parametrize('source_size', [None, [0, 8], [8], ['8', 8]])
+def test_box_crop_proxy_scaling_requires_valid_source_size(tmp_path, source_size):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (16, 12)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop', path=src,
+            spec={'params': {'scale_transform_to_image': True}},
+        )
+    with pytest.raises(ValueError, match='transform.input_size'):
+        node.run(tmp_path, input={'transform': {
+            'input_size': source_size,
+            'crop': {'bbox_xyxy': [1, 1, 5, 4]},
+        }})
+
+
+def test_box_crop_does_not_scale_proxy_bbox_by_default(tmp_path):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (16, 12)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(name='crop', path=src)
+    out = node.run(tmp_path, input={'transform': {
+        'input_size': [8, 6],
+        'crop': {'bbox_xyxy': [1, 1, 5, 4]},
+    }})
+    assert out['crop']['bbox_xyxy'] == [1, 1, 5, 4]
+
+
 def test_box_crop_requires_bbox_or_transform_bbox(tmp_path):
     src = tmp_path / 'src.png'
     Image.new('RGB', (8, 8), color=(255, 255, 255)).save(src)

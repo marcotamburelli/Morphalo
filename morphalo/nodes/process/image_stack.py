@@ -20,6 +20,72 @@ from morphalo.nodes.preprocess.utils.color_ops import \
 from morphalo.nodes.preprocess.utils.geometry import Point
 
 CornerDelta = tuple[SizeExpr, SizeExpr] | None
+EdgeValues = SizeExpr | tuple[SizeExpr, ...] | list[SizeExpr]
+
+
+def expand_css_values(value: EdgeValues) -> tuple[SizeExpr, SizeExpr, SizeExpr, SizeExpr]:
+    """Expand and validate scalar or 1-4 clockwise CSS-style values."""
+    values = tuple(value) if isinstance(value, (tuple, list)) else (value,)
+    if not 1 <= len(values) <= 4:
+        raise ValueError('Expected one to four edge/corner values')
+    for item in values:
+        validate_size_expr(item)
+    if len(values) == 1:
+        return values * 4
+    if len(values) == 2:
+        return values * 2
+    if len(values) == 3:
+        return values[0], values[1], values[2], values[1]
+    return values
+
+
+def _directional_alpha_ramp(
+    w: int, h: int, *, feather: EdgeValues, corner_radius: EdgeValues | None,
+) -> Image.Image:
+    """Build bounding-box alpha with independent sides and circular corners."""
+    import numpy as np
+
+    sides = tuple(
+        resolve_feather_xy(value, width=w, height=h)[1 if idx % 2 == 0 else 0]
+        for idx, value in enumerate(expand_css_values(feather))
+    )
+    top, right, bottom, left = sides
+    max_corner = max(0, (min(w, h) // 2) - 1)
+    adjacent = ((top, left), (top, right), (bottom, right), (bottom, left))
+    if corner_radius is None:
+        corners = tuple(
+            min(max_corner, int((a + b) * 1.5)) if a and b else 0
+            for a, b in adjacent
+        )
+    else:
+        corners = tuple(
+            max(0, min(max_corner, resolve_size_expr(
+                value, max_size=max_corner, min_size=0,
+            ))) for value in expand_css_values(corner_radius)
+        )
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    alpha = np.ones((h, w), dtype=np.float32)
+    for distance, width in zip((yy, w - 1 - xx, h - 1 - yy, xx), sides):
+        if width > 0:
+            t = np.clip(distance / width, 0, 1)
+            alpha = np.minimum(alpha, t * t * (3 - 2 * t))
+    for idx, radius in enumerate(corners):
+        if radius <= 0:
+            continue
+        is_left, is_top = idx in (0, 3), idx in (0, 1)
+        cx = radius if is_left else w - 1 - radius
+        cy = radius if is_top else h - 1 - radius
+        region = (xx < cx if is_left else xx > cx) & (yy < cy if is_top else yy > cy)
+        distance = radius - np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        widths = [value for value in adjacent[idx] if value > 0]
+        if widths:
+            t = np.clip(distance / min(widths), 0, 1)
+            corner_alpha = t * t * (3 - 2 * t)
+        else:
+            corner_alpha = (distance >= 0).astype(np.float32)
+        alpha = np.where(region, np.minimum(alpha, corner_alpha), alpha)
+    return Image.fromarray(np.rint(alpha * 255).astype(np.uint8))
 
 
 @dataclass(frozen=True)
@@ -89,8 +155,8 @@ class LayerSpec:
     corner_offsets: Optional[CornerOffsets] = None
     brightness: float = 0.0
     color_transfer: float = 0.0
-    feather: int | str = 0
-    corner_radius: Optional[int | str] = None
+    feather: EdgeValues = 0
+    corner_radius: Optional[EdgeValues] = None
     alpha: float = 1.0
 
 
@@ -1631,8 +1697,8 @@ class ImageStack(NodeRef):
         corner_offsets: Optional[CornerOffsets] = None,
         brightness: float = 0.0,
         color_transfer: float = 0.0,
-        feather: int | str = 0,
-        corner_radius: Optional[int | str] = None,
+        feather: EdgeValues = 0,
+        corner_radius: Optional[EdgeValues] = None,
         alpha: float = 1.0,
     ) -> ImageLayerAttachmentSink:
         """
@@ -1814,7 +1880,12 @@ class ImageStack(NodeRef):
 
             Default: ``0.0``.
 
-        feather : int or str, optional
+        feather : int, str, tuple or list, optional
+            A sequence of 1-4 pixel/percentage values uses CSS expansion in
+            top, right, bottom, left order. Percentages use height for top/bottom
+            and width for left/right. Zero preserves that bounding-box edge.
+            Sequences apply a smooth bounding-box mask multiplied by existing
+            alpha; scalar values retain the cutout-alpha blur behavior below.
             Feathering applied to the layer edges before compositing.
 
             Supported formats:
@@ -1845,7 +1916,11 @@ class ImageStack(NodeRef):
 
             Default: ``0``.
 
-        corner_radius : int or str or None, optional
+        corner_radius : int, str, tuple, list or None, optional
+            A sequence of 1-4 pixel/percentage values uses CSS expansion in
+            top-left, top-right, bottom-right, bottom-left order. Each percentage
+            uses the maximum valid radius described below. Sequence masks also
+            apply to transparent layers and work independently of feather.
             Corner rounding radius used when generating the synthetic alpha mask
             for fully opaque layers.
 
@@ -1860,8 +1935,8 @@ class ImageStack(NodeRef):
 
             A value of ``0`` or ``"0%"`` disables corner rounding.
 
-            This parameter has no effect when the layer already contains
-            transparency (e.g. segmentation masks).
+            With scalar feather and scalar radius, the legacy feathering path
+            does not round layers that already contain transparency.
 
         alpha : float, optional
             Global opacity multiplier applied to the layer before compositing.
@@ -1975,9 +2050,9 @@ class ImageStack(NodeRef):
             )
 
         if corner_radius is not None:
-            validate_size_expr(corner_radius)
+            expand_css_values(corner_radius)
 
-        validate_size_expr(feather)
+        expand_css_values(feather)
 
         alpha = float(alpha)
         if not math.isfinite(alpha) or not (0.0 <= alpha <= 1.0):
@@ -2188,7 +2263,21 @@ class ImageStack(NodeRef):
                     layer.paste(matched_crop, layer_box)
 
             # Apply feathering through alpha-channel handling.
-            if feather_is_nonzero(layer_spec.feather):
+            directional = (
+                isinstance(layer_spec.feather, (tuple, list))
+                or isinstance(layer_spec.corner_radius, (tuple, list))
+                or (not feather_is_nonzero(layer_spec.feather)
+                    and layer_spec.corner_radius is not None)
+            )
+            if directional:
+                r, g, b, a = layer.split()
+                ramp = _directional_alpha_ramp(
+                    lw, lh, feather=layer_spec.feather,
+                    corner_radius=layer_spec.corner_radius,
+                )
+                a = ImageChops.multiply(a, ramp)
+                layer = Image.merge('RGBA', (r, g, b, a))
+            elif feather_is_nonzero(layer_spec.feather):
                 r, g, b, a = layer.split()
 
                 # If alpha is fully opaque (typical for crop_mode='bbox'),
