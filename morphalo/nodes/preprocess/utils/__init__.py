@@ -465,11 +465,17 @@ def resolve_size_expr(
     *,
     max_size: Optional[int] = None,
     reference: Optional[int] = None,
-    min_size: int = 1,
+    min_size: Optional[int] = 1,
     allow_unitless: bool = False,
-) -> int:
+    allow_negative: bool = False,
+    round_result: bool = True,
+) -> int | float:
     """
     Resolve a pixel or percentage size expression to pixels.
+
+    By default, round to integer pixels and enforce ``min_size``. Coordinates
+    may use ``allow_negative=True``, ``min_size=None`` and ``round_result=False``
+    to preserve signed fractional bounds until the rectangle is computed.
     """
     ref = reference if reference is not None else max_size
     if ref is None:
@@ -477,19 +483,24 @@ def resolve_size_expr(
     if ref < 0:
         raise ValueError(f'reference must be >= 0, got {ref}')
 
-    validate_size_expr(size_expr, allow_unitless=allow_unitless)
+    validate_size_expr(
+        size_expr, allow_unitless=allow_unitless, allow_negative=allow_negative,
+    )
 
     if isinstance(size_expr, int):
-        return max(min_size, size_expr)
+        result = size_expr
+    else:
+        s = size_expr.strip().lower()
+        if s.endswith('px'):
+            result = float(s[:-2])
+        elif s.endswith('%'):
+            result = ref * (float(s[:-1]) / 100.0)
+        else:
+            result = float(s)
 
-    s = size_expr.strip().lower()
-    if s.endswith('px'):
-        return max(min_size, int(round(float(s[:-2]))))
-    if s.endswith('%'):
-        pct = max(0.0, float(s[:-1])) / 100.0
-        return max(min_size, int(round(ref * pct)))
-
-    return max(min_size, int(round(float(s))))
+    if round_result:
+        result = int(round(result))
+    return result if min_size is None else max(min_size, result)
 
 
 def validate_percentage_size_expr(

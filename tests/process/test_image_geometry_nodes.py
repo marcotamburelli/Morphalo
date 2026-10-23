@@ -16,7 +16,7 @@ from morphalo.nodes.preprocess.mask_insert_layer import (
     _place_overlay_on_local_canvas,
     _resize_overlay_to_box,
 )
-from morphalo.nodes.preprocess.utils import read_spatial_transform
+from morphalo.nodes.preprocess.utils import read_spatial_transform, resolve_size_expr
 from morphalo.nodes.preprocess.utils.geometry import expand_clip_bbox_by_size_expr
 from morphalo.nodes.preprocess.utils.mask_ops import cleanup_shape_mask
 
@@ -503,6 +503,29 @@ def test_image_stack_rejects_color_transfer_outside_range(tmp_path, color_transf
         stack.image(idx=0, color_transfer=color_transfer)
 
 
+@pytest.mark.parametrize(
+    'value, expected',
+    [(0, 1), ('0%', 1), ('25%', 3), ('2.5px', 2)],
+)
+def test_size_expr_default_rounding_and_minimum(value, expected):
+    result = resolve_size_expr(value, reference=13)
+    assert result == expected
+    assert isinstance(result, int)
+    with pytest.raises(ValueError):
+        resolve_size_expr('-25%', reference=13)
+
+
+@pytest.mark.parametrize(
+    'value, expected',
+    [('-25%', -3.25), ('25%', 3.25), ('-1.5px', -1.5), (0, 0)],
+)
+def test_size_expr_preserves_signed_fractional_coordinates(value, expected):
+    assert resolve_size_expr(
+        value, reference=13, min_size=None,
+        allow_negative=True, round_result=False,
+    ) == expected
+
+
 def test_box_crop_emits_local_anchor_and_global_position(tmp_path):
     src = tmp_path / 'src.png'
     Image.new('RGBA', (20, 20), color=(255, 255, 255, 255)).save(src)
@@ -526,6 +549,185 @@ def test_box_crop_emits_local_anchor_and_global_position(tmp_path):
     assert out['crop']['bbox_size'] == [10, 10]
     assert out['crop']['bbox_xyxy'] == [4, 6, 14, 16]
     assert out['bbox_source'] == 'params'
+    assert out['mode'] == 'default'
+    assert out['input_size'] == [20, 20]
+    assert out['output_size'] == [10, 10]
+    assert Image.open(out['image']).mode == 'RGBA'
+
+
+@pytest.mark.parametrize('mode', ['mask', 'negative-mask'])
+@pytest.mark.parametrize(
+    'bbox, expected_bbox',
+    [
+        (['0px', '75%', '100%', '25%'], [0, 6, 12, 8]),
+        ([-2, 2, 6, 10], [0, 2, 4, 8]),
+    ],
+)
+def test_box_crop_full_frame_mask(tmp_path, mode, bbox, expected_bbox):
+    src = tmp_path / 'src.png'
+    Image.new('RGBA', (12, 8), (255, 0, 0, 0)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='region',
+            spec={'params': {'bbox_format': 'xywh', 'bbox': bbox, 'mode': mode}},
+        )
+    out = node.run(tmp_path, input={'default': {'image': str(src)}})
+    result = Image.open(out['image'])
+    expected = np.zeros((8, 12), dtype=np.uint8)
+    x1, y1, x2, y2 = expected_bbox
+    expected[y1:y2, x1:x2] = 255
+    if mode == 'negative-mask':
+        expected = 255 - expected
+
+    assert result.mode == 'L'
+    assert result.size == (12, 8)
+    np.testing.assert_array_equal(np.asarray(result), expected)
+    assert out['mode'] == out['params']['mode'] == mode
+    assert out['input_size'] == out['output_size'] == [12, 8]
+    assert out['crop']['bbox_xyxy'] == expected_bbox
+    assert out['crop']['bbox_size'] == [x2 - x1, y2 - y1]
+
+
+def test_box_crop_mask_processing_and_inversion(tmp_path):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (24, 24)).save(src)
+    results = {}
+    for mode in ('default', 'mask', 'negative-mask'):
+        with DAG('test', out_dir=tmp_path):
+            node = BoxCrop(
+                name=mode, path=src,
+                spec={'params': {
+                    'bbox': [8, 8, 16, 16], 'mode': mode,
+                    'close_radius': 1, 'dilate_radius': 2, 'smoothing_radius': 1,
+                }},
+            )
+        out = node.run(tmp_path)
+        results[mode] = np.asarray(Image.open(out['image']))
+        assert out['crop']['bbox_xyxy'] == [8, 8, 16, 16]
+        assert out['params']['close_radius'] == 1
+        assert out['params']['dilate_radius'] == 2
+        assert out['params']['smoothing_radius'] == 1
+
+    positive = results['mask']
+    assert positive[12, 6] > 0  # Dilation extends beyond the original rectangle.
+    assert 0 < positive[12, 5] < 255
+    assert positive[12, 12] == 255
+    assert positive[0, 0] == 0
+    np.testing.assert_array_equal(results['negative-mask'], 255 - positive)
+    assert results['default'].shape == (8, 8, 3)
+    assert not results['default'].any()
+
+
+def test_box_crop_mask_uses_scaled_transform_bbox(tmp_path):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (16, 12)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='region', path=src,
+            spec={'params': {
+                'mode': 'mask', 'scale_transform_to_image': True,
+                'bbox': [0, 0, 1, 1],
+            }},
+        )
+    out = node.run(tmp_path, input={'transform': {
+        'input_size': [8, 6], 'crop': {'bbox_xyxy': [1, 1, 5, 4]},
+    }})
+    expected = np.zeros((12, 16), dtype=np.uint8)
+    expected[2:8, 2:10] = 255
+    np.testing.assert_array_equal(np.asarray(Image.open(out['image'])), expected)
+    assert out['bbox_source'] == 'transform'
+    assert out['crop']['bbox_xyxy'] == [2, 2, 10, 8]
+
+
+@pytest.mark.parametrize(
+    'params, error',
+    [
+        ({'mode': 'crop'}, 'invalid mode'),
+        ({'mode': 'unknown'}, 'invalid mode'),
+        ({'dilate_radius': -1}, 'dilate_radius must be >= 0'),
+        ({'close_radius': -1}, 'close_radius must be >= 0'),
+        ({'smoothing_radius': -1}, 'smoothing_radius must be >= 0'),
+    ],
+)
+def test_box_crop_rejects_invalid_mask_config(tmp_path, params, error):
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(name='crop', spec={'params': params})
+    with pytest.raises(ValueError, match=error):
+        node.run(tmp_path)
+
+
+@pytest.mark.parametrize(
+    'size, bbox_format, bbox, original, expected',
+    [
+        ((1200, 800), 'xywh', ['0px', '75%', '100%', '25%'],
+         [0, 600, 1200, 800], [0, 600, 1200, 800]),
+        ((20, 12), 'xyxy', [2, '25%', '75%', '10px'],
+         [2, 3, 15, 10], [2, 3, 15, 10]),
+        ((1200, 800), 'xyl', [0, 0, '25%'],
+         [0, 0, 300, 300], [0, 0, 300, 300]),
+        ((800, 1200), 'xyl', ['25%', '25%', '25%'],
+         [200, 300, 500, 600], [200, 300, 500, 600]),
+        ((13, 7), 'xywh', ['25%', '25%', '25%', '25%'],
+         [3, 1, 7, 4], [3, 1, 7, 4]),
+        ((13, 7), 'xyxy', ['25%', '25%', '50%', '50%'],
+         [3, 1, 7, 4], [3, 1, 7, 4]),
+        ((20, 12), 'xywh', ['-10%', '75%', '120%', '50%'],
+         [-2, 9, 22, 15], [0, 9, 20, 12]),
+        ((20, 12), 'xyl', [0, 0, '100%'],
+         [0, 0, 20, 20], [0, 0, 20, 12]),
+        ((20, 12), 'xywh', ['1.5px', '2.5px', '3px', '4px'],
+         [1, 2, 5, 7], [1, 2, 5, 7]),
+    ],
+)
+def test_box_crop_resolves_mixed_units(
+    tmp_path, size, bbox_format, bbox, original, expected,
+):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', size).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop', path=src,
+            spec={'params': {'bbox_format': bbox_format, 'bbox': bbox}},
+        )
+
+    out = node.run(tmp_path)
+
+    assert out['bbox'] == bbox
+    assert out['params']['bbox'] == bbox
+    assert out['original_bbox_xyxy'] == original
+    assert out['crop']['bbox_xyxy'] == expected
+    expected_size = (expected[2] - expected[0], expected[3] - expected[1])
+    assert Image.open(out['image']).size == expected_size
+    assert out['crop']['bbox_size'] == list(expected_size)
+    assert out['crop']['position'] == [
+        (expected[0] + expected[2]) // 2, (expected[1] + expected[3]) // 2,
+    ]
+
+
+@pytest.mark.parametrize('value', ['12em', '%', 'px', 'nan%', 'infpx', None, {}])
+def test_box_crop_rejects_invalid_unit_coordinates(tmp_path, value):
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop',
+            spec={'params': {'bbox_format': 'xywh', 'bbox': [0, value, 10, 10]}},
+        )
+    with pytest.raises(ValueError, match='invalid params.bbox coordinate'):
+        node.run(tmp_path)
+
+
+@pytest.mark.parametrize('extent', ['0%', '-1%'])
+def test_box_crop_rejects_empty_fractional_boxes(tmp_path, extent):
+    src = tmp_path / 'src.png'
+    Image.new('RGB', (13, 7)).save(src)
+    with DAG('test', out_dir=tmp_path):
+        node = BoxCrop(
+            name='crop', path=src,
+            spec={'params': {
+                'bbox_format': 'xywh', 'bbox': ['25%', 0, extent, '100%'],
+            }},
+        )
+    with pytest.raises(ValueError, match='Invalid bbox'):
+        node.run(tmp_path)
 
 
 def test_box_crop_transform_bbox_overrides_params_bbox(tmp_path):
@@ -542,7 +744,7 @@ def test_box_crop_transform_bbox_overrides_params_bbox(tmp_path):
             spec={
                 'params': {
                     'bbox_format': 'xyxy',
-                    'bbox': [0, 0, 1, 1],
+                    'bbox': ['0px', '0%', '100%', '100%'],
                 }
             },
         )
