@@ -154,17 +154,23 @@ def resolve_qwen_image_params(spec: Any) -> QwenImageParams:
     )
 
 
-def resolve_qwen_image_edit_params(spec: Any) -> QwenImageEditParams:
+def resolve_qwen_image_edit_params(
+    spec: Any,
+    *,
+    default_steps: int = 25,
+) -> QwenImageEditParams:
     """
-    Resolve parameters for ``QwenImageEdit``.
+    Resolve common inference parameters for Qwen editing pipelines.
 
     ``true_cfg_scale`` and explicit output size remain optional. When omitted,
     the node lets the pipeline use its own defaults, including input-image-sized
     output where applicable.
+    ``default_steps`` allows unified pipelines to set their own step default
+    without changing the existing single-image edit node's behavior.
     """
     params = _params_section(spec)
     return QwenImageEditParams(
-        steps=int(params.get('steps', 25)),
+        steps=int(params.get('steps', default_steps)),
         true_cfg_scale=_optional_float(params, 'true_cfg_scale'),
         height=_optional_int(params, 'height'),
         width=_optional_int(params, 'width'),

@@ -1,7 +1,7 @@
 import pytest
 
 from morphalo.dag import DAG
-from morphalo.nodes.common import cuda_mem
+from morphalo.core import cuda_mem
 from morphalo.nodes.foundation import omnigen
 from morphalo.nodes.foundation import qwen_image
 

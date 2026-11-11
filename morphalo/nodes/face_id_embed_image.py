@@ -13,7 +13,7 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.sdxl_resolve import resolve_image_paths
@@ -177,6 +177,11 @@ class FaceIdEmbedImage(CudaPostRunMixin, NodeRef):
 
     Notes
     -----
+    - Official InsightFace weights, including the default ``buffalo_l`` pack,
+      are for non-commercial research only. This restriction concerns the
+      pretrained weights; InsightFace code is MIT-licensed. See the
+      `InsightFace licensing policy
+      <https://github.com/deepinsight/insightface#license>`_.
     - The visual (CLIP-based) component used by FaceID Plus / PlusV2 is not computed
       here; image paths are forwarded for downstream CLIP embedding injection.
     - ``det_size`` controls the resolution used during face detection (not the

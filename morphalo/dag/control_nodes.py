@@ -5,11 +5,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from morphalo.cache import ModelCache
 from morphalo.core.paths import make_node_output_path
 
 from .core import NodeRef
 
-__all__ = ['CudaCooldown', 'MaterializedPassthrough']
+__all__ = ['CudaCooldown', 'EvictModelCache', 'MaterializedPassthrough']
 
 Output = Dict[str, Any]
 
@@ -83,3 +84,71 @@ class CudaCooldown(MaterializedPassthrough):
 
     def _invalid_input(self, input_keys: list[str]) -> Exception:
         return ValueError('CudaCooldown accepts only the default input')
+
+
+class EvictModelCache(MaterializedPassthrough):
+    """
+    Evict all cached models before forwarding the default input.
+
+    The node synchronizes pending PyTorch CUDA work, clears ``ModelCache``,
+    then performs garbage collection and releases unused CUDA allocator memory.
+    It runs in the executor's current process, including the existing worker
+    when using ``ProcessNodeExecutor``, without requesting a worker restart or
+    cooldown delay.
+
+    Parameters
+    ----------
+    name : str, optional
+        Unique node identifier within the DAG.
+
+    Inputs
+    ------
+    default : dict, optional
+        Upstream output to forward. Only the default input channel is accepted.
+        With no input, cache eviction still runs and the node returns ``{}``.
+
+    Outputs
+    -------
+    dict
+        Forwarded payload with this node's identity and a new JSON output card.
+        Upstream metadata is replaced; other payload fields are preserved.
+
+    Notes
+    -----
+    - Clears all entries in the process-local model cache, including CPU models.
+      Downloaded weights and DAG output artifacts on disk are retained.
+    - Memory release is best effort. Objects referenced elsewhere and allocations
+      owned by other runtimes may remain alive. The CUDA context is retained.
+    - Does not initialize CUDA when it has not already been initialized.
+    - Models required by later nodes must be loaded again.
+
+    Examples
+    --------
+    Insert between stages using different heavyweight models::
+
+        generation >> EvictModelCache(name='evict') >> processing
+    """
+
+    def run(
+        self,
+        output_dir: str,
+        input: Optional[Dict[str, Output]] = None,
+    ) -> Output:
+        if input and (len(input) != 1 or 'default' not in input):
+            raise self._invalid_input(sorted(input))
+
+        # Import CUDA helpers only during execution, keeping DAG imports light.
+        from morphalo.core.cuda_mem import cleanup_torch_cuda, synchronize_torch_cuda
+
+        synchronize_torch_cuda()
+        ModelCache.clear()
+        cleanup_torch_cuda()
+
+        out = super().run(output_dir, input=input)
+        return out
+
+    def _missing_input(self, output_dir: str, *, upstream_none: bool) -> Output:
+        return {}
+
+    def _invalid_input(self, input_keys: list[str]) -> Exception:
+        return ValueError('EvictModelCache accepts only the default input')

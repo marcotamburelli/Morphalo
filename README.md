@@ -166,6 +166,9 @@ Because workflows are represented as graphs with explicit channels, it would be 
   Higher-level image generation and editing workflows are available through:
 
   - `QwenImage`
+  - `QwenImage21` (unified generation/editing, RGBA, up to 10 references;
+    also supports the 2.1 Turbo checkpoint; defaults to BF16 with CUDA model
+    CPU offload via `model.device='cuda'` and `model.cpu_offload=True`)
   - `QwenImageEdit`
   - `QwenImageEditPlus`
   - `QwenImageInpaint`
@@ -850,6 +853,22 @@ do not update the original node object held by the DAG runner.
 The worker process owns its CUDA context and model caches. Restarting it also
 discards those process-local resources, trading some cache reuse for a shorter
 CUDA context lifetime.
+
+To release cached models between stages while keeping the worker alive, insert
+`EvictModelCache` into the DAG:
+
+```python
+from morphalo.dag import EvictModelCache
+
+generation >> EvictModelCache(name='evict') >> processing
+```
+
+This node synchronizes pending PyTorch CUDA work, clears all entries in the
+process-local model cache (including CPU models), and performs garbage collection
+and CUDA allocator cleanup. It forwards the default input and writes its own JSON
+output card. With no input it still clears the cache and returns an empty payload.
+It does not request a worker restart or cooldown delay. Memory still referenced
+elsewhere may remain allocated; downloaded weights and output files are retained.
 
 > **Note:** GPU models and their supporting libraries are loaded only when needed
 > inside the worker. This keeps CUDA activity out of the parent process and

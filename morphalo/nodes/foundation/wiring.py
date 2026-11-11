@@ -384,6 +384,8 @@ class ImageSequenceBundle:
     The bundle intentionally permits an empty sequence. Some foundation models
     can run either as text-to-image or as image-conditioned editors. Nodes that
     require at least one image should validate ``bundle.images`` themselves.
+    Inputs are converted to RGB by default; ``preserve_alpha=True`` loads RGBA
+    images for pipelines supporting transparent references.
     """
 
     def __init__(
@@ -391,7 +393,9 @@ class ImageSequenceBundle:
         specs: List[int],
         *,
         input: Optional[Dict[str, Dict]] = None,
+        preserve_alpha: bool = False,
     ):
+        self._preserve_alpha = preserve_alpha
         self._images: List[Image.Image] = []
         self._metadata: List[Dict[str, Any]] = []
         self._build(specs, input=input or {})
@@ -420,7 +424,10 @@ class ImageSequenceBundle:
             for path in _payload_image_paths(upstream, input_id=input_id):
                 entries.append((input_id, path))
 
-        self._images = [Image.open(path).convert('RGB') for _, path in entries]
+        self._images = []
+        for _, path in entries:
+            with Image.open(Path(path).expanduser()) as image:
+                self._images.append(image.convert('RGBA' if self._preserve_alpha else 'RGB'))
         self._metadata = [
             {
                 'input_id': input_id,
@@ -454,8 +461,11 @@ class ImageSequenceMixin:
     def build_image_sequence_bundle(
         self,
         input: Optional[Dict[str, Dict]],
+        *,
+        preserve_alpha: bool = False,
     ) -> ImageSequenceBundle:
         return ImageSequenceBundle(
             self.image.specs,
             input=input or {},
+            preserve_alpha=preserve_alpha,
         )

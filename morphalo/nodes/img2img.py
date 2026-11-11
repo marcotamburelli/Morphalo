@@ -8,7 +8,7 @@ from PIL import Image
 from morphalo.cache.models import get_sdxl_base_pipe
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
@@ -230,6 +230,10 @@ class Img2Img(
       ``image=init_image`` and passes ControlNet conditioning via ``control_image``
       (through ``build_pipe_kwargs(..., init_image_already_passed=True)``).
     - IP-Adapter and FaceID are mutually exclusive in this node.
+    - When using FaceID conditioning, ``h94/IP-Adapter-FaceID`` weights are
+      restricted to non-commercial research. See the `FaceID model card
+      <https://huggingface.co/h94/IP-Adapter-FaceID#non-commercial-use>`_
+      and :class:`FaceIdRegistry` for the related InsightFace restriction.
     """
 
     spec: SpecInput = field(default_factory=dict)

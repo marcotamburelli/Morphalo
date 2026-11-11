@@ -9,7 +9,7 @@ from morphalo.cache.models import evict_omnigen, get_omnigen
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
-from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+from morphalo.core.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)

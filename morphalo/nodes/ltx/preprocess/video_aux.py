@@ -12,7 +12,7 @@ from morphalo.cache.models import get_controlnet_aux_annotator
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.ltx.video_utils import read_video_info
 from morphalo.nodes.preprocess.utils import (fit_to_target_rgb,

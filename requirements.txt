@@ -1,5 +1,5 @@
-diffusers[torch]
-transformers>=5.13.1
+diffusers[torch]>=0.42.0
+transformers>=5.17
 bitsandbytes
 pyhocon
 typer

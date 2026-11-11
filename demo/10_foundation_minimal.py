@@ -1,7 +1,7 @@
 '''
 Foundation nodes demo (minimal).
 
-This module contains six small DAGs covering the minimal foundation workflows:
+This module contains eight small DAGs covering the minimal foundation workflows:
 
 1) QwenImage      - text-to-image generation (no input image)
 2) QwenImageEdit  - instruction-based image editing (requires one input image)
@@ -9,6 +9,8 @@ This module contains six small DAGs covering the minimal foundation workflows:
 4) QwenImageInpaint - masked inpainting with an AnyCrop-generated mask
 5) OmniGen        - multimodal generation/editing with wired images referenced in the prompt
 6) Flux2Klein     - unified FLUX.2 Klein text-to-image / optional reference editing
+7) QwenImage21    - transparent text-to-image generation
+8) QwenImage21    - reference editing with the Turbo checkpoint
 
 How to run
 ----------
@@ -18,6 +20,8 @@ How to run
     ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image_inpaint_tshirt_min
     ./bin/run_dag.sh demo.10_foundation_minimal --dag omnigen_style_transfer_min
     ./bin/run_dag.sh demo.10_foundation_minimal --dag flux2_klein_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image21_min
+    ./bin/run_dag.sh demo.10_foundation_minimal --dag qwen_image21_edit_min
 '''
 
 from pathlib import Path
@@ -28,6 +32,7 @@ from morphalo.nodes.foundation import (
     Flux2Klein,
     OmniGen,
     QwenImage,
+    QwenImage21,
     QwenImageEdit,
     QwenImageEditPlus,
     QwenImageInpaint,
@@ -41,6 +46,66 @@ SOURCE_IMG_2 = '~/images/img_2.jpg'
 SOURCE_IMG_3 = '~/images/picture_2.jpg'
 
 STYLE_REF = '~/images/style_ref_03.jpg'
+
+
+# Qwen Image 2.1 uses a separate unified pipeline, not the older Edit pipeline.
+# Requires diffusers>=0.42.0 and transformers>=5.17. Commercial use of the
+# downloaded weights requires a separate Qwen license.
+with DAG(
+    name='qwen_image21_min',
+    out_dir=ROOT / 'outputs' / 'qwen_image21_min',
+):
+    out = QwenImage21(
+        name='out',
+        spec={
+            'model': {
+                'dtype': 'bf16',
+                'device': 'cuda',
+                'cpu_offload': True,
+                # Reduce the final VAE decode peak on a 32 GB GPU.
+                # Tiling can affect fine details and alpha at tile boundaries.
+                # 'vae_tiling': True,
+            },
+            'prompt': [
+                "This is an RGBA image with transparency.",
+                "A cute cartoon dragon sticker.",
+                "The image has alpha channel and the background is transparent.",
+            ],
+            # Start at 1024 on a 32 GB GPU; 2048 increases activation/decode memory.
+            'params': {'steps': 40, 'width': 1024, 'height': 1024},
+            'seed': 1234,
+        },
+    )
+
+
+with DAG(
+    name='qwen_image21_edit_min',
+    out_dir=ROOT / 'outputs' / 'qwen_image21_edit_min',
+):
+    init_img = FileImage(name='init_img', path=SOURCE_IMG_1)
+    out = QwenImage21(
+        name='out',
+        spec={
+            'model': {
+                'id': 'Qwen/Qwen-Image-2.1-Turbo',
+                'dtype': 'bf16',
+                'device': 'cuda',
+                'cpu_offload': True,
+            },
+            'prompt': [
+                "Change the background to a sunset beach.",
+                "Light and shadow should be consistent with the new background.",
+                "Keep the subject's pose and expression.",
+            ],
+            'params': {
+                'steps': 8,
+                'output_resolution': 1024,
+            },
+            'seed': 1234,
+        },
+    )
+    init_img >> out
+    # For additional references: ref >> out.image(1), ref2 >> out.condition(2).
 
 
 # -----------------------------------------------------------------------------

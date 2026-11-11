@@ -157,6 +157,16 @@ class FaceIdRegistry:
 
     Similar to IpAdapterRegistry, but the primary input is embeddings (.pt),
     not images.
+
+    Notes
+    -----
+    - ``h94/IP-Adapter-FaceID`` weights, including Plus / PlusV2 variants,
+      are released for non-commercial research. See the `model card
+      <https://huggingface.co/h94/IP-Adapter-FaceID#non-commercial-use>`_.
+      Verify the terms separately when selecting another repository.
+    - Identity extraction with official InsightFace weights has its own
+      non-commercial research restriction; see the `InsightFace policy
+      <https://github.com/deepinsight/insightface#license>`_.
     """
 
     def __init__(self, owner: NodeRef):
@@ -256,6 +266,8 @@ class FaceIdRegistry:
             adapter weights.
 
             Example: ``'h94/IP-Adapter-FaceID'``.
+            Those weights are for non-commercial research; see the licensing
+            notes on :class:`FaceIdRegistry` and the linked model card.
 
         weight_name : str
             FaceID adapter weight file to load.

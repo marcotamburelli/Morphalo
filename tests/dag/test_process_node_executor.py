@@ -12,7 +12,8 @@ from typing import Any, Dict
 import pytest
 
 import morphalo.dag.process_executor as process_executor_mod
-from morphalo.dag import DAG, NodeRef
+from morphalo.cache import CacheKey, ModelCache
+from morphalo.dag import DAG, EvictModelCache, NodeRef
 from morphalo.dag.control_nodes import CudaCooldown
 from morphalo.dag.process_executor import (
     NodeResult,
@@ -68,6 +69,41 @@ class SlowFileTracingNode(FileTracingNode):
 
         time.sleep(self.delay)
         return {'node_id': self.id, 'pid': os.getpid()}
+
+
+@dataclass
+class CacheProbeNode(NodeRef):
+    populate: bool = False
+
+    def run(self, output_dir, input=None):
+        key = CacheKey(kind='test', ref='worker_model', device='cpu', dtype='float32')
+        if self.populate:
+            ModelCache.put(key, object())
+        return {'pid': os.getpid(), 'cache_present': ModelCache.get(key) is not None}
+
+
+def test_evict_clears_worker_cache_without_restarting_or_clearing_parent(tmp_path, monkeypatch):
+    monkeypatch.setattr(ModelCache, '_store', {})
+    key = CacheKey(kind='test', ref='worker_model', device='cpu', dtype='float32')
+    parent_model = ModelCache.put(key, object())
+    with DAG('worker_eviction', out_dir=tmp_path):
+        populate = CacheProbeNode(name='populate', populate=True)
+        evict = EvictModelCache(name='evict')
+        probe = CacheProbeNode(name='probe')
+
+    with ProcessNodeExecutor(
+        cuda_shutdown_min_wait=0,
+        cuda_cooldown_after_restart=0,
+    ) as executor:
+        before = executor.run(node=populate, out_dir=str(tmp_path), input_map={})
+        forwarded = executor.run(node=evict, out_dir=str(tmp_path), input_map={'default': before})
+        after = executor.run(node=probe, out_dir=str(tmp_path), input_map={})
+
+    assert before['cache_present'] is True
+    assert after['cache_present'] is False
+    assert before['pid'] == forwarded['pid'] == after['pid']
+    assert before['pid'] != os.getpid()
+    assert ModelCache.get(key) is parent_model
 
 
 class FakeQueue:

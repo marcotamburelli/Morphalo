@@ -10,7 +10,7 @@ import torch
 from morphalo.core.paths import make_node_output_path
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.ltx.preprocess.utils.depth_extractor import \
     DepthVideoExtractor

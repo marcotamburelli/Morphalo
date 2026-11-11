@@ -614,6 +614,19 @@ class FaceSwap(NodeRef):
 
     Notes
     -----
+    - The official InsightFace weights used for detection and ArcFace embeddings
+      (default ``buffalo_l``) are restricted to non-commercial research. See the
+      `InsightFace licensing policy
+      <https://github.com/deepinsight/insightface#license>`_.
+    - Both supported SimSwap backends, ``simswap_256`` and
+      ``simswap_unofficial_512``, use non-commercial model weights distributed
+      through FaceFusion. See `FaceFusion model licenses
+      <https://docs.facefusion.io/introduction/licenses#simswap>`_ and the
+      `upstream SimSwap CC-BY-NC 4.0 license
+      <https://github.com/neuralchen/SimSwap#license>`_. The CrossFace converter
+      has its own OpenRAIL-M terms, listed separately on the FaceFusion license
+      page; these do not remove the other models' non-commercial restrictions.
+
     The internal pipeline is:
 
     1. Load the target and source images in BGR format and analyse them with a

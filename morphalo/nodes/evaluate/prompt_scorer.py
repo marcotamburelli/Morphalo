@@ -14,7 +14,7 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag.core import NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_seed, resolve_spec)
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json
 from morphalo.nodes.evaluate.helper import clamp01

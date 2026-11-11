@@ -1,3 +1,5 @@
+"""CUDA synchronization and memory cleanup shared by runtime and nodes."""
+
 import gc
 
 import torch

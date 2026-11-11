@@ -7,7 +7,7 @@ from morphalo.cache.ltx_models import (get_ltx_condition,
                                        get_ltx_latent_upsample)
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device

@@ -8,7 +8,7 @@ from PIL import Image
 from morphalo.cache.models import get_sdxl_base_pipe
 from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)
 from morphalo.nodes.common.device import is_cuda_device
@@ -292,6 +292,10 @@ class Inpaint(
     - IP-Adapter conditioning uses one or more reference images passed through
       ``ip_adapter_image``; FaceID uses precomputed embeddings passed through
       ``ip_adapter_image_embeds``. IP-Adapter and FaceID are mutually exclusive.
+    - When using FaceID conditioning, ``h94/IP-Adapter-FaceID`` weights are
+      restricted to non-commercial research. See the `FaceID model card
+      <https://huggingface.co/h94/IP-Adapter-FaceID#non-commercial-use>`_
+      and :class:`FaceIdRegistry` for the related InsightFace restriction.
     - Outputs are written as one or more image files plus a single JSON sidecar
       for the node execution. In batch mode, the sidecar is shared across all
       generated images.

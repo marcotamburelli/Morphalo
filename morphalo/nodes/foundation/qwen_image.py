@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from morphalo.cache.models import evict_qwen_image, get_qwen_image
 from morphalo.dag import NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
-from morphalo.nodes.common.cuda_mem import (cleanup_torch_cuda,
+from morphalo.core.cuda_mem import (cleanup_torch_cuda,
                                             synchronize_torch_cuda)
 from morphalo.nodes.common.cuda_stat import (cuda_mem_stats, cuda_prerun,
                                              cuda_sync)

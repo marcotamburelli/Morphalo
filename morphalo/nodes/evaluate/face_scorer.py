@@ -14,7 +14,7 @@ from morphalo.core.paths import make_node_output_path
 from morphalo.dag.core import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import (SpecInput, resolve_dtype,
                                                   resolve_spec)
-from morphalo.nodes.common.cuda_mem import CudaPostRunMixin
+from morphalo.core.cuda_mem import CudaPostRunMixin
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import load_faceid_embeds, write_json
 from morphalo.nodes.evaluate.helper import clamp01
@@ -956,6 +956,12 @@ class FaceScorer(CudaPostRunMixin, ImgWiringMixin, NodeRef):
 
     Notes
     -----
+    - When reference embeddings enable identity scoring, the node loads
+      InsightFace weights (default ``buffalo_l``), restricted to non-commercial
+      research. This is separate from InsightFace's MIT code license. See the
+      `InsightFace licensing policy
+      <https://github.com/deepinsight/insightface#license>`_. Without identity
+      scoring, this node does not load InsightFace.
     - This node does not generate images; it selects among existing candidates.
     - Identity similarity is optional and only contributes when reference
     embeddings are provided upstream.

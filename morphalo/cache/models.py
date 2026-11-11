@@ -613,6 +613,72 @@ def evict_qwen_image(
     return ModelCache.pop(key)
 
 
+def get_qwen_image21_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: str = 'cuda',
+    cpu_offload: bool = True,
+    vae_tiling: bool = False,
+) -> Any:
+    """Load Qwen-Image-2.1 with model CPU offload on CUDA by default.
+
+    Disable ``cpu_offload`` to move the full pipeline to ``device``. Cache
+    ``vae_tiling`` enables tiled VAE encoding/decoding to reduce activation
+    memory. Cache entries distinguish device, offload, and tiling settings.
+    """
+    key = CacheKey(
+        kind='qwen_image21',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+        extra=f'cpu_offload={cpu_offload}|vae_tiling={vae_tiling}',
+    )
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        from diffusers import QwenImage21Pipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            'QwenImage21 requires Diffusers with QwenImage21Pipeline support '
+            '(diffusers>=0.42.0) and transformers>=5.17.'
+        ) from exc
+
+    pipe = QwenImage21Pipeline.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+    )
+    if vae_tiling:
+        pipe.vae.enable_tiling()
+
+    if str(device).startswith('cuda') and cpu_offload:
+        pipe.enable_model_cpu_offload(device=device)
+    else:
+        pipe = pipe.to(device)
+
+    return ModelCache.put(key, pipe)
+
+
+def evict_qwen_image21_pipe(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device: str = 'cuda',
+    cpu_offload: bool = True,
+    vae_tiling: bool = False,
+) -> Any:
+    key = CacheKey(
+        kind='qwen_image21',
+        ref=model_id,
+        device=device,
+        dtype=dtype_key(dtype),
+        extra=f'cpu_offload={cpu_offload}|vae_tiling={vae_tiling}',
+    )
+    return ModelCache.pop(key)
+
+
 def get_qwen_image_edit_pipe(
     *,
     model_id: str,
@@ -1123,6 +1189,15 @@ def get_insightface(
     det_size: Tuple[int, int],
     device: str,
 ) -> FaceAnalysis:
+    """
+    Load and cache an InsightFace model pack.
+
+    Notes
+    -----
+    Official pretrained packs are for non-commercial research only, separately
+    from the MIT code license. See the `InsightFace licensing policy
+    <https://github.com/deepinsight/insightface#license>`_.
+    """
     from insightface.app import FaceAnalysis
 
     key = CacheKey(
@@ -1188,6 +1263,14 @@ def get_face_swapper(*, model_name: str, device: str) -> FaceSwapperRuntime:
         If ``model_name`` is not supported.
     RuntimeError
         If CUDA is requested but unavailable in ONNX Runtime.
+
+    Notes
+    -----
+    The supported SimSwap weights are non-commercial; see `FaceFusion model
+    licenses <https://docs.facefusion.io/introduction/licenses#simswap>`_ and
+    the `SimSwap license <https://github.com/neuralchen/SimSwap#license>`_.
+    The CrossFace converter is separately listed under OpenRAIL-M by FaceFusion;
+    that license does not replace the swapper weights' terms.
     """
     try:
         model = _FACE_SWAPPER_MODELS[model_name]
