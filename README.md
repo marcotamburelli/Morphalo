@@ -402,9 +402,9 @@ The repository is structured as a small execution engine plus optional local wor
 
 - `demo/` - Example DAGs and macro workflows. Useful starting points include:
     - `01_minimal_txt2img.py` for the smallest image-generation DAG
-    - `10_foundation_minimal.py` for Qwen Image and OmniGen
-    - `12_scorers.py` for candidate ranking and chained evaluators
-    - `14_video_wip.py` for current LTX-Video workflows
+    - `11_foundation_minimal.py` for Qwen Image and OmniGen
+    - `13_scorers.py` for candidate ranking and chained evaluators
+    - `15_video_wip.py` for current LTX-Video workflows
     - `macro/` for reusable higher-level graph composition
 - `tests/` - Unit tests (including DAG-level tests).
 - `third_party/`

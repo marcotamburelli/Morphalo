@@ -14,10 +14,11 @@ from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import write_json_sidecar
 from morphalo.nodes.preprocess.utils.aux_annotator import build_aux_annotator
-from morphalo.nodes.preprocess.utils.face_luminance_compositing import (
-    compare_face_masks, composite_face_luminance, gray_to_rgb,
+from morphalo.nodes.preprocess.utils.face_compositing import (
+    FEATHER_RADIUS_FRACTION, INSERT_EROSION_RADIUS_PX, MIN_FEATHER_RADIUS_PX,
+    compare_face_masks, composite_face, gray_to_rgb,
     sample_landmark_luminance, sharpen_face_luminance,
-    warp_face_luminance_background)
+    warp_face_background)
 from morphalo.nodes.sdxl_resolve import (resolve_image_paths,
                                          resolve_single_image_path)
 from morphalo.nodes.vision.face_geometry import (_draw_landmarks,
@@ -41,6 +42,7 @@ class Config:
     processor_device: str
     processor_params: Dict[str, Any]
     detail_gain: float
+    save_debug: bool
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -81,6 +83,10 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     if not isinstance(params, dict):
         raise ValueError(f"'{node_id}': params must be an object")
+
+    debug = spec.get('debug', {})
+    if not isinstance(debug, dict):
+        raise ValueError(f"'{node_id}': debug must be an object")
 
     processor = params.get('processor')
     processor_params = params.get('processor_params', {})
@@ -123,6 +129,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         )),
         processor_params=dict(processor_params),
         detail_gain=detail_gain,
+        save_debug=bool(debug.get('save_debug', False)),
     )
 
 
@@ -246,14 +253,16 @@ class FaceGeometryMap(NodeRef):
     5. Sample the target's low-frequency luminance at its facial landmarks and
        rasterize those values over the transformed source mesh. This produces a
        synthetic grayscale face with target-compatible lighting.
-    6. Build a local coordinate deformation that contracts the surrounding
-       target image toward the synthetic face boundary. The deformation is
-       strongest beside the replacement and decays smoothly to zero away from
-       it, preserving real surrounding luminance instead of inventing a fill.
+    6. Radially fit the unmodified original face silhouette under the eroded
+       synthetic mask, using rays from the mask-union centroid. Interpolate
+       to a fixed outer contour beyond both faces, preserving surrounding
+       luminance outside the local transition. Rays use the furthest original
+       boundary hit and nearest eroded-destination hit. Multiple crossings are
+       allowed; invalid shared centers or missing intersections are rejected.
     7. Run the selected ``controlnet-aux`` processor on the completed image and
        save its result as the node's primary conditioning map.
-    8. Save landmark overlays and luminance-compositing intermediates in a
-       separate debug directory, together with a JSON sidecar.
+    8. Save a JSON sidecar. When debugging is enabled, also save landmark
+       overlays and luminance-compositing intermediates in a separate directory.
 
     Parameters
     ----------
@@ -311,6 +320,11 @@ class FaceGeometryMap(NodeRef):
                 detect, but may introduce halos or preserve unwanted target
                 detail.
 
+        ``debug`` : dict, optional
+            ``save_debug`` : bool, optional
+                Compute and save diagnostic overlays and intermediate images.
+                Default: ``False``. Does not affect the primary conditioning map.
+
     Inputs
     ------
     default : dict
@@ -342,17 +356,18 @@ class FaceGeometryMap(NodeRef):
         ``target_image`` : str
             Resolved target image path.
 
-        ``debug_directory`` : str
+        ``debug_directory`` : str, optional
             Directory containing source and target landmark overlays, normalized
             source views, the fused source geometry, and luminance-compositing
-            intermediates.
+            intermediates. Present only when ``debug.save_debug`` is true.
 
         ``transform`` : list[list[float]]
             Fitted 3D similarity transform from fused source geometry to target
             geometry.
 
         ``source_views`` : list[dict]
-            Per-source yaw, depth weight, base-view status, and debug paths.
+            Per-source yaw, depth weight, and base-view status. Debug paths are
+            included only when ``debug.save_debug`` is true.
 
         ``metadata`` : str
             Path to the JSON sidecar.
@@ -502,7 +517,8 @@ class FaceGeometryMap(NodeRef):
                 continue
 
             usable_source_paths.append(source_path)
-            usable_source_rgbs.append(source_rgb)
+            if cfg.save_debug:
+                usable_source_rgbs.append(source_rgb)
             source_landmarks.append(source_xyz)
             source_yaws.append(
                 _yaw_degrees_from_transform(source_transform)
@@ -529,7 +545,6 @@ class FaceGeometryMap(NodeRef):
         # Its rotation transfers target pose without changing source proportions.
         matrix = _estimate_landmark_similarity(fused_source_xyz, target_xyz)
         transformed_xyz = _transform_landmarks(fused_source_xyz, matrix)
-        transformed_xy = transformed_xyz[:, :2]
 
         # 5. Render exactly one primary conditioning map for the DAG output.
         # For processor output, first construct one coherent grayscale image.
@@ -569,31 +584,24 @@ class FaceGeometryMap(NodeRef):
             insert_mask,
             detail_gain=cfg.detail_gain,
         )
-        geometry_comparison = compare_face_masks(target_mask, insert_mask)
 
-        # Remove a meaningful margin around the target mesh so residual skin
-        # does not survive beneath the new face.
-        erase_radius = max(2, int(round(face_span * 0.05)))
-        erase_size = erase_radius * 2 + 1
-        erase_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (erase_size, erase_size),
+        # Erode only the destination contour by a fixed small offset. The
+        # original silhouette is passed unchanged; feathering controls alpha.
+        feather_radius = max(
+            MIN_FEATHER_RADIUS_PX,
+            int(round(face_span * FEATHER_RADIUS_FRACTION)),
         )
-        erase_mask = cv2.dilate(
-            target_mask.astype(np.uint8),
-            erase_kernel,
-        ) > 0
-        feather_radius = max(2, int(round(face_span * 0.025)))
         warped_gray, warp_displacement, warp_params = (
-            warp_face_luminance_background(
+            warp_face_background(
                 target_gray,
-                erase_mask,
+                target_mask,
                 insert_mask,
                 face_span=face_span,
-                feather_radius=feather_radius,
+                erosion_radius=INSERT_EROSION_RADIUS_PX,
+                collect_diagnostics=cfg.save_debug,
             )
         )
-        composed_gray, blend_alpha = composite_face_luminance(
+        composed_gray, blend_alpha = composite_face(
             warped_gray,
             synthetic_face,
             insert_mask,
@@ -601,85 +609,84 @@ class FaceGeometryMap(NodeRef):
         )
         composed_rgb = gray_to_rgb(composed_gray)
         output_map = _run_processor(composed_rgb, cfg)
-        luminance_debug = {
-            'target_gray': gray_to_rgb(target_gray),
-            'synthetic_face': gray_to_rgb(synthetic_face),
-            'warped_background': gray_to_rgb(warped_gray),
-            'composite': composed_rgb,
-            'processor': output_map,
-            'erase_mask': gray_to_rgb(
-                erase_mask.astype(np.uint8) * 255
-            ),
-            'target_mesh_mask': gray_to_rgb(
-                target_mask.astype(np.uint8) * 255
-            ),
-            'insert_mask': gray_to_rgb(
-                insert_mask.astype(np.uint8) * 255
-            ),
-            'blend_alpha': gray_to_rgb(
-                np.rint(blend_alpha * 255.0).astype(np.uint8)
-            ),
-            'warp_displacement': gray_to_rgb(
-                np.rint(
-                    warp_displacement
-                    / max(float(np.max(warp_displacement)), 1e-6)
-                    * 255.0
-                ).astype(np.uint8)
-            ),
-            'erase_radius': erase_radius,
-            'feather_radius': feather_radius,
-            'blur_sigma': blur_sigma,
-            'detail_gain': cfg.detail_gain,
-            'warp_params': warp_params,
-            'geometry_comparison': geometry_comparison,
-        }
 
-        target_debug = _draw_landmarks(
-            target_rgb,
-            target_xyz[:, :2],
-            color=(0, 255, 255),
-        )
-        geometry_alignment = draw_geometry_alignment(
-            target_rgb,
-            target_xyz[:, :2],
-            transformed_xy,
-            target_mask,
-            insert_mask,
-        )
-
-        # 6. Persist the primary output and collect every diagnostic image in a
-        # timestamped directory next to it.
+        # 6. Persist the primary output. Diagnostics are opt-in.
         out_path = make_node_output_path(
             out_dir=Path(output_dir),
             node_id=self.id,
             ext='png',
         )
-        debug_dir = out_path.with_name(out_path.stem + '_debug')
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        target_debug_path = debug_dir / 'target.png'
-        geometry_alignment_path = debug_dir / 'geometry_alignment.png'
-        source_result_path = debug_dir / 'source_result.png'
-        base_canvas = np.zeros_like(usable_source_rgbs[base_index])
-        source_result = _draw_landmarks(
-            base_canvas,
-            fused_source_xyz[:, :2],
-            color=(255, 255, 255),
-        )
-
         Image.fromarray(output_map).save(out_path)
-        Image.fromarray(target_debug).save(target_debug_path)
-        Image.fromarray(geometry_alignment).save(geometry_alignment_path)
-        Image.fromarray(source_result).save(source_result_path)
 
-        luminance_debug_paths = {}
-        if luminance_debug is not None:
+        if cfg.save_debug:
+            luminance_debug = {
+                'target_gray': gray_to_rgb(target_gray),
+                'synthetic_face': gray_to_rgb(synthetic_face),
+                'warped_background': gray_to_rgb(warped_gray),
+                'composite': composed_rgb,
+                'processor': output_map,
+                'target_mesh_mask': gray_to_rgb(
+                    target_mask.astype(np.uint8) * 255
+                ),
+                'insert_mask': gray_to_rgb(
+                    insert_mask.astype(np.uint8) * 255
+                ),
+                'blend_alpha': gray_to_rgb(
+                    np.rint(blend_alpha * 255.0).astype(np.uint8)
+                ),
+                'warp_displacement': gray_to_rgb(
+                    np.rint(
+                        warp_displacement
+                        / max(float(np.max(warp_displacement)), 1e-6)
+                        * 255.0
+                    ).astype(np.uint8)
+                ),
+                'erosion_radius': INSERT_EROSION_RADIUS_PX,
+                'feather_radius': feather_radius,
+                'blur_sigma': blur_sigma,
+                'detail_gain': cfg.detail_gain,
+                'warp_params': warp_params,
+                'geometry_comparison': compare_face_masks(
+                    target_mask, insert_mask,
+                ),
+            }
+
+            target_debug = _draw_landmarks(
+                target_rgb,
+                target_xyz[:, :2],
+                color=(0, 255, 255),
+            )
+            geometry_alignment = draw_geometry_alignment(
+                target_rgb,
+                target_xyz[:, :2],
+                transformed_xyz[:, :2],
+                target_mask,
+                insert_mask,
+            )
+
+            debug_dir = out_path.with_name(out_path.stem + '_debug')
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            target_debug_path = debug_dir / 'target.png'
+            geometry_alignment_path = debug_dir / 'geometry_alignment.png'
+            source_result_path = debug_dir / 'source_result.png'
+            base_canvas = np.zeros_like(usable_source_rgbs[base_index])
+            source_result = _draw_landmarks(
+                base_canvas,
+                fused_source_xyz[:, :2],
+                color=(255, 255, 255),
+            )
+
+            Image.fromarray(target_debug).save(target_debug_path)
+            Image.fromarray(geometry_alignment).save(geometry_alignment_path)
+            Image.fromarray(source_result).save(source_result_path)
+
+            luminance_debug_paths = {}
             debug_names = (
                 'target_gray',
                 'synthetic_face',
                 'warped_background',
                 'composite',
                 'processor',
-                'erase_mask',
                 'target_mesh_mask',
                 'insert_mask',
                 'blend_alpha',
@@ -691,46 +698,38 @@ class FaceGeometryMap(NodeRef):
                 Image.fromarray(luminance_debug[name]).save(debug_path)
                 luminance_debug_paths[name] = str(debug_path)
 
-        source_views = []
-        for index, (path, rgb, original_xyz, normalized_xyz, yaw, weight) in (
-            enumerate(zip(
-                usable_source_paths,
-                usable_source_rgbs,
-                source_landmarks,
-                normalized_sources,
-                source_yaws,
-                depth_weights,
-            ))
-        ):
-            source_number = index + 1
-            source_debug_path = debug_dir / f'source_{source_number}.png'
-            normalized_debug_path = (
-                debug_dir / f'source_{source_number}_norm.png'
-            )
-            source_debug = _draw_landmarks(
-                rgb,
-                original_xyz[:, :2],
-                color=(255, 255, 0),
-            )
-            normalized_debug = _draw_landmarks(
-                base_canvas,
-                normalized_xyz[:, :2],
-                color=(255, 255, 255),
-            )
-
-            Image.fromarray(source_debug).save(source_debug_path)
-            Image.fromarray(normalized_debug).save(normalized_debug_path)
-
-            source_views.append({
+        source_views = [
+            {
                 'image': str(path),
                 'yaw_degrees': yaw,
                 'depth_weight': weight,
                 'is_base': index == base_index,
-                'debug_image': str(source_debug_path),
-                'debug_normalized': str(normalized_debug_path),
-            })
-
-        base_debug_path = source_views[base_index]['debug_image']
+            }
+            for index, (path, yaw, weight) in enumerate(zip(
+                usable_source_paths, source_yaws, depth_weights,
+            ))
+        ]
+        if cfg.save_debug:
+            for index, (rgb, original_xyz, normalized_xyz) in enumerate(zip(
+                usable_source_rgbs, source_landmarks, normalized_sources,
+            )):
+                source_number = index + 1
+                source_debug_path = debug_dir / f'source_{source_number}.png'
+                normalized_debug_path = (
+                    debug_dir / f'source_{source_number}_norm.png'
+                )
+                source_debug = _draw_landmarks(
+                    rgb, original_xyz[:, :2], color=(255, 255, 0),
+                )
+                normalized_debug = _draw_landmarks(
+                    base_canvas, normalized_xyz[:, :2], color=(255, 255, 255),
+                )
+                Image.fromarray(source_debug).save(source_debug_path)
+                Image.fromarray(normalized_debug).save(normalized_debug_path)
+                source_views[index].update({
+                    'debug_image': str(source_debug_path),
+                    'debug_normalized': str(normalized_debug_path),
+                })
 
         out = {
             'ok': True,
@@ -740,17 +739,6 @@ class FaceGeometryMap(NodeRef):
             'source_images': [str(path) for path in usable_source_paths],
             'rejected_source_images': rejected_sources,
             'target_image': str(target_path),
-            'debug_directory': str(debug_dir),
-            'debug_source': base_debug_path,
-            'debug_source_result': str(source_result_path),
-            'debug_target': str(target_debug_path),
-            'debug_geometry_alignment': str(geometry_alignment_path),
-            'geometry_alignment_legend': {
-                'target_landmarks': 'cyan',
-                'synthetic_landmarks': 'magenta',
-                'target_contour': 'green',
-                'synthetic_contour': 'red',
-            },
             'transform': matrix.tolist(),
             'source_views': source_views,
             'model': {
@@ -765,9 +753,22 @@ class FaceGeometryMap(NodeRef):
             },
         }
 
-        if luminance_debug is not None:
+        if cfg.save_debug:
+            out.update({
+                'debug_directory': str(debug_dir),
+                'debug_source': source_views[base_index]['debug_image'],
+                'debug_source_result': str(source_result_path),
+                'debug_target': str(target_debug_path),
+                'debug_geometry_alignment': str(geometry_alignment_path),
+                'geometry_alignment_legend': {
+                    'target_landmarks': 'cyan',
+                    'synthetic_landmarks': 'magenta',
+                    'target_contour': 'green',
+                    'synthetic_contour': 'red',
+                },
+            })
             out['luminance_compositing'] = {
-                'erase_radius': luminance_debug['erase_radius'],
+                'erosion_radius': luminance_debug['erosion_radius'],
                 'feather_radius': luminance_debug['feather_radius'],
                 'blur_sigma': luminance_debug['blur_sigma'],
                 'detail_gain': luminance_debug['detail_gain'],

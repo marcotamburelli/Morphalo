@@ -1,0 +1,42 @@
+This directory contains code derived from the following project:
+
+3DDFA-V3
+https://github.com/wang-zidu/3DDFA-V3
+Upstream commit: e15385837dc1e051a6cf376b3827f2e279537b29 (2024-11-10)
+
+Copyright (c) 2024 Zidu Wang
+
+Licensed under the MIT License.
+The complete license text is available in this directory's LICENSE file.
+
+The copied components also include code attributed upstream to:
+- Deep3DFaceRecon_pytorch: https://github.com/sicxu/Deep3DFaceRecon_pytorch
+  See LICENSE.Deep3DFaceRecon for its MIT license and copyright notice.
+- torchvision: https://github.com/pytorch/vision
+  See LICENSE.torchvision for its BSD 3-Clause license and copyright notice.
+
+The code is used by Morphalo to reconstruct facial geometry and appearance
+parameters, transfer source identity to a target face, and produce rendered
+diagnostics and image-conditioning inputs.
+
+The code has been copied and modified to:
+- retain the ResNet-50 coefficient regressor from model/networks.py
+- separate morphable-model decoding from the renderer and demo in model/recon.py
+- retain five-point alignment and cropping from util/preprocess.py
+- accept MediaPipe landmarks and externally resolved model assets
+- remove unused training, recognition, detector, and rendering dependencies
+- support current NumPy and Pillow APIs while preserving model conventions
+- integrate inference with Morphalo's model cache and node workflow
+
+runtime.py is Morphalo's own implementation of the inference assembly needed
+by the application. It loads externally resolved local assets and coordinates
+the adapted components; it was not copied verbatim from an upstream file.
+Asset downloading and application-level model caching remain in Morphalo.
+
+These modifications are not part of the original project.
+See README.md for component-level provenance and integration details.
+
+Model weights and face-model assets are not included in this directory.
+They are resolved separately from the authors' Hugging Face dataset:
+https://huggingface.co/datasets/Zidu-Wang/3DDFA-V3/tree/main/assets
+The software licenses above do not relicense those external assets.

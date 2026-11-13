@@ -35,6 +35,7 @@ def test_read_cfg_requires_face_landmarker_task():
     assert cfg.face_landmarker_task == '~/models/face_landmarker.task'
     assert cfg.processor == 'canny'
     assert cfg.detail_gain == 0.0
+    assert cfg.save_debug is False
 
 
 def test_read_cfg_requires_supported_processor():
@@ -251,3 +252,85 @@ def test_single_source_fusion_preserves_the_base_geometry():
     assert weights == pytest.approx([25.0 / 60.0])
     np.testing.assert_array_equal(fused, source)
     np.testing.assert_array_equal(normalized[0], source)
+
+
+@pytest.mark.parametrize('save_debug', [None, False, True])
+def test_node_only_computes_and_saves_diagnostics_when_enabled(
+    tmp_path, monkeypatch, save_debug,
+):
+    import json
+    from pathlib import Path
+    from PIL import Image
+    from morphalo.dag import DAG
+    from morphalo.nodes.preprocess import face_geometry_map as module
+    from morphalo.nodes.vision import face_landmarks
+
+    landmarks = np.array(
+        [[16, 16, 0], [48, 16, 0], [48, 48, 0], [16, 48, 1]],
+        dtype=np.float32,
+    )
+    triangles = [(0, 1, 2), (0, 2, 3)]
+    monkeypatch.setattr(module, 'get_mediapipe_face_landmarker', lambda **kw: object())
+    monkeypatch.setattr(face_landmarks, 'mp_face_landmarks_xyz', lambda **kw: landmarks.copy())
+    monkeypatch.setattr(
+        face_landmarks, 'mp_face_landmarks_xyz_with_transform',
+        lambda **kw: (landmarks.copy(), np.eye(4)),
+    )
+    monkeypatch.setattr(
+        module, 'face_mesh_mask',
+        lambda shape, xy: face_mesh_mask(shape, xy, triangles=triangles),
+    )
+    monkeypatch.setattr(
+        module, 'draw_luminance_map',
+        lambda shape, xyz, values: draw_luminance_map(
+            shape, xyz, values, triangles=triangles,
+        ),
+    )
+    monkeypatch.setattr(module, '_run_processor', lambda rgb, cfg: rgb)
+    diagnostic_calls = []
+    for name in ('_draw_landmarks', 'draw_geometry_alignment', 'compare_face_masks'):
+        original = getattr(module, name)
+
+        def diagnostic(*args, _name=name, _original=original, **kwargs):
+            assert save_debug is True, f'{_name} ran with diagnostics disabled'
+            diagnostic_calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, diagnostic)
+
+    y, x = np.mgrid[:64, :64]
+    rgb = np.repeat((30 + x + y)[:, :, None], 3, axis=2).astype(np.uint8)
+    image_path = tmp_path / 'input.png'
+    Image.fromarray(rgb).save(image_path)
+    spec = {
+        'model': {'face_landmarker_task': 'unused.task'},
+        'params': {'processor': 'canny'},
+    }
+    if save_debug is not None:
+        spec['debug'] = {'save_debug': save_debug}
+    with DAG('geometry_debug_test', out_dir=tmp_path):
+        node = module.FaceGeometryMap(name='geometry', spec=spec)
+    out = node.run(tmp_path, input={
+        'default': {'image': str(image_path)},
+        'source': {'images': [str(image_path), str(image_path)]},
+    })
+    assert Path(out['image']).is_file()
+    card = json.loads(Path(out['metadata']).read_text())
+    assert len(card['source_views']) == 2
+    debug_dir = Path(out['image']).with_name(Path(out['image']).stem + '_debug')
+    if save_debug:
+        assert set(diagnostic_calls) == {
+            '_draw_landmarks', 'draw_geometry_alignment', 'compare_face_masks',
+        }
+        assert Path(card['debug_directory']) == debug_dir
+        assert len(list(debug_dir.glob('*.png'))) == 16
+        for view in card['source_views']:
+            assert Path(view['debug_image']).is_file()
+            assert Path(view['debug_normalized']).is_file()
+    else:
+        assert not diagnostic_calls
+        assert not debug_dir.exists()
+        assert 'luminance_compositing' not in card
+        assert not any(key.startswith('debug') for key in card)
+        assert all(not any(key.startswith('debug') for key in view)
+                   for view in card['source_views'])

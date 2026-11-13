@@ -2,6 +2,7 @@ from .any_crop import AnyCrop
 from .box_crop import BoxCrop
 from .color_driven_crop import ColorDrivenCrop
 from .face_geometry_map import FaceGeometryMap
+from .face_reconstruction import FaceReconstruction
 from .face_crop import FaceCrop
 from .fashn_segment_crop import FashnSegmentCrop
 from .image_layer_placement import ImageLayerPlacement
@@ -16,6 +17,7 @@ __all__ = [
     'BoxCrop',
     'ColorDrivenCrop',
     'FaceGeometryMap',
+    'FaceReconstruction',
     'FaceCrop',
     'FashnSegmentCrop',
     'ImageLayerPlacement',

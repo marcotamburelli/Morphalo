@@ -1,0 +1,625 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+from PIL import Image
+
+from morphalo.cache.models import (
+    get_face_reconstruction_model, get_mediapipe_face_landmarker,
+)
+from morphalo.core.cuda_mem import CudaPostRunMixin
+from morphalo.core.paths import make_node_output_path
+from morphalo.dag import AttachmentSink, NodeRef
+from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
+from morphalo.nodes.common.cuda_stat import cuda_mem_stats, cuda_prerun, cuda_sync
+from morphalo.nodes.common.device import is_cuda_device
+from morphalo.nodes.common.io import write_json_sidecar
+from morphalo.nodes.preprocess.utils.face_reconstruction_geometry import (
+    AlignedFace, align_reconstruction_face, compose_reconstructed_face,
+    reconstruction_to_image, render_reconstruction,
+    transfer_reconstruction_parameters,
+)
+from morphalo.nodes.sdxl_resolve import resolve_image_paths, resolve_single_image_path
+from morphalo.nodes.vision.face_landmarks import mp_face_landmarks_xyz
+from third_party.tddfa_v3.runtime import COEFFICIENT_SLICES
+
+
+ASSET_REPOSITORY = 'Zidu-Wang/3DDFA-V3'
+
+
+@dataclass(frozen=True)
+class Config:
+    """Resolved model, source-transfer, and diagnostic configuration."""
+
+    device: str
+    face_landmarker_task: str
+    repo_id: str
+    revision: str
+    preserve: tuple[str, ...]
+    save_debug: bool
+
+
+def _read_cfg(spec: dict, node_id: str) -> Config:
+    """
+    Validate reconstruction settings and mandatory parameter provenance.
+
+    Parameters
+    ----------
+    spec : dict
+        Resolved node specification.
+    node_id : str
+        Identifier included in configuration errors.
+
+    Returns
+    -------
+    Config
+        Source identity is implicit; only expression and albedo can be selected.
+
+    Raises
+    ------
+    ValueError
+        If configuration blocks or parameter selection are invalid.
+    """
+    model, params = spec.get('model', {}), spec.get('params', {})
+
+    if not isinstance(model, dict) or not isinstance(params, dict):
+        raise ValueError(f"'{node_id}': model and params must be objects")
+
+    task = model.get('face_landmarker_task')
+
+    if not isinstance(task, str) or not task:
+        raise ValueError(f"'{node_id}': model.face_landmarker_task required")
+
+    preserve = params.get('preserve', [])
+    allowed = {'expression', 'albedo'}
+
+    if (not isinstance(preserve, (list, tuple))
+            or not all(isinstance(value, str) for value in preserve)
+            or set(preserve) - allowed):
+        raise ValueError(
+            f"'{node_id}': params.preserve accepts only expression and albedo. "
+            'Identity always comes from source and is not configurable. '
+            'Pose, translation, and illumination always come from target.'
+        )
+
+    debug = spec.get('debug', {})
+
+    if not isinstance(debug, dict):
+        raise ValueError(f"'{node_id}': debug must be an object")
+
+    device = str(model.get('device', 'cpu'))
+
+    return Config(
+        device=device,
+        face_landmarker_task=task,
+        repo_id=str(model.get('id', ASSET_REPOSITORY)),
+        revision=str(model.get('revision', 'main')),
+        preserve=tuple(dict.fromkeys(preserve)),
+        save_debug=bool(debug.get('save_debug', False)),
+    )
+
+
+def _load_rgb(path: Path) -> np.ndarray:
+    """Load a filesystem image as an independent uint8 RGB array."""
+    with Image.open(path) as image:
+        return np.array(image.convert('RGB'))
+
+
+def _save_reconstruction(
+    debug_dir: Path,
+    prefix: str,
+    rgb: np.ndarray,
+    alignment: AlignedFace,
+    coefficients: np.ndarray,
+    decoded: dict,
+    triangles: np.ndarray,
+    raster: dict,
+    mapped: dict,
+) -> dict:
+    """
+    Save one reconstruction's visual and numeric diagnostics without rerendering.
+
+    Crop-space images show the network input, predicted-light color, and neutral
+    studio shading. The overlay and mask use the full original image frame so
+    alignment can be inspected. The NPZ archive retains coefficients, topology,
+    vertex attributes, and coordinate transforms for numerical investigation.
+    The caller invokes this helper only when debug output is enabled.
+
+    Parameters
+    ----------
+    debug_dir : pathlib.Path
+        Existing diagnostic directory.
+    prefix : str
+        Unique source/target/mixed artifact prefix.
+    rgb : numpy.ndarray
+        Original RGB image onto which the rendered crop is mapped.
+    alignment : AlignedFace
+        Input crop and original-image transforms.
+    coefficients : numpy.ndarray
+        Reconstruction parameters with shape ``(257,)``.
+    decoded : dict
+        Mesh and color data from the cached decoder.
+    triangles : numpy.ndarray
+        Shared mesh connectivity.
+    raster : dict
+        Color, neutral-shape, and mask renders in crop coordinates.
+    mapped : dict
+        Same renders mapped to the original image frame.
+
+    Returns
+    -------
+    dict
+        Diagnostic paths, alignment transforms, and coefficient groups.
+    """
+    overlay = rgb.copy()
+    overlay[mapped['mask']] = np.rint(
+        0.3 * rgb[mapped['mask']] + 0.7 * mapped['shape'][mapped['mask']],
+    ).astype(np.uint8)
+    images = {
+        'crop': alignment.rgb,
+        'render': raster['shape'],
+        'color': raster['color'],
+        'overlay': overlay,
+        'mask': mapped['mask'].astype(np.uint8) * 255,
+    }
+
+    paths = {}
+
+    for name, image in images.items():
+        path = debug_dir / f'{prefix}_{name}.png'
+        Image.fromarray(image).save(path)
+        paths[name] = str(path)
+
+    geometry = debug_dir / f'{prefix}_geometry.npz'
+    # Projected vertices use the model's 224-pixel crop coordinates, regardless
+    # of raster size. Add homogeneous coordinates to map them back to the image.
+    screen = np.column_stack((
+        decoded['screen_vertices'],
+        np.ones(len(decoded['screen_vertices'])),
+    ))
+    original_xy = (screen @ alignment.crop_to_image.T)[:, :2]
+
+    np.savez_compressed(
+        geometry,
+        coefficients=coefficients,
+        triangles=triangles,
+        canonical_vertices=decoded['canonical_vertices'],
+        camera_vertices=decoded['camera_vertices'],
+        screen_vertices=decoded['screen_vertices'],
+        original_xy=original_xy,
+        albedo=decoded['albedo'],
+        colors=decoded['colors'],
+        image_to_crop=alignment.image_to_crop,
+        crop_to_image=alignment.crop_to_image,
+    )
+
+    paths['geometry'] = str(geometry)
+
+    return {
+        'debug': paths,
+        'coefficients': {
+            name: coefficients[indices].tolist()
+            for name, indices in COEFFICIENT_SLICES.items()
+        },
+        'alignment': {
+            'image_to_crop': alignment.image_to_crop.tolist(),
+            'crop_to_image': alignment.crop_to_image.tolist(),
+            'landmarks_five': alignment.landmarks.tolist(),
+        },
+    }
+
+
+@dataclass
+class FaceReconstruction(CudaPostRunMixin, NodeRef):
+    """
+    Reconstruct and transfer source facial identity with 3DDFA-V3.
+
+    The default input supplies the target image. The ``source`` attachment
+    supplies one or more views of the same identity. MediaPipe supplies five
+    landmarks to the original 3DDFA-V3 alignment routine; a ResNet-50 regresses
+    the morphable-model parameters from its 224-by-224 RGB crop.
+
+    Identity geometry always comes from the arithmetic mean of source identity
+    coefficients. Rotation, translation, and spherical-harmonic illumination
+    always come from target. Expression and albedo default to target and may
+    optionally be selected from source. Diagnostic neutral renders use fixed
+    studio lighting; the transferred color render uses target illumination.
+
+    The output is an RGB reconstruction composite. Conditioning maps can be
+    produced by subsequent nodes. Skin microtexture remains the responsibility
+    of downstream identity-conditioned image generation.
+
+    Processing flow
+    ---------------
+    1. Align and reconstruct the target to obtain destination pose, placement,
+       illumination, and the original face silhouette.
+    2. Infer coefficients for each usable source view and average them in the
+       shared model basis. Transfer identity and optional source groups into
+       the target vector.
+    3. Render the mixed face in the target frame. Radially deform the original
+       silhouette beneath the eroded replacement silhouette and feather the
+       RGB render onto the warped background.
+    4. Save the composite and JSON card. When debug is enabled, also save
+       separate source, target, and mixed reconstructions with numeric geometry.
+
+    Parameters
+    ----------
+    name : str, optional
+        Unique node identifier within the DAG. Assigned by the enclosing DAG
+        when omitted.
+    spec : dict or str or pathlib.Path or sequence of these, optional
+        Node configuration resolved by ``resolve_spec``. Dictionaries and HOCON
+        paths may be supplied together in a sequence, merged from left to right.
+
+        Expected structure:
+
+        ``model`` : dict
+            ``face_landmarker_task`` : str
+                Required MediaPipe Face Landmarker task path.
+
+            ``device`` : str, optional
+                Torch device for coefficient inference and mesh decoding.
+                Default: ``'cpu'``. MediaPipe landmark detection runs on CPU.
+
+            ``id`` : str, optional
+                Asset dataset repository. Default: ``'Zidu-Wang/3DDFA-V3'``.
+                Alternatives must provide compatible files under ``assets/``.
+
+            ``revision`` : str, optional
+                Dataset revision. Default: ``'main'``.
+
+            External assets use the standard Hugging Face cache, normally
+            ``~/.cache/huggingface/hub``, as other Morphalo weights do.
+
+        ``params`` : dict, optional
+            ``preserve`` : list[str], optional
+                Additional source groups to transfer:
+
+                - ``'expression'``: facial deformation.
+                - ``'albedo'``: surface color before lighting.
+
+                Default: ``[]``. Identity is always transferred implicitly and
+                must not be listed. Pose, placement, and illumination always
+                remain those of the target.
+
+        ``debug`` : dict, optional
+            ``save_debug`` : bool, optional
+                Compute and save source renders and diagnostic images, geometry
+                archives, and coefficients. Default: ``False``. Target-mask and
+                transferred-color rendering are required in both modes.
+
+    Inputs
+    ------
+    default : dict
+        One target path under ``image`` or ``path``.
+    source : dict
+        Source paths under ``image``, ``images``, or ``path``. Undetected faces
+        are reported and skipped; execution fails if no source remains.
+
+    Outputs
+    -------
+    dict
+        Primary payload, also written to a JSON sidecar. Operational fields are
+        present independently of debug mode:
+
+        ``image``, ``composite`` : str
+            Two references to the same saved RGB composite.
+        ``source_images`` : list[str]
+            Source images whose detected faces contributed to the source mean.
+        ``source_views`` : list[dict]
+            Operational source records containing only each contributing image
+            path. Numeric and visual source diagnostics live under ``debug``.
+        ``rejected_source_images`` : list[dict]
+            Undetected source faces, with their image paths and failure reasons.
+        ``target_image`` : str
+            Resolved target image path.
+        ``parameter_origins`` : dict[str, str]
+            Whether each coefficient group comes from source mean or target.
+        ``model``, ``params`` : dict
+            Resolved model/assets, device, revision, and transfer configuration.
+        ``composition`` : dict
+            Applied destination-erosion and feathering radii in pixels.
+        ``timing`` : dict
+            ``seconds`` measures processing after model loading, including all
+            optional diagnostic renders and file writes. Writing the final JSON
+            sidecar itself is excluded.
+        ``cuda_mem`` : dict, optional
+            CUDA memory statistics in GB, using the same helpers as img2img.
+            Omitted on CPU.
+        ``metadata`` : str
+            Path to the JSON sidecar, added to the returned payload after writing.
+        ``debug`` : dict, optional
+            Present only with ``debug.save_debug=True``. Contains:
+
+            ``debug_directory`` : str
+                Directory containing the diagnostic PNG and NPZ files.
+            ``source_views``, ``target``, ``mixed`` : list[dict] or dict
+                Source/target/transferred reconstruction records, including
+                image paths where applicable, coefficients by group, alignment
+                transforms, and artifact paths in each record's ``debug`` field.
+                Neutral renders use fixed studio lighting; color renders use
+                each reconstruction's inferred lighting, with target lighting
+                for the mixed face.
+            ``mean_source_coefficients`` : dict[str, list[float]]
+                Averaged source groups, including pose/light groups retained
+                solely for diagnosis rather than transferred to the target.
+            ``warp`` : dict
+                Shared radial center, ray count, transition width, maximum
+                displacement, and minimum Jacobian; empty for an identity warp.
+
+    Notes
+    -----
+    All source views must depict the same person. Source coefficients are
+    averaged equally; target pose, translation, and lighting are never averaged
+    into that identity. Without debug, source meshes are neither decoded nor
+    rendered; the target mask and mixed color render remain necessary.
+
+    Composition requires the mask-union center inside both silhouettes,
+    including the eroded new face. Each ray uses the furthest original-boundary
+    hit and the nearest eroded-destination hit to contain the old silhouette
+    inside the replacement. Multiple intersections from concavities are allowed;
+    invalid placement or missing intersections still raise an error.
+
+    Examples
+    --------
+    Connect images using the standard target edge and source attachment::
+
+        target >> reconstruction
+        source_views >> reconstruction.source()
+
+    A minimal specification is::
+
+        {
+            'model': {
+                'face_landmarker_task': '~/models/mediapipe/face_landmarker.task',
+            },
+            'params': {'preserve': ['albedo']},
+        }
+    """
+
+    spec: SpecInput = field(default_factory=dict)
+
+    @property
+    def uses_cuda(self) -> bool:
+        """Return whether reconstruction uses CUDA."""
+        cfg = _read_cfg(resolve_spec(self.spec), self.id)
+        return is_cuda_device(cfg.device)
+
+    def source(self) -> AttachmentSink:
+        """
+        Declare the source-identity attachment, separate from the target input.
+
+        Connect one image or several views of the same person. Each detected
+        face supplies coefficients in the shared 3DDFA-V3 basis; their mean
+        determines identity and any additional groups selected in ``preserve``.
+        The default input supplies target pose, placement, and illumination.
+        Images with no detected source face are reported and skipped; at least
+        one usable source is required.
+
+        Examples
+        --------
+        Supply the target through the normal edge and source views through
+        this dedicated attachment::
+
+            target >> reconstruction
+            source_front >> reconstruction.source()
+            source_oblique >> reconstruction.source()
+
+        A FileImage node producing several image paths can supply all views::
+
+            source_images >> reconstruction.source()
+
+        Returns
+        -------
+        AttachmentSink
+            Source sink accepting one or more views of the same person.
+        """
+        return AttachmentSink(
+            name=f'source:{self.id}',
+            target=self,
+            input_id='source',
+        )
+
+    def run(self, output_dir: str | Path, input: Optional[dict] = None) -> dict:
+        cfg = _read_cfg(resolve_spec(self.spec), self.id)
+
+        target_path = resolve_single_image_path(
+            node_id=self.id,
+            path=None,
+            input=input,
+        )
+        sources = resolve_image_paths(
+            node_id=self.id,
+            path=None,
+            input=input,
+            input_key='source',
+        )
+
+        detector = get_mediapipe_face_landmarker(
+            model_asset_path=cfg.face_landmarker_task, device='cpu',
+        )
+        runtime = get_face_reconstruction_model(
+            device=cfg.device, repo_id=cfg.repo_id, revision=cfg.revision,
+        )
+
+        cuda_prerun(cfg.device)
+        t0 = time.perf_counter()
+
+        target_rgb = _load_rgb(target_path)
+        target_landmarks = mp_face_landmarks_xyz(
+            img_rgb=target_rgb, face_landmarker=detector,
+        )
+
+        out_path = make_node_output_path(
+            out_dir=Path(output_dir), node_id=self.id, ext='png',
+        )
+        debug_dir = out_path.with_name(out_path.stem + '_debug')
+
+        if cfg.save_debug:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+        # Only target visibility and transferred color are needed to compose.
+        # Neutral shading and all source geometry are diagnostic work.
+        target_fields = ('color', 'shape') if cfg.save_debug else ()
+
+        # The target provides pose, placement, lighting, and groups not selected
+        # from source. Its rendered silhouette also tells composition which
+        # original-face region must fit beneath the transferred face. Keep the
+        # crop transforms to map both meshes into this same full-image frame.
+        target_alignment = align_reconstruction_face(
+            target_rgb, target_landmarks, runtime.reference,
+        )
+        target_coefficients = runtime.infer(target_alignment.rgb)
+        target_decoded = runtime.decode(
+            target_coefficients, render_fields=target_fields,
+        )
+        target_raster = render_reconstruction(
+            target_decoded, runtime.triangles, render_fields=target_fields,
+        )
+        target_render = reconstruction_to_image(
+            target_raster, target_alignment, target_rgb.shape,
+        )
+        target_view = {'image': str(target_path)}
+
+        if cfg.save_debug:
+            target_view.update(_save_reconstruction(
+                debug_dir, 'target', target_rgb, target_alignment,
+                target_coefficients, target_decoded, runtime.triangles,
+                target_raster, target_render,
+            ))
+
+        coefficients, source_views, rejected = [], [], []
+        source_debug_views = []
+
+        # Every usable source contributes one coefficient vector to the mean.
+        # Detection failures are recorded without discarding the other views.
+        # Source geometry is unnecessary for transfer: decode/render/save it
+        # only for visual comparison when debug is enabled.
+        for path in sources:
+            rgb = _load_rgb(path)
+
+            try:
+                landmarks = mp_face_landmarks_xyz(
+                    img_rgb=rgb, face_landmarker=detector,
+                )
+            except RuntimeError as exc:
+                rejected.append({'image': str(path), 'reason': str(exc)})
+                continue
+
+            alignment = align_reconstruction_face(
+                rgb, landmarks, runtime.reference,
+            )
+
+            values = runtime.infer(alignment.rgb)
+            view = {'image': str(path)}
+
+            if cfg.save_debug:
+                decoded = runtime.decode(values)
+                raster = render_reconstruction(decoded, runtime.triangles)
+                mapped = reconstruction_to_image(raster, alignment, rgb.shape)
+                source_debug_views.append({
+                    **view,
+                    **_save_reconstruction(
+                        debug_dir, f'source_{len(source_views) + 1}', rgb, alignment,
+                        values, decoded, runtime.triangles, raster, mapped,
+                    ),
+                })
+            source_views.append(view)
+            coefficients.append(values)
+
+        if not coefficients:
+            raise RuntimeError(
+                f"FaceReconstruction node '{self.id}': no source face could be detected"
+            )
+
+        # Transfer groups in coefficient space, preserving target pose and
+        # lighting. Render the mixed vector using the target crop's camera frame.
+        mean, mixed = transfer_reconstruction_parameters(
+            coefficients, target_coefficients, cfg.preserve,
+        )
+
+        mixed_fields = ('color', 'shape') if cfg.save_debug else ('color',)
+        mixed_decoded = runtime.decode(mixed, render_fields=mixed_fields)
+
+        mixed_raster = render_reconstruction(
+            mixed_decoded, runtime.triangles, render_fields=mixed_fields,
+        )
+        mixed_render = reconstruction_to_image(
+            mixed_raster, target_alignment, target_rgb.shape,
+        )
+        composite, composition = compose_reconstructed_face(
+            target_rgb, target_render['mask'], mixed_render,
+            collect_diagnostics=cfg.save_debug,
+        )
+
+        Image.fromarray(composite).save(out_path)
+
+        # Warp statistics are diagnostic only; composition keeps its operational
+        # radii in both modes. All optional additions belong under one debug key.
+        warp_diagnostics = composition.pop('warp')
+        debug = {}
+        if cfg.save_debug:
+            debug = {
+                'debug': {
+                    'debug_directory': str(debug_dir),
+                    'source_views': source_debug_views,
+                    'target': target_view,
+                    'mixed': _save_reconstruction(
+                        debug_dir, 'mixed', target_rgb, target_alignment, mixed,
+                        mixed_decoded, runtime.triangles, mixed_raster, mixed_render,
+                    ),
+                    'warp': warp_diagnostics,
+                    'mean_source_coefficients': {
+                        name: mean[indices].tolist()
+                        for name, indices in COEFFICIENT_SLICES.items()
+                    },
+                }
+            }
+
+        # Stop after every diagnostic write, including the mixed NPZ/render.
+        # Synchronization makes elapsed time include pending CUDA work.
+        cuda_sync(cfg.device)
+        dt_s = time.perf_counter() - t0
+        mem = cuda_mem_stats(cfg.device)
+        cuda_mem = {}
+        if mem:
+            cuda_mem = {'cuda_mem': mem}
+
+        out = {
+            'ok': True,
+            'node': self.op,
+            'id': self.id,
+            'image': str(out_path),
+            'output_kind': 'reconstruction_composite',
+            'composite': str(out_path),
+            'target_image': str(target_path),
+            'source_images': [view['image'] for view in source_views],
+            'source_views': source_views,
+            'rejected_source_images': rejected,
+            'parameter_origins': {
+                name: (
+                    'source_mean'
+                    if name == 'identity' or name in cfg.preserve else 'target'
+                )
+                for name in COEFFICIENT_SLICES
+            },
+            'model': {
+                'id': cfg.repo_id,
+                'revision': cfg.revision,
+                'device': cfg.device,
+                'face_landmarker_task': cfg.face_landmarker_task,
+                'assets': {name: str(path) for name, path in runtime.assets.items()},
+            },
+            'params': {'preserve': list(cfg.preserve)},
+            'composition': composition,
+            'timing': {'seconds': round(dt_s, 3)},
+            **cuda_mem,
+            **debug,
+        }
+        out['metadata'] = str(write_json_sidecar(out_path, out))
+
+        return out

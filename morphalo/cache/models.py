@@ -86,6 +86,7 @@ def _resolve_single_file_checkpoint(checkpoint: Any) -> Optional[str]:
 
 
 if TYPE_CHECKING:
+    from third_party.tddfa_v3.runtime import FaceReconstructionRuntime
     from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
                            OmniGenPipeline, QwenImageControlNetInpaintPipeline,
                            QwenImageControlNetModel, QwenImageEditPipeline,
@@ -1319,6 +1320,79 @@ def get_face_swapper(*, model_name: str, device: str) -> FaceSwapperRuntime:
         mean=model['mean'],
         std=model['std'],
     )
+    return ModelCache.put(key, runtime)
+
+
+def resolve_reconstruction_assets(
+    *,
+    repo_id: str,
+    revision: str = 'main',
+) -> dict[str, Path]:
+    """
+    Resolve three required assets through the standard Hugging Face cache.
+
+    Parameters
+    ----------
+    repo_id : str
+        Dataset repository holding the external assets.
+    revision : str, optional
+        Hugging Face asset revision. Default: ``'main'``.
+
+    Returns
+    -------
+    dict[str, pathlib.Path]
+        Required asset paths keyed by filename.
+
+    Notes
+    -----
+    Cache location follows the same Hugging Face defaults and global environment
+    settings as other Morphalo weights, normally ``~/.cache/huggingface/hub``.
+    The node does not introduce a separate asset directory or cache override.
+    """
+    from huggingface_hub import hf_hub_download
+    from third_party.tddfa_v3.runtime import ASSET_FILENAMES
+
+    return {
+        name: Path(hf_hub_download(
+            repo_id=repo_id, repo_type='dataset', revision=revision,
+            filename=f'assets/{name}',
+        )) for name in ASSET_FILENAMES
+    }
+
+
+def get_face_reconstruction_model(
+    *, device: str = 'cpu',
+    repo_id: str, revision: str = 'main',
+) -> FaceReconstructionRuntime:
+    """
+    Load or reuse the official ResNet-50 reconstruction checkpoint and bases.
+
+    Parameters
+    ----------
+    device : str, optional
+        Torch inference device. Default: ``'cpu'``.
+    repo_id : str
+        Asset dataset repository.
+    revision : str, optional
+        Asset revision used when downloading.
+
+    Returns
+    -------
+    FaceReconstructionRuntime
+        Cached network, decoder, five-point reference, and triangulation.
+    """
+    from third_party.tddfa_v3.runtime import FaceReconstructionRuntime
+
+    paths = resolve_reconstruction_assets(repo_id=repo_id, revision=revision)
+    signature = '|'.join(
+        f'{path.resolve()}:{path.stat().st_size}:{path.stat().st_mtime_ns}'
+        for path in paths.values()
+    )
+    key = CacheKey('tddfa_v3', signature, str(device), 'float32')
+    cached = ModelCache.get(key)
+    if cached is not None:
+        return cached
+    runtime = FaceReconstructionRuntime(assets=paths, device=device)
     return ModelCache.put(key, runtime)
 
 
