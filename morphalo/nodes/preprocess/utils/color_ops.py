@@ -260,9 +260,16 @@ def match_lab_color_statistics(
     *,
     strength: float,
     eps: float = 1e-6,
+    statistics_mask: np.ndarray | None = None,
 ) -> Image.Image:
     """
     Match refined image color statistics to a target image in Lab space.
+
+    By default, both statistics and correction use the intersection of visible
+    source/reference alpha. ``statistics_mask`` can restrict estimation to a
+    reliable subset without limiting where the resulting correction is applied.
+    This lets a face sample only its common interior with the original target,
+    while all visible reconstructed-face pixels receive the same adjustment.
 
     Parameters
     ----------
@@ -277,6 +284,11 @@ def match_lab_color_statistics(
     eps : float, optional
         Small denominator guard used when a refined Lab channel has near-zero
         standard deviation.
+    statistics_mask : numpy.ndarray or None, optional
+        Boolean ``(H, W)`` sampling region, further intersected with visible
+        source/reference alpha. Default: None uses the full alpha intersection.
+        The correction is still applied over that full visible intersection.
+        If no samples remain, the original RGBA source is returned unchanged.
 
     Returns
     -------
@@ -286,7 +298,8 @@ def match_lab_color_statistics(
     Raises
     ------
     ValueError
-        If image sizes differ or ``strength`` is outside ``[0, 1]``.
+        If image sizes differ, the statistics mask shape is incompatible, or
+        ``strength`` is outside ``[0, 1]``.
     """
     strength = float(strength)
     if not 0.0 <= strength <= 1.0:
@@ -300,6 +313,12 @@ def match_lab_color_statistics(
             f'and {ref.size}'
         )
 
+    samples = None
+    if statistics_mask is not None:
+        samples = np.asarray(statistics_mask, dtype=bool)
+        if samples.shape != (src.height, src.width):
+            raise ValueError('statistics_mask must match image height and width')
+
     if strength == 0.0:
         return src
 
@@ -309,14 +328,15 @@ def match_lab_color_statistics(
     src_alpha = src_arr[..., 3:4]
     valid = src_alpha[..., 0] > 0.0
     valid &= ref_arr[..., 3] > 0.0
-    if not np.any(valid):
+    sampling = valid if samples is None else valid & samples
+    if not np.any(sampling):
         return src
 
     src_lab = rgb2lab(src_arr[..., :3] / 255.0).astype(np.float32)
     ref_lab = rgb2lab(ref_arr[..., :3] / 255.0).astype(np.float32)
 
-    src_samples = src_lab[valid]
-    ref_samples = ref_lab[valid]
+    src_samples = src_lab[sampling]
+    ref_samples = ref_lab[sampling]
     src_mean = src_samples.mean(axis=0)
     ref_mean = ref_samples.mean(axis=0)
     src_std = src_samples.std(axis=0)

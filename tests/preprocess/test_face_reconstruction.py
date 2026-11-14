@@ -31,6 +31,7 @@ def test_configuration_fixes_identity_pose_and_lighting_origins():
     model = {'face_landmarker_task': 'unused.task'}
     cfg = _read_cfg({'model': model}, 'reconstruction')
     assert cfg.preserve == ()
+    assert cfg.color_transfer == 0.
     assert cfg.save_debug is False
     assert cfg.repo_id == 'Zidu-Wang/3DDFA-V3'
     alternative = _read_cfg({'model': {**model, 'id': 'alternative/reconstruction'}}, 'reconstruction')
@@ -169,11 +170,12 @@ def test_assets_use_standard_hugging_face_cache_without_directory_overrides(monk
         assert call['revision'] == 'fixed-revision'
 
 
+@pytest.mark.parametrize('with_occlusion', [False, True])
 @pytest.mark.parametrize('save_debug', [None, False, True])
 @pytest.mark.parametrize('device', ['cpu', 'cuda:1'])
 @pytest.mark.parametrize('preserve', [[], ['albedo']])
 def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces(
-    tmp_path, monkeypatch, save_debug, device, preserve,
+    tmp_path, monkeypatch, save_debug, device, preserve, with_occlusion,
 ):
     import json
     from types import SimpleNamespace
@@ -255,13 +257,32 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
         path = tmp_path / f'{name}.png'
         Image.fromarray(np.full((200, 200, 3), value, np.uint8)).save(path)
         files.append(str(path))
-    with DAG('face_reconstruction_test', out_dir=tmp_path):
+    occlusion_path = tmp_path / 'occlusion.png'
+    occlusion = np.zeros((100, 100), np.uint8)
+    occlusion[60:] = 255
+    if with_occlusion:
+        Image.fromarray(occlusion).save(occlusion_path)
+    color_transfer = 0.35 if with_occlusion and not preserve else 0.
+    with DAG('face_reconstruction_test', out_dir=tmp_path) as dag:
         node = FaceReconstruction(name='reconstruct', spec={
             'model': {'face_landmarker_task': 'unused.task', 'device': device},
-            'params': {'preserve': preserve},
+            'params': {'preserve': preserve, 'color_transfer': color_transfer},
             **({'debug': {'save_debug': save_debug}} if save_debug is not None else {}),
         })
-    out = node.run(tmp_path, input={'default': {'image': files[0]}, 'source': {'images': files[1:]}})
+        if with_occlusion:
+            from morphalo.nodes import FileImage
+            occlusion_node = FileImage(name='occluder', path=str(occlusion_path))
+            occlusion_node >> node.occlusion()
+    if with_occlusion:
+        assert any(edge.node_from == 'occluder' and edge.node_to == 'reconstruct'
+                   and edge.input_id == 'occlusion' for edge in dag.edges)
+    payload = {'default': {'image': files[0]}, 'source': {'images': files[1:]}}
+    if with_occlusion:
+        payload['occlusion'] = {'image': str(occlusion_path)}
+    out = node.run(tmp_path, input=payload)
+    assert ('occlusion_image' in out) == with_occlusion
+    if with_occlusion:
+        assert out['occlusion_image'] == str(occlusion_path)
     assert remaining == []
     assert len(out['source_views']) == 2 and len(out['rejected_source_images']) == 1
     assert out['parameter_origins']['identity'] == 'source_mean'
@@ -272,7 +293,10 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
     assert out['timing']['seconds'] == (4. if save_debug else 0.)
     assert out.get('cuda_mem', {}) == memory
     assert ('cuda_mem' in out) == bool(memory)
-    assert out['params'] == {'preserve': preserve}
+    assert out['params'] == {'preserve': preserve, 'color_transfer': color_transfer}
+    if color_transfer:
+        assert out['composition']['color_transfer']['applied']
+        assert out['composition']['color_transfer']['sample_pixels'] > 0
     assert out['output_kind'] == 'reconstruction_composite'
     assert out['composite'] == out['image']
     mixed = observed_coefficients[-1]
@@ -304,7 +328,11 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
             with np.load(view['debug']['geometry']) as geometry:
                 assert geometry['coefficients'].shape == (257,)
         assert debug['mean_source_coefficients']['identity'] == [2.] * 80
-        assert len(list(debug_dir.glob('*.png'))) == 20
+        assert len(list(debug_dir.glob('*.png'))) == (21 if with_occlusion else 20)
+        if with_occlusion:
+            with Image.open(debug['occlusion_mask']) as mask_image:
+                expected_mask = np.repeat(np.repeat(occlusion, 2, axis=0), 2, axis=1)
+                np.testing.assert_array_equal(np.array(mask_image), expected_mask)
         assert len(list(debug_dir.glob('*.npz'))) == 4
     else:
         assert decoded_fields == [(), ('color',)]
@@ -318,14 +346,15 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
         assert image.size == (200, 200)
         assert image.mode == 'RGB'
         composite = np.array(image)
+    if with_occlusion:
+        np.testing.assert_array_equal(composite[120:], np.full((80, 200, 3), 30, np.uint8))
+        assert np.any(composite[:120] != 30)
     if save_debug:
         # The diagnostic path must produce exactly the same composite.
         node.spec = {**node.spec, 'debug': {'save_debug': False}}
         remaining.extend([target.copy(), first.copy(), second.copy()])
         statistics_calls.clear()
-        baseline = node.run(tmp_path / 'without_debug', input={
-            'default': {'image': files[0]}, 'source': {'images': files[1:]},
-        })
+        baseline = node.run(tmp_path / 'without_debug', input=payload)
         with Image.open(baseline['image']) as image:
             np.testing.assert_array_equal(composite, np.array(image))
     assert json.loads(Path(out['metadata']).read_text())['ok']
@@ -433,3 +462,34 @@ def test_reconstruction_cache_uses_resolved_assets_device_and_file_signature(tmp
     assert constructed[0] == {'assets': paths, 'device': 'cpu'}
     assert constructed[1]['device'] == 'cuda:1'
     assert all(isinstance(key, CacheKey) and key.kind == 'tddfa_v3' for key in cache)
+
+
+
+def test_occlusion_loader_resizes_by_nearest_neighbor_and_uses_white_as_protected(tmp_path):
+    from morphalo.nodes.preprocess.face_reconstruction import _load_occlusion
+
+    values = np.array([[0, 127], [128, 255]], np.uint8)
+    path = tmp_path / 'occlusion.png'
+    Image.fromarray(values).save(path)
+    actual = _load_occlusion(path, (4, 6, 3))
+    expected = np.repeat(np.repeat(values >= 128, 2, axis=0), 3, axis=1)
+    np.testing.assert_array_equal(actual, expected)
+
+
+
+@pytest.mark.parametrize('strength', [-0.1, 1.1, float('nan'), float('inf'), None, 'bad'])
+def test_configuration_rejects_invalid_color_transfer(strength):
+    with pytest.raises(ValueError, match='color_transfer'):
+        _read_cfg({
+            'model': {'face_landmarker_task': 'unused.task'},
+            'params': {'color_transfer': strength},
+        }, 'reconstruction')
+
+
+def test_color_transfer_requires_target_albedo():
+    model = {'face_landmarker_task': 'unused.task'}
+    with pytest.raises(ValueError, match='incompatible'):
+        _read_cfg({'model': model, 'params': {'preserve': ['albedo'], 'color_transfer': 0.5}}, 'reconstruction')
+    cfg = _read_cfg({'model': model, 'params': {'preserve': ['expression'], 'color_transfer': 0.5}}, 'reconstruction')
+    assert cfg.color_transfer == 0.5
+    assert _read_cfg({'model': model, 'params': {'preserve': ['albedo'], 'color_transfer': 0}}, 'reconstruction').color_transfer == 0

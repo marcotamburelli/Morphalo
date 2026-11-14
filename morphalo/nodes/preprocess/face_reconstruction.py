@@ -40,6 +40,7 @@ class Config:
     repo_id: str
     revision: str
     preserve: tuple[str, ...]
+    color_transfer: float
     save_debug: bool
 
 
@@ -86,6 +87,22 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             'Pose, translation, and illumination always come from target.'
         )
 
+    try:
+        color_transfer = float(params.get('color_transfer', 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{node_id}': params.color_transfer must be a number in [0, 1]"
+        ) from exc
+    if not np.isfinite(color_transfer) or not 0.0 <= color_transfer <= 1.0:
+        raise ValueError(
+            f"'{node_id}': params.color_transfer must be finite and in [0, 1]"
+        )
+    if color_transfer > 0.0 and 'albedo' in preserve:
+        raise ValueError(
+            f"'{node_id}': params.color_transfer > 0 is incompatible with "
+            "preserve=['albedo']; color matching requires target albedo"
+        )
+
     debug = spec.get('debug', {})
 
     if not isinstance(debug, dict):
@@ -99,6 +116,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         repo_id=str(model.get('id', ASSET_REPOSITORY)),
         revision=str(model.get('revision', 'main')),
         preserve=tuple(dict.fromkeys(preserve)),
+        color_transfer=color_transfer,
         save_debug=bool(debug.get('save_debug', False)),
     )
 
@@ -107,6 +125,33 @@ def _load_rgb(path: Path) -> np.ndarray:
     """Load a filesystem image as an independent uint8 RGB array."""
     with Image.open(path) as image:
         return np.array(image.convert('RGB'))
+
+
+def _load_occlusion(path: Path, shape: tuple) -> np.ndarray:
+    """
+    Load a target-space occlusion mask using white-as-protected semantics.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Grayscale or RGB mask image. Values >=128 are protected.
+    shape : tuple[int, ...]
+        Target shape beginning with height and width. Differing mask dimensions
+        are resized by nearest neighbor before thresholding.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean ``(H, W)`` protection mask in the original target frame.
+    """
+    with Image.open(path) as image:
+        mask = image.convert('L')
+        size = (shape[1], shape[0])
+
+        if mask.size != size:
+            mask = mask.resize(size, resample=Image.Resampling.NEAREST)
+
+        return np.asarray(mask) >= 128
 
 
 def _save_reconstruction(
@@ -240,7 +285,8 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
     2. Infer coefficients for each usable source view and average them in the
        shared model basis. Transfer identity and optional source groups into
        the target vector.
-    3. Render the mixed face in the target frame. Radially deform the original
+    3. Render the mixed face in the target frame and optionally match its colors
+       to reliable original-target face pixels. Radially deform the original
        silhouette beneath the eroded replacement silhouette and feather the
        RGB render onto the warped background.
     4. Save the composite and JSON card. When debug is enabled, also save
@@ -286,6 +332,19 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                 must not be listed. Pose, placement, and illumination always
                 remain those of the target.
 
+            ``color_transfer`` : float, optional
+                Strength of Lab-space statistical matching to the original
+                target face. Range: [0, 1]. Default: 0 disables matching.
+                Only compatible with target albedo: a positive value together
+                with ``preserve=['albedo']`` raises ValueError.
+
+                After rendering and before feathering, statistics are estimated
+                from the common interior of original and reconstructed masks,
+                excluding occlusion and a two-pixel boundary margin. Correction
+                is applied to the full visible render. No surviving samples
+                leaves the render unchanged. Raw mixed debug renders and decoded
+                vertex colors retain the model prediction for comparison.
+
         ``debug`` : dict, optional
             ``save_debug`` : bool, optional
                 Compute and save source renders and diagnostic images, geometry
@@ -299,6 +358,11 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
     source : dict
         Source paths under ``image``, ``images``, or ``path``. Undetected faces
         are reported and skipped; execution fails if no source remains.
+    occlusion : dict, optional
+        Target-space occlusion mask path under ``image`` or ``path``, connected
+        through :meth:`occlusion`. White protects original pixels and black
+        allows modification; grayscale values >=128 are protected. A different
+        mask size is resized to the target by nearest-neighbor sampling.
 
     Outputs
     -------
@@ -317,12 +381,15 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             Undetected source faces, with their image paths and failure reasons.
         ``target_image`` : str
             Resolved target image path.
+        ``occlusion_image`` : str, optional
+            Resolved input mask path, present only when an occlusion is wired.
         ``parameter_origins`` : dict[str, str]
             Whether each coefficient group comes from source mean or target.
         ``model``, ``params`` : dict
             Resolved model/assets, device, revision, and transfer configuration.
         ``composition`` : dict
-            Applied destination-erosion and feathering radii in pixels.
+            Applied destination-erosion and feathering radii in pixels. Enabled
+            color transfer also reports sample count and whether it was applied.
         ``timing`` : dict
             ``seconds`` measures processing after model loading, including all
             optional diagnostic renders and file writes. Writing the final JSON
@@ -349,7 +416,11 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                 solely for diagnosis rather than transferred to the target.
             ``warp`` : dict
                 Shared radial center, ray count, transition width, maximum
-                displacement, and minimum Jacobian; empty for an identity warp.
+                displacement, and minimum radial Jacobian; empty for an identity
+                warp. Includes blocked-ray count when an active occlusion exists.
+            ``occlusion_mask`` : str, optional
+                PNG of the resized binary mask actually used for protection.
+                Present only when an occlusion mask is connected.
 
     Notes
     -----
@@ -364,12 +435,24 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
     inside the replacement. Multiple intersections from concavities are allowed;
     invalid placement or missing intersections still raise an error.
 
+    An optional occlusion mask is applied after contour sampling and destination
+    erosion, leaving the full mesh masks available for geometric alignment. A
+    ray is blocked when either selected contour point is protected; adjacent
+    valid directions taper toward identity. The face is pasted outside the
+    protected region and original pixels are restored there afterward. This
+    preserves occluders such as clothes or shoulders without changing inferred
+    geometry. It does not prevent inverse sampling of occluder colors elsewhere.
+
     Examples
     --------
     Connect images using the standard target edge and source attachment::
 
         target >> reconstruction
         source_views >> reconstruction.source()
+
+    Optionally protect foreground occluders using a white-on-black mask::
+
+        occlusion_mask >> reconstruction.occlusion()
 
     A minimal specification is::
 
@@ -424,6 +507,71 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             input_id='source',
         )
 
+    def occlusion(self) -> AttachmentSink:
+        """
+        Declare an optional target-space mask of foreground occluders.
+
+        Use a segmentation of the actual target image to protect regions such
+        as clothes, shoulders, hands, or hair. White pixels (grayscale >=128)
+        preserve the corresponding original target pixels; black pixels permit
+        modification. The mask must share the target image's framing. Differing
+        dimensions are resized by nearest neighbor before thresholding.
+
+        The mask describes protected pixels, not an instruction to create an
+        occlusion. For example, an upper-body segmentation behaves as follows:
+
+        - If the body covers the chin in the target, its selected pixels remain
+          in front of the replacement face. The reconstructed chin cannot be
+          pasted over them: original body pixels are restored after blending.
+        - If the selected body region does not overlap the replacement face,
+          the face remains visible there. The body pixels are still protected;
+          the mask does not force the chin behind a body that is elsewhere.
+        - If a larger reconstructed face extends into the selected body region,
+          the body also covers that new overlap, according to the supplied mask.
+
+        Protection also matters near the face, outside the render's support.
+        The background warp may reach a nearby shoulder or clothing even when
+        it does not overlap the inserted face. Selected pixels remain unchanged
+        rather than being carried along by that deformation.
+
+        Geometric face masks remain complete for center and contour sampling.
+        After sampling, a ray uses identity deformation if either its selected
+        original point or its eroded-destination point lies in the occlusion.
+        Neighboring valid directions taper toward blocked ones. A protected
+        region away from those endpoints does not by itself block the entire
+        ray, but its own pixels are still preserved.
+
+        The face is blended only outside the protected region. Original target
+        pixels are then restored inside it after both warping and pasting, so
+        neither operation can overwrite the selected occluder. Full geometry is
+        still inferred; the mask limits visibility and deformation, not the mesh.
+
+        Notes
+        -----
+        This node uses the supplied mask directly; it does not classify selected
+        pixels as body versus face or infer depth ordering. Protection applies to
+        this node's composite, not automatically to downstream image generation.
+        Restoring an occluder does not prevent inverse sampling from carrying
+        some of its colors into other, unprotected pixels.
+
+        Examples
+        --------
+        Connect a FileImage or another mask-producing node::
+
+            foreground_mask >> reconstruction.occlusion()
+
+        Returns
+        -------
+        AttachmentSink
+            Sink bound to ``input_id='occlusion'``. Omit this connection to use
+            the normal unoccluded composition path.
+        """
+        return AttachmentSink(
+            name=f'occlusion:{self.id}',
+            target=self,
+            input_id='occlusion',
+        )
+
     def run(self, output_dir: str | Path, input: Optional[dict] = None) -> dict:
         cfg = _read_cfg(resolve_spec(self.spec), self.id)
 
@@ -439,6 +587,12 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             input_key='source',
         )
 
+        occlusion_path = None
+        if input is not None and input.get('occlusion') is not None:
+            occlusion_path = resolve_single_image_path(
+                node_id=self.id, path=None, input=input, input_key='occlusion',
+            )
+
         detector = get_mediapipe_face_landmarker(
             model_asset_path=cfg.face_landmarker_task, device='cpu',
         )
@@ -450,6 +604,10 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
         t0 = time.perf_counter()
 
         target_rgb = _load_rgb(target_path)
+        occlusion = (
+            _load_occlusion(occlusion_path, target_rgb.shape)
+            if occlusion_path is not None else None
+        )
         target_landmarks = mp_face_landmarks_xyz(
             img_rgb=target_rgb, face_landmarker=detector,
         )
@@ -553,6 +711,8 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
         )
         composite, composition = compose_reconstructed_face(
             target_rgb, target_render['mask'], mixed_render,
+            occlusion_mask=occlusion,
+            color_transfer=cfg.color_transfer,
             collect_diagnostics=cfg.save_debug,
         )
 
@@ -563,6 +723,14 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
         warp_diagnostics = composition.pop('warp')
         debug = {}
         if cfg.save_debug:
+            om = {}
+            if occlusion is not None:
+                occlusion_debug_path = debug_dir / 'occlusion_mask.png'
+                Image.fromarray(
+                    occlusion.astype(np.uint8) * 255
+                ).save(occlusion_debug_path)
+                om = {'occlusion_mask': str(occlusion_debug_path)}
+
             debug = {
                 'debug': {
                     'debug_directory': str(debug_dir),
@@ -577,6 +745,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                         name: mean[indices].tolist()
                         for name, indices in COEFFICIENT_SLICES.items()
                     },
+                    **om,
                 }
             }
 
@@ -614,8 +783,12 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                 'face_landmarker_task': cfg.face_landmarker_task,
                 'assets': {name: str(path) for name, path in runtime.assets.items()},
             },
-            'params': {'preserve': list(cfg.preserve)},
+            'params': {
+                'preserve': list(cfg.preserve),
+                'color_transfer': cfg.color_transfer,
+            },
             'composition': composition,
+            **({'occlusion_image': str(occlusion_path)} if occlusion_path is not None else {}),
             'timing': {'seconds': round(dt_s, 3)},
             **cuda_mem,
             **debug,

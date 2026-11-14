@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from third_party.tddfa_v3.runtime import COEFFICIENT_SLICES
+from morphalo.nodes.preprocess.utils.color_ops import match_lab_color_statistics
 from morphalo.nodes.preprocess.utils.face_compositing import (
     FEATHER_RADIUS_FRACTION, INSERT_EROSION_RADIUS_PX, MIN_FEATHER_RADIUS_PX,
     composite_face, warp_face_background,
@@ -24,6 +25,10 @@ from morphalo.nodes.preprocess.utils.face_compositing import (
 # Upstream alignment uses 224x224 inputs and focal length 1015 at center 112.
 # A 512-pixel diagnostic raster adds sampling resolution, not inferred detail.
 RENDER_SIZE = 512
+
+# Exclude raster-edge and occlusion-boundary pixels from color statistics.
+# This affects only the sampling region, never visibility or warp geometry.
+COLOR_TRANSFER_BORDER_RADIUS_PX = 2
 
 
 @dataclass(frozen=True)
@@ -129,11 +134,6 @@ def align_reconstruction_face(
         img=Image.fromarray(rgb),
         lm=upward,
         lm3D=reference,
-        # TODO: Consider mask for future segmentation-aware processing.
-        # It accepts an existing PIL mask and applies the same resize/crop,
-        # returning it as the fourth result. It neither creates a segmentation
-        # nor changes alignment or network inference. A future caller could
-        # use it to carry a face/occlusion mask into the aligned crop.
     )
     _, _, scale, tx, ty = parameters
 
@@ -434,6 +434,8 @@ def compose_reconstructed_face(
     original_mask: np.ndarray,
     inserted: dict[str, np.ndarray],
     *,
+    occlusion_mask: np.ndarray | None = None,
+    color_transfer: float = 0.0,
     collect_diagnostics: bool = True,
 ) -> tuple[np.ndarray, dict]:
     """
@@ -452,12 +454,26 @@ def compose_reconstructed_face(
     near its edge. A fixed contour beyond both silhouettes anchors a local,
     continuous transition to the unchanged surrounding image.
 
+    Optionally match the rendered colors to the unwarped original target in
+    Lab space before blending. Estimate mean/std only from the common interior
+    of both masks, excluding occlusion and a small boundary margin. Apply the
+    partial correction to the entire visible render, including areas outside
+    that sampling intersection. The caller must retain target albedo when this
+    option is enabled; source-albedo preservation is incompatible at node level.
+
     Blend the new face onto that warped background with a soft edge whose
     width is controlled separately by ``FEATHER_RADIUS_FRACTION`` and its pixel
     minimum. Changing feathering does not change the mask erosion. One
     deformation map and one alpha field are shared across the RGB channels.
+    An optional target-space occlusion mask blocks warp directions whose
+    sampled endpoints are hidden. Full geometric masks still determine the
+    center and contours; destination erosion precedes visibility clipping.
+    Paste the new face only outside occlusion, then restore the protected
+    original target pixels after composition, including its feathered edge.
+
     This operation deforms existing pixels; it does not generate new hair or
-    skin texture. Further image generation can refine the composite.
+    skin texture. Further image generation can refine the composite. Protecting
+    an occluder does not prevent its colors from being sampled elsewhere.
 
     Parameters
     ----------
@@ -467,6 +483,13 @@ def compose_reconstructed_face(
         Target reconstruction mask in the original image frame.
     inserted : dict[str, numpy.ndarray]
         Mixed reconstruction color and mask in that same frame.
+    occlusion_mask : numpy.ndarray or None, optional
+        Boolean ``(H, W)`` mask aligned with target; True protects original pixels.
+        Default: None. This limits visibility rather than changing inferred mesh.
+    color_transfer : float, optional
+        Lab mean/std matching strength in [0, 1]. Default: 0 disables matching.
+        Reference colors come from ``target`` before the background warp.
+        Empty sampling interiors leave the render unchanged.
     collect_diagnostics : bool, optional
         Compute displacement and Jacobian statistics. Default: ``True``.
 
@@ -476,7 +499,8 @@ def compose_reconstructed_face(
         RGB composite, suitable as conditioning input or reconstruction preview.
     dict
         Erosion/feather radii in pixels and warp diagnostics. ``warp`` is empty
-        when ``collect_diagnostics=False``.
+        when ``collect_diagnostics=False``. Enabled color transfer adds its
+        sample count and whether a correction was applied.
 
     Raises
     ------
@@ -484,8 +508,19 @@ def compose_reconstructed_face(
         If either reconstruction mask contains no visible face.
     ValueError
         If the shared center is outside either face mask after erosion, a mask
-        lacks a single valid external contour, or a ray has no intersection.
+        lacks a single valid external contour, a ray has no intersection, or
+        ``color_transfer`` is nonfinite or outside [0, 1].
     """
+    if not np.isfinite(color_transfer) or not 0.0 <= color_transfer <= 1.0:
+        raise ValueError('color_transfer must be finite and in [0, 1]')
+
+    occlusion = None
+    if occlusion_mask is not None:
+        occlusion = np.asarray(occlusion_mask, dtype=bool)
+        if occlusion.shape != target.shape[:2]:
+            raise ValueError(
+                'Occlusion mask must match the target height and width')
+
     insert_mask = inserted['mask']
     if not np.any(insert_mask) or not np.any(original_mask):
         raise RuntimeError('Reconstruction render contains no visible face')
@@ -507,17 +542,71 @@ def compose_reconstructed_face(
         insert_mask,
         face_span=span,
         erosion_radius=INSERT_EROSION_RADIUS_PX,
+        occlusion_mask=occlusion,
         collect_diagnostics=collect_diagnostics,
     )
+
+    visible_mask = insert_mask if occlusion is None else insert_mask & ~occlusion
+    face_color = inserted['color']
+    color_metadata = {}
+
+    if color_transfer > 0.0:
+        # Estimate using the unwarped original face, not the deformed corona
+        # (which can contain hair/clothing). Remove both raster boundaries and
+        # a margin near occluders, whose colors must not influence the match.
+        sampling = np.asarray(original_mask, dtype=bool) & visible_mask
+        margin = COLOR_TRANSFER_BORDER_RADIUS_PX
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * margin + 1, 2 * margin + 1),
+        )
+        sampling = cv2.erode(sampling.astype(np.uint8), kernel) > 0
+        sample_pixels = int(sampling.sum())
+
+        if sample_pixels:
+            # Limit Lab conversions to the visible-face bounding box. Alpha
+            # controls application; statistics_mask independently controls fitting.
+            ys, xs = np.nonzero(visible_mask)
+            region = (
+                slice(ys.min(), ys.max() + 1),
+                slice(xs.min(), xs.max() + 1),
+            )
+            rgba = np.dstack((
+                face_color[region],
+                visible_mask[region].astype(np.uint8) * 255,
+            ))
+            corrected = match_lab_color_statistics(
+                Image.fromarray(rgba),
+                Image.fromarray(target[region]),
+                strength=color_transfer,
+                statistics_mask=sampling[region],
+            )
+
+            face_color = face_color.copy()
+            face_color[region] = np.asarray(corrected.convert('RGB'))
+
+        color_metadata = {
+            'color_transfer': {
+                'applied': bool(sample_pixels),
+                'sample_pixels': sample_pixels,
+            },
+        }
+
     composed, _ = composite_face(
         warped,
-        inserted['color'],
-        insert_mask,
+        face_color,
+        visible_mask,
         feather_radius=feather_radius,
     )
+
+    if occlusion is not None:
+        # Restore after both background deformation and face blending: restoring
+        # before the paste would allow the rendered face to overwrite occluders.
+        composed[occlusion] = target[occlusion]
 
     return composed, {
         'erosion_radius': INSERT_EROSION_RADIUS_PX,
         'feather_radius': feather_radius,
         'warp': parameters,
+        **color_metadata,
     }

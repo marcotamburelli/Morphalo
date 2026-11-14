@@ -63,6 +63,7 @@ with DAG(
             'params': {
                 # Identity is automatic. Optionally preserve expression/albedo.
                 'preserve': [],
+                'color_transfer': 1.0,
             },
             'debug': {'save_debug': True},
         },

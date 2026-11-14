@@ -16,6 +16,11 @@ MIN_WARP_INFLUENCE_RADIUS_PX = 4
 RADIAL_SAMPLE_SPACING_PX = 1.0
 MIN_RADIAL_SAMPLE_COUNT = 64
 
+# Taper warp strength toward blocked angular directions over this arc length
+# at the furthest face contour. The blocked rays and their adjacent angular
+# intervals stay exactly at identity; tapering only affects nearby valid rays.
+OCCLUSION_TRANSITION_ARC_PX = 4.0
+
 # Fixed inward offset of the new silhouette, independent of face size and
 # blending. Increase only enough to hide residual original-face edge pixels.
 INSERT_EROSION_RADIUS_PX = 2
@@ -168,7 +173,8 @@ def _radial_mask_contour(mask: np.ndarray) -> np.ndarray:
         cv2.CHAIN_APPROX_SIMPLE,
     )
     if len(contours) != 1 or cv2.contourArea(contours[0]) <= 0:
-        raise ValueError('Radial face warp requires one nondegenerate silhouette per mask')
+        raise ValueError(
+            'Radial face warp requires one nondegenerate silhouette per mask')
     return contours[0].reshape(-1, 2).astype(np.float64)
 
 
@@ -226,7 +232,8 @@ def _radial_contour_radii(
         )
         # For a boundary segment collinear with the ray, choose the relevant
         # positive endpoint; the entire interval belongs to the boundary.
-        collinear = (np.abs(denominator) <= 1e-12) & (np.abs(start_side) <= 1e-9)
+        collinear = (np.abs(denominator) <=
+                     1e-12) & (np.abs(start_side) <= 1e-9)
         if np.any(collinear):
             start_projection = dx * starts[:, 0] + dy * starts[:, 1]
             end_projection = dx * ends[:, 0] + dy * ends[:, 1]
@@ -234,12 +241,15 @@ def _radial_contour_radii(
             if outermost:
                 projected = np.max(endpoints, axis=0)
             else:
-                projected = np.min(np.where(endpoints > 0, endpoints, np.inf), axis=0)
-            valid_collinear = collinear & (projected > 0) & np.isfinite(projected)
+                projected = np.min(
+                    np.where(endpoints > 0, endpoints, np.inf), axis=0)
+            valid_collinear = collinear & (
+                projected > 0) & np.isfinite(projected)
             distances = np.where(valid_collinear, projected, distances)
             hits |= valid_collinear
         if np.any(~np.any(hits, axis=1)):
-            raise ValueError('Radial face warp found a ray without a positive boundary intersection')
+            raise ValueError(
+                'Radial face warp found a ray without a positive boundary intersection')
 
         if outermost:
             selected = np.max(np.where(hits, distances, -np.inf), axis=1)
@@ -250,6 +260,74 @@ def _radial_contour_radii(
     return radii
 
 
+def _occlusion_ray_weights(
+    occlusion: np.ndarray,
+    center: np.ndarray,
+    angles: np.ndarray,
+    original_radii: np.ndarray,
+    inserted_radii: np.ndarray,
+    max_radius: float,
+) -> tuple[np.ndarray, int]:
+    """
+    Block occluded contour pairs and taper only their valid angular neighbors.
+
+    Parameters
+    ----------
+    occlusion : numpy.ndarray
+        Boolean target-space protection mask, with shape ``(H, W)``.
+    center : numpy.ndarray
+        Shared original/new silhouette center in image XY coordinates.
+    angles : numpy.ndarray
+        Sorted unique ray angles in [0, 2pi), sampled from the full silhouettes.
+    original_radii, inserted_radii : numpy.ndarray
+        Selected source and eroded-destination radii for each ray. Endpoints
+        are checked against occlusion using nearest-pixel coordinates.
+    max_radius : float
+        Furthest contour distance, converting the internal pixel arc width to
+        an angle for the transition near blocked directions.
+
+    Returns
+    -------
+    numpy.ndarray
+        Per-ray strength in [0, 1]. Blocked rays and adjacent sample intervals
+        stay at zero; valid neighbors gradually return to full warp strength.
+    int
+        Number of contour pairs directly blocked by occluded endpoints, before
+        expanding the zero-weight intervals for interpolation.
+    """
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    blocked = np.zeros(len(angles), dtype=bool)
+
+    for radii in (original_radii, inserted_radii):
+        points = np.rint(center + directions * radii[:, None]).astype(int)
+        points[:, 0] = np.clip(points[:, 0], 0, occlusion.shape[1] - 1)
+        points[:, 1] = np.clip(points[:, 1], 0, occlusion.shape[0] - 1)
+        blocked |= occlusion[points[:, 1], points[:, 0]]
+
+    count = int(blocked.sum())
+
+    if not count:
+        return np.ones(len(angles)), count
+
+    # Zero both ends of any interval touching a blocked ray. Otherwise angular
+    # interpolation between a blocked sample and a valid sample would revive
+    # displacement inside that excluded interval. Circular rolls handle 0/2pi.
+    zero = blocked | np.roll(blocked, 1) | np.roll(blocked, -1)
+    anchors = angles[zero]
+    wrapped = np.concatenate(
+        ([anchors[-1] - 2 * np.pi], anchors, [anchors[0] + 2 * np.pi])
+    )
+    indices = np.searchsorted(wrapped, angles, side='right')
+    distance = np.minimum(
+        angles - wrapped[indices - 1],
+        wrapped[indices] - angles
+    )
+    transition_angle = OCCLUSION_TRANSITION_ARC_PX / max_radius
+    weight = np.clip(distance / transition_angle, 0., 1.)
+
+    return weight * weight * (3. - 2. * weight), count
+
+
 def warp_face_background(
     image: np.ndarray,
     original_mask: np.ndarray,
@@ -257,6 +335,7 @@ def warp_face_background(
     *,
     face_span: float,
     erosion_radius: int = INSERT_EROSION_RADIUS_PX,
+    occlusion_mask: np.ndarray | None = None,
     collect_diagnostics: bool = True,
 ) -> tuple[np.ndarray, np.ndarray | None, dict[str, float | int]]:
     """
@@ -287,6 +366,13 @@ def warp_face_background(
     preserving narrow raster tips. Radii are interpolated periodically between
     sampled angles. Radial mappings are strictly increasing: neither contraction nor expansion reverses their
     order. No later Gaussian smoothing changes the boundary correspondence.
+    With an occlusion mask, sample both contours before checking occlusion.
+    A protected endpoint blocks the entire ray. Blocked directions retain the
+    identity map; nearby valid directions taper toward them. The center and
+    silhouette geometry are never recomputed from occlusion-cut masks. Protected
+    pixels are kept unchanged here; callers must also restore them after pasting
+    the face. Inverse sampling can still carry occluder colors into other pixels.
+
     Beyond C, pixels remain unchanged. RGB channels share one remap; no color
     conversion is performed. Boundary accuracy is limited by mask rasterization,
     angular sampling, and image interpolation.
@@ -309,6 +395,10 @@ def warp_face_background(
         Fixed insertion-mask erosion radius in pixels, independent of feathering.
         Default: ``INSERT_EROSION_RADIUS_PX`` (2 pixels). Erosion must leave
         the shared center inside the destination silhouette.
+    occlusion_mask : numpy.ndarray or None, optional
+        Boolean ``(H, W)`` target-space mask; True protects a pixel. Default: None.
+        Either occluded sampled endpoint invalidates its direction. Transition
+        width is controlled internally by ``OCCLUSION_TRANSITION_ARC_PX``.
     collect_diagnostics : bool, optional
         Return displacement magnitudes and radial Jacobian statistics.
         Default: ``True``. Disabling diagnostics does not change output pixels.
@@ -321,7 +411,10 @@ def warp_face_background(
         Displacement magnitude in pixels, shape ``(H, W)``, or None when disabled.
     dict[str, float | int]
         Shared center, ray count, transition width, maximum displacement, and
-        minimum analytic Jacobian. Empty when disabled or the warp is identity.
+        minimum analytic radial Jacobian. With an active occlusion mask, also
+        includes the blocked-ray count. The Jacobian describes the radial map
+        outside protected pixels, not the boundary of their restoration.
+        Empty when disabled or the warp is identity.
 
     Raises
     ------
@@ -335,6 +428,17 @@ def warp_face_background(
     image = np.asarray(image, dtype=np.uint8)
     original = np.asarray(original_mask, dtype=bool)
     insert = np.asarray(insert_mask, dtype=bool)
+
+    occlusion = None
+    if occlusion_mask is not None:
+        occlusion = np.asarray(occlusion_mask, dtype=bool)
+
+        if occlusion.shape != image.shape[:2]:
+            raise ValueError(
+                'Occlusion mask must match the image height and width')
+
+        if not np.any(occlusion):
+            occlusion = None
 
     if image.ndim != 2 and (image.ndim != 3 or image.shape[2] != 3):
         raise ValueError('Image must have shape (H, W) or (H, W, 3)')
@@ -356,7 +460,8 @@ def warp_face_background(
         inner = cv2.erode(insert.astype(np.uint8), kernel) > 0
 
     if not np.any(inner):
-        raise ValueError('Eroded insertion mask is empty; shared center cannot lie inside it')
+        raise ValueError(
+            'Eroded insertion mask is empty; shared center cannot lie inside it')
 
     contours = [_radial_mask_contour(mask) for mask in (original, inner)]
     center_x, center_y = np.rint(center).astype(int)
@@ -371,13 +476,15 @@ def warp_face_background(
 
     if np.array_equal(original, inner):
         displacement = (
-            np.zeros(original.shape, dtype=np.float32) if collect_diagnostics else None
+            np.zeros(original.shape,
+                     dtype=np.float32) if collect_diagnostics else None
         )
         return image.copy(), displacement, {}
 
     # Bound angular sample spacing at the furthest silhouette point, then pair
     # both boundaries at exactly the same angles rather than by arc length.
-    max_radius = max(np.linalg.norm(contour - center, axis=1).max() for contour in contours)
+    max_radius = max(np.linalg.norm(contour - center, axis=1).max()
+                     for contour in contours)
     ray_count = max(
         MIN_RADIAL_SAMPLE_COUNT,
         int(np.ceil(2 * np.pi * max_radius / RADIAL_SAMPLE_SPACING_PX)),
@@ -390,7 +497,8 @@ def warp_face_background(
     # can miss a narrow raster tip and underestimate the original silhouette.
     # These extra samples preserve narrow extrema between uniform rays.
     vertex_angles = [
-        np.mod(np.arctan2((contour - center)[:, 1], (contour - center)[:, 0]), 2 * np.pi)
+        np.mod(np.arctan2((contour - center)
+               [:, 1], (contour - center)[:, 0]), 2 * np.pi)
         for contour in contours
     ]
     angles = np.unique(np.concatenate([uniform_angles, *vertex_angles]))
@@ -403,6 +511,14 @@ def warp_face_background(
     inserted_radii = _radial_contour_radii(
         contours[1], center, angles, outermost=False,
     )
+
+    ray_weights = None
+    blocked_ray_count = 0
+    if occlusion is not None:
+        ray_weights, blocked_ray_count = _occlusion_ray_weights(
+            occlusion, center, angles, original_radii, inserted_radii, max_radius,
+        )
+
     influence_radius = max(
         MIN_WARP_INFLUENCE_RADIUS_PX,
         int(round(face_span * WARP_INFLUENCE_FRACTION)),
@@ -417,20 +533,33 @@ def warp_face_background(
     relative_y = grid_y - center[1]
     radius = np.hypot(relative_x, relative_y)
     theta = np.arctan2(relative_y, relative_x)
-    original_radius = np.interp(theta, angles, original_radii, period=2 * np.pi)
-    inserted_radius = np.interp(theta, angles, inserted_radii, period=2 * np.pi)
-    fixed_radius = np.maximum(original_radius, inserted_radius) + influence_radius
+    original_radius = np.interp(
+        theta, angles, original_radii, period=2 * np.pi)
+    inserted_radius = np.interp(
+        theta, angles, inserted_radii, period=2 * np.pi)
+    fixed_radius = np.maximum(
+        original_radius, inserted_radius) + influence_radius
 
     # Inverse radial correspondence: output B samples input A, output C samples
     # C. Because C > max(A, B), the annular slope (C-A)/(C-B) stays positive.
     inside = radius <= inserted_radius
     active = radius < fixed_radius
-    annular_slope = (fixed_radius - original_radius) / (fixed_radius - inserted_radius)
+    annular_slope = (fixed_radius - original_radius) / \
+        (fixed_radius - inserted_radius)
     source_radius = np.where(
         inside,
         radius * original_radius / inserted_radius,
         original_radius + (radius - inserted_radius) * annular_slope,
     )
+    angular_weight = None
+
+    if ray_weights is not None:
+        angular_weight = np.interp(
+            theta, angles, ray_weights, period=2 * np.pi)
+        source_radius = radius + angular_weight * (source_radius - radius)
+        active &= angular_weight > 0
+        active &= ~occlusion[min_y:max_y, min_x:max_x]
+
     source_radius = np.where(active, source_radius, radius)
     scale = np.divide(
         source_radius, radius,
@@ -454,15 +583,21 @@ def warp_face_background(
     displacement[min_y:max_y, min_x:max_x] = np.abs(source_radius - radius)
     # A radial map preserves angle. Its determinant is (source_radius/radius)
     # times the radial derivative, including the center's scale-squared limit.
-    derivative = np.where(inside, original_radius / inserted_radius, annular_slope)
+    derivative = np.where(inside, original_radius /
+                          inserted_radius, annular_slope)
+    if angular_weight is not None:
+        derivative = 1. + angular_weight * (derivative - 1.)
+
     jacobian = scale * derivative
+
     return result, displacement, {
         'center_x': float(center[0]),
         'center_y': float(center[1]),
         'ray_count': ray_count,
         'influence_radius': influence_radius,
         'max_displacement': float(displacement.max()),
-        'min_jacobian': float(jacobian[active].min()),
+        'min_jacobian': float(jacobian[active].min()) if np.any(active) else 1.,
+        **({'blocked_ray_count': blocked_ray_count} if occlusion is not None else {}),
     }
 
 

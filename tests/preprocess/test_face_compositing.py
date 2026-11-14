@@ -376,3 +376,149 @@ def test_radial_intersections_include_collinear_boundary_endpoints():
     outer = _radial_contour_radii(contour, np.zeros(2), np.array([0.]), outermost=True)
     np.testing.assert_allclose(inner, [8.])
     np.testing.assert_allclose(outer, [10.])
+
+
+@pytest.mark.parametrize('protected_columns', [(94, 100), (84, 89)])
+def test_occluded_endpoint_blocks_whole_ray_and_preserves_valid_directions(protected_columns):
+    y, x = np.mgrid[:128, :128]
+    image = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    inserted = (x - 64) ** 2 + (y - 64) ** 2 <= 22 ** 2
+    occlusion = np.zeros(original.shape, bool)
+    occlusion[:, slice(*protected_columns)] = True
+    warped, displacement, statistics = warp_face_background(
+        image, original, inserted, face_span=64., erosion_radius=0,
+        occlusion_mask=occlusion,
+    )
+    assert 0 < statistics['blocked_ray_count'] < statistics['ray_count']
+    # The +X contour pair is blocked by either its source or destination point.
+    # Pixels on that ray outside the protected stripe must also stay unchanged.
+    np.testing.assert_array_equal(warped[64, 70:84], image[64, 70:84])
+    assert not np.any(displacement[64, 70:84])
+    assert displacement[64, 40] > 0
+    assert not np.array_equal(warped[64, 40], image[64, 40])
+    np.testing.assert_array_equal(warped[occlusion], image[occlusion])
+    assert not np.any(displacement[occlusion])
+    # +X is also the circular angular seam; both sides of 0/2pi stay blocked.
+    np.testing.assert_array_equal(warped[63:66, 78:83], image[63:66, 78:83])
+
+
+def test_reconstruction_restores_occluders_after_blending_and_keeps_full_geometry(monkeypatch):
+    from morphalo.nodes.preprocess.utils import face_reconstruction_geometry as geometry
+
+    y, x = np.mgrid[:128, :128]
+    image = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
+    before = image.copy()
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    inserted = (x - 64) ** 2 + (y - 64) ** 2 <= 22 ** 2
+    # Includes the center: cutting geometric masks first would invalidate it.
+    occlusion = y >= 64
+    actual_warp = geometry.warp_face_background
+    calls = []
+
+    def warp(target, old_mask, new_mask, **kwargs):
+        assert old_mask is original and new_mask is inserted
+        return actual_warp(target, old_mask, new_mask, **kwargs)
+
+    def blend(background, face, visible_mask, **kwargs):
+        assert not np.any(visible_mask[occlusion])
+        calls.append(True)
+        # Deliberately overwrite protected pixels: final restoration must happen
+        # after this call, even though the visible mask is already clipped.
+        return np.zeros_like(background), np.zeros(original.shape, np.float32)
+
+    monkeypatch.setattr(geometry, 'warp_face_background', warp)
+    monkeypatch.setattr(geometry, 'composite_face', blend)
+    result, _ = geometry.compose_reconstructed_face(
+        image, original, {'mask': inserted, 'color': np.full_like(image, 200)},
+        occlusion_mask=occlusion,
+    )
+    assert calls
+    np.testing.assert_array_equal(result[occlusion], before[occlusion])
+    assert not np.any(result[~occlusion])
+    np.testing.assert_array_equal(image, before)
+
+
+@pytest.mark.parametrize('fully_occluded', [False, True])
+def test_reconstruction_empty_and_full_occlusion_masks(fully_occluded):
+    from morphalo.nodes.preprocess.utils.face_reconstruction_geometry import compose_reconstructed_face
+
+    y, x = np.mgrid[:128, :128]
+    image = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    inserted = {'mask': (x - 64) ** 2 + (y - 64) ** 2 <= 22 ** 2,
+                'color': np.full_like(image, 200)}
+    baseline, metadata = compose_reconstructed_face(image, original, inserted)
+    occlusion = np.full(original.shape, fully_occluded, bool)
+    result, masked_metadata = compose_reconstructed_face(
+        image, original, inserted, occlusion_mask=occlusion,
+    )
+    if fully_occluded:
+        np.testing.assert_array_equal(result, image)
+        stats = masked_metadata['warp']
+        assert stats['blocked_ray_count'] == stats['ray_count']
+        assert stats['max_displacement'] == 0
+        assert stats['min_jacobian'] == 1
+    else:
+        np.testing.assert_array_equal(result, baseline)
+        assert masked_metadata == metadata
+    plain, _ = compose_reconstructed_face(
+        image, original, inserted, occlusion_mask=occlusion, collect_diagnostics=False,
+    )
+    np.testing.assert_array_equal(plain, result)
+
+
+def test_occlusion_mask_shape_is_validated():
+    from morphalo.nodes.preprocess.utils.face_reconstruction_geometry import compose_reconstructed_face
+
+    image = np.zeros((32, 32, 3), np.uint8)
+    mask = np.ones((32, 32), bool)
+    invalid = np.ones((16, 16), bool)
+    with pytest.raises(ValueError, match='Occlusion mask'):
+        warp_face_background(image, mask, mask, face_span=32., occlusion_mask=invalid)
+    with pytest.raises(ValueError, match='Occlusion mask'):
+        compose_reconstructed_face(image, mask, {'mask': mask, 'color': image}, occlusion_mask=invalid)
+
+
+def test_face_color_transfer_ignores_mask_borders_and_occluder_colors():
+    from morphalo.nodes.preprocess.utils import face_reconstruction_geometry as geometry
+
+    y, x = np.mgrid[:128, :128]
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 35 ** 2
+    inserted = (x - 69) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    protected = (x >= 60) & (x <= 65) & (y >= 70)
+    visible = inserted & ~protected
+    sampling = original & visible
+    size = 2 * geometry.COLOR_TRANSFER_BORDER_RADIUS_PX + 1
+    sampling = cv2.erode(sampling.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))) > 0
+    target = np.full((128, 128, 3), [80, 90, 100], np.uint8)
+    face = {'mask': inserted, 'color': np.full_like(target, [170, 130, 110])}
+    before = face['color'].copy()
+    clean, info = geometry.compose_reconstructed_face(target, original, face, occlusion_mask=protected, color_transfer=1.)
+    contaminated = target.copy()
+    contaminated[~sampling] = [250, 0, 240]
+    actual, _ = geometry.compose_reconstructed_face(contaminated, original, face, occlusion_mask=protected, color_transfer=1.)
+    # Well inside the pasted region, alpha is one: the original target border
+    # and occluder colors must have no effect on the corrected render.
+    core = cv2.erode(visible.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    assert np.any(core)
+    np.testing.assert_array_equal(actual[core], clean[core])
+    np.testing.assert_allclose(clean[core], np.broadcast_to([80, 90, 100], clean[core].shape), atol=1)
+    np.testing.assert_array_equal(actual[protected], contaminated[protected])
+    np.testing.assert_array_equal(face['color'], before)
+    assert info['color_transfer'] == {'applied': True, 'sample_pixels': int(sampling.sum())}
+
+
+def test_face_color_transfer_without_common_visible_samples_leaves_render_unchanged():
+    from morphalo.nodes.preprocess.utils.face_reconstruction_geometry import compose_reconstructed_face
+
+    y, x = np.mgrid[:128, :128]
+    original = (x - 60) ** 2 + (y - 64) ** 2 <= 30 ** 2
+    inserted = (x - 66) ** 2 + (y - 64) ** 2 <= 30 ** 2
+    protected = original & inserted
+    target = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
+    face = {'mask': inserted, 'color': np.full_like(target, 180)}
+    expected, _ = compose_reconstructed_face(target, original, face, occlusion_mask=protected)
+    actual, metadata = compose_reconstructed_face(target, original, face, occlusion_mask=protected, color_transfer=1.)
+    np.testing.assert_array_equal(actual, expected)
+    assert metadata['color_transfer'] == {'applied': False, 'sample_pixels': 0}

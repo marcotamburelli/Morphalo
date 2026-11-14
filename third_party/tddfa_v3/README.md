@@ -58,6 +58,14 @@ option. Rotation, translation, and illumination always
 come from target. Neutral debug renders use the original studio lights and
 are distinct from the target-lit color render used for composition.
 
+With target albedo, `params.color_transfer` can optionally match rendered Lab
+color statistics to the original target before feathering (range [0, 1], default
+0). Sampling uses the common mask interior, excludes occlusion and a two-pixel
+boundary margin, and reads the unwarped target. The resulting partial correction
+applies to all visible reconstructed-face pixels. Empty sample regions leave
+the render unchanged. Positive transfer with `preserve: ['albedo']` is rejected.
+Raw debug renders and decoded coefficients remain unmodified model outputs.
+
 The node always returns an RGB composite. Conditioning maps belong to subsequent
 nodes. Diagnostics are disabled by default; `debug.save_debug: true` enables
 source/target/mixed renders, overlays, coefficients, and compressed geometry
@@ -69,6 +77,15 @@ model loading and includes every optional diagnostic file write. Diagnostic
 records (source/target/mixed renders, coefficient groups, geometry paths, and
 warp statistics) are grouped under the JSON card's optional `debug` key.
 Operational source records and composition radii remain present in both modes.
+
+An optional `foreground_mask >> reconstruction.occlusion()` attachment protects
+foreground objects in target coordinates. White pixels are protected (threshold
+128); differing mask dimensions use nearest-neighbor resizing. Full geometric
+masks and erosion are computed before occlusion filtering. Sampled rays with an
+occluded endpoint use identity deformation, with a local angular transition in
+neighboring valid directions. The render is blended outside occlusion and
+protected original pixels are restored after blending. This does not change
+inference or prevent occluder colors from being sampled elsewhere by the warp.
 
 ## External assets
 
