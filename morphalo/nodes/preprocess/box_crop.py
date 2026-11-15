@@ -40,7 +40,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         for name in ('dilate_radius', 'close_radius', 'smoothing_radius')
     }
     for name, value in mask_params.items():
-        if value < 0:
+        if name != 'dilate_radius' and value < 0:
             raise ValueError(f"'{node_id}': {name} must be >= 0, got {value}")
 
     bbox_format = str(params.get('bbox_format', 'xyxy')).lower()
@@ -326,8 +326,11 @@ class BoxCrop(NodeRef):
                 is not resized. This option does not affect ``params.bbox``.
 
             ``dilate_radius`` : int, optional
-                Non-negative dilation radius in pixels for mask outputs.
-                Default: ``0``. Expands the selected rectangle before inversion.
+                Positive values dilate; negative values erode using the absolute
+                radius in pixels. Zero disables this step. Applied after closing
+                and before smoothing and any negative-mask inversion.
+
+                Used only for mask outputs. Default: ``0``.
 
             ``close_radius`` : int, optional
                 Non-negative morphological closing radius in pixels for mask

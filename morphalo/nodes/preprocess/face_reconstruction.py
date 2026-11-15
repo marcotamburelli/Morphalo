@@ -41,6 +41,7 @@ class Config:
     revision: str
     preserve: tuple[str, ...]
     color_transfer: float
+    occlusion_threshold: float
     save_debug: bool
 
 
@@ -103,6 +104,17 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             "preserve=['albedo']; color matching requires target albedo"
         )
 
+    try:
+        occlusion_threshold = float(params.get('occlusion_threshold', 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{node_id}': params.occlusion_threshold must be a number in [0, 1]"
+        ) from exc
+    if not np.isfinite(occlusion_threshold) or not 0.0 <= occlusion_threshold <= 1.0:
+        raise ValueError(
+            f"'{node_id}': params.occlusion_threshold must be finite and in [0, 1]"
+        )
+
     debug = spec.get('debug', {})
 
     if not isinstance(debug, dict):
@@ -117,6 +129,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         revision=str(model.get('revision', 'main')),
         preserve=tuple(dict.fromkeys(preserve)),
         color_transfer=color_transfer,
+        occlusion_threshold=occlusion_threshold,
         save_debug=bool(debug.get('save_debug', False)),
     )
 
@@ -134,15 +147,15 @@ def _load_occlusion(path: Path, shape: tuple) -> np.ndarray:
     Parameters
     ----------
     path : pathlib.Path
-        Grayscale or RGB mask image. Values >=128 are protected.
+        Grayscale or RGB mask image. White protects fully; black permits changes.
     shape : tuple[int, ...]
         Target shape beginning with height and width. Differing mask dimensions
-        are resized by nearest neighbor before thresholding.
+        are resized by nearest neighbor, preserving the supplied grayscale levels.
 
     Returns
     -------
     numpy.ndarray
-        Boolean ``(H, W)`` protection mask in the original target frame.
+        Float32 ``(H, W)`` protection alpha in [0, 1], including soft edges.
     """
     with Image.open(path) as image:
         mask = image.convert('L')
@@ -151,7 +164,7 @@ def _load_occlusion(path: Path, shape: tuple) -> np.ndarray:
         if mask.size != size:
             mask = mask.resize(size, resample=Image.Resampling.NEAREST)
 
-        return np.asarray(mask) >= 128
+        return np.asarray(mask, dtype=np.float32) / 255.0
 
 
 def _save_reconstruction(
@@ -345,6 +358,15 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                 leaves the render unchanged. Raw mixed debug renders and decoded
                 vertex colors retain the model prediction for comparison.
 
+            ``occlusion_threshold`` : float, optional
+                Threshold for blocking radial warp directions. Range: [0, 1].
+                Default: 0. A ray is blocked only if the mask value at its
+                eroded-new-face endpoint is strictly greater than this value.
+                Zero blocks any nonblack sample, including soft edges; 0.5
+                blocks values above half intensity; 1 blocks no directions.
+                Raise this value if mask smoothing blocks too many directions.
+                This never thresholds the final protection alpha.
+
         ``debug`` : dict, optional
             ``save_debug`` : bool, optional
                 Compute and save source renders and diagnostic images, geometry
@@ -361,7 +383,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
     occlusion : dict, optional
         Target-space occlusion mask path under ``image`` or ``path``, connected
         through :meth:`occlusion`. White protects original pixels and black
-        allows modification; grayscale values >=128 are protected. A different
+        allows modification; gray values provide partial protection. A different
         mask size is resized to the target by nearest-neighbor sampling.
 
     Outputs
@@ -419,7 +441,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
                 displacement, and minimum radial Jacobian; empty for an identity
                 warp. Includes blocked-ray count when an active occlusion exists.
             ``occlusion_mask`` : str, optional
-                PNG of the resized binary mask actually used for protection.
+                PNG of the resized grayscale protection mask, retaining soft edges.
                 Present only when an occlusion mask is connected.
 
     Notes
@@ -437,10 +459,12 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
 
     An optional occlusion mask is applied after contour sampling and destination
     erosion, leaving the full mesh masks available for geometric alignment. A
-    ray is blocked when either selected contour point is protected; adjacent
-    valid directions taper toward identity. The face is pasted outside the
-    protected region and original pixels are restored there afterward. This
-    preserves occluders such as clothes or shoulders without changing inferred
+    ray is blocked only when its selected eroded-destination point is protected;
+    adjacent valid directions taper toward identity. An occluded original
+    contour point does not block deformation toward a free destination. The
+    full face is pasted, then the unwarped original is layered over it using
+    the grayscale protection mask as alpha, exactly once. This preserves
+    occluders such as clothes or shoulders without changing inferred
     geometry. It does not prevent inverse sampling of occluder colors elsewhere.
 
     Examples
@@ -512,10 +536,11 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
         Declare an optional target-space mask of foreground occluders.
 
         Use a segmentation of the actual target image to protect regions such
-        as clothes, shoulders, hands, or hair. White pixels (grayscale >=128)
-        preserve the corresponding original target pixels; black pixels permit
-        modification. The mask must share the target image's framing. Differing
-        dimensions are resized by nearest neighbor before thresholding.
+        as clothes, shoulders, hands, or hair. White preserves original target
+        pixels fully; black permits modification; gray provides proportional
+        protection. Supply soft edges using smoothing in an upstream mask node.
+        The mask must share the target framing. Differing sizes are resized by
+        nearest neighbor, retaining the supplied grayscale levels.
 
         The mask describes protected pixels, not an instruction to create an
         occlusion. For example, an upper-body segmentation behaves as follows:
@@ -535,16 +560,24 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
         rather than being carried along by that deformation.
 
         Geometric face masks remain complete for center and contour sampling.
-        After sampling, a ray uses identity deformation if either its selected
-        original point or its eroded-destination point lies in the occlusion.
-        Neighboring valid directions taper toward blocked ones. A protected
-        region away from those endpoints does not by itself block the entire
-        ray, but its own pixels are still preserved.
+        After sampling, a ray uses identity deformation only if its selected
+        eroded-destination mask value exceeds ``params.occlusion_threshold``.
+        The default 0 blocks every nonblack sample; raising the threshold ignores
+        fainter portions of soft edges for ray blocking only. Neighboring valid
+        directions taper toward blocked ones. An original contour point in
+        the occlusion does not block the ray: the old face must still deform
+        toward a free new contour, even when hair touches the original boundary.
+        A protected region away from the destination endpoint does not by itself
+        block the entire ray, but its own pixels are still preserved.
 
-        The face is blended only outside the protected region. Original target
-        pixels are then restored inside it after both warping and pasting, so
-        neither operation can overwrite the selected occluder. Full geometry is
-        still inferred; the mask limits visibility and deformation, not the mesh.
+        Composition uses three layers in order: the warped target, the complete
+        replacement face with its ordinary edge feathering, and the unwarped
+        original target with this mask as alpha. The face is not cut by the
+        occlusion mask. Protection alpha is applied only once, after pasting,
+        independently of the ray-blocking threshold. Fully white regions are
+        restored exactly; gray regions provide partial protection. Full geometry
+        is still inferred; the mask controls visibility and warp directions.
+        Incorrect segmentation remains the responsibility of the upstream mask.
 
         Notes
         -----
@@ -713,6 +746,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             target_rgb, target_render['mask'], mixed_render,
             occlusion_mask=occlusion,
             color_transfer=cfg.color_transfer,
+            occlusion_threshold=cfg.occlusion_threshold,
             collect_diagnostics=cfg.save_debug,
         )
 
@@ -727,7 +761,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             if occlusion is not None:
                 occlusion_debug_path = debug_dir / 'occlusion_mask.png'
                 Image.fromarray(
-                    occlusion.astype(np.uint8) * 255
+                    np.rint(occlusion * 255).astype(np.uint8)
                 ).save(occlusion_debug_path)
                 om = {'occlusion_mask': str(occlusion_debug_path)}
 
@@ -786,6 +820,7 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
             'params': {
                 'preserve': list(cfg.preserve),
                 'color_transfer': cfg.color_transfer,
+                'occlusion_threshold': cfg.occlusion_threshold,
             },
             'composition': composition,
             **({'occlusion_image': str(occlusion_path)} if occlusion_path is not None else {}),

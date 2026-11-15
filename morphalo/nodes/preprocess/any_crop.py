@@ -82,7 +82,7 @@ class AnyCropConfig:
     save_debug : bool
         Whether to save debug overlays. Reserved for later implementation.
     dilate_radius : int
-        Mask dilation radius for full-frame mask outputs.
+        Signed dilation/erosion radius for full-frame mask outputs.
     close_radius : int
         Morphological closing radius for full-frame mask outputs.
     smoothing_radius : int
@@ -609,7 +609,7 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
     Post-processing is applied in this order:
 
     1. morphological closing via ``close_radius``;
-    2. dilation via ``dilate_radius``;
+    2. dilation or erosion via ``dilate_radius``;
     3. Gaussian smoothing via ``smoothing_radius``;
     4. optional inversion for ``mode='negative-mask'``.
 
@@ -757,8 +757,12 @@ class AnyCrop(CudaPostRunMixin, PromptMixin, NodeRef):
                 Default: all disabled.
 
             ``dilate_radius`` : int, optional
-                Mask dilation radius in pixels, used only for ``mode='mask'`` and
-                ``mode='negative-mask'``. Default: ``0``.
+                Positive values dilate; negative values erode using the absolute
+                radius in pixels. Zero disables this step. Applied after closing
+                and before smoothing and any negative-mask inversion.
+
+                Used only for ``mode='mask'`` and ``mode='negative-mask'``.
+                Default: ``0``.
 
             ``close_radius`` : int, optional
                 Morphological closing radius in pixels, used only for full-frame

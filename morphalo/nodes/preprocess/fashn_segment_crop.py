@@ -106,7 +106,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     close_radius = int(params.get('close_radius', 0))
     smoothing_radius = int(params.get('smoothing_radius', 0))
     for name, value in (
-        ('dilate_radius', dilate_radius),
         ('close_radius', close_radius),
         ('smoothing_radius', smoothing_radius),
     ):
@@ -402,7 +401,7 @@ class FashnSegmentCrop(CudaPostRunMixin, NodeRef):
     Post-processing is applied in this order:
 
     1. morphological closing via ``close_radius``;
-    2. dilation via ``dilate_radius``;
+    2. dilation or erosion via ``dilate_radius``;
     3. Gaussian smoothing via ``smoothing_radius``;
     4. optional inversion for ``mode='negative-mask'``.
 
@@ -527,8 +526,12 @@ class FashnSegmentCrop(CudaPostRunMixin, NodeRef):
                 Default: all disabled.
 
             ``dilate_radius`` : int, optional
-                Mask dilation radius in pixels, used only for ``mode='mask'``
-                and ``mode='negative-mask'``. Default: ``0``.
+                Positive values dilate; negative values erode using the absolute
+                radius in pixels. Zero disables this step. Applied after closing
+                and before smoothing and any negative-mask inversion.
+
+                Used only for ``mode='mask'`` and ``mode='negative-mask'``.
+                Default: ``0``.
 
             ``close_radius`` : int, optional
                 Morphological closing radius in pixels, used only for

@@ -81,10 +81,12 @@ Operational source records and composition radii remain present in both modes.
 An optional `foreground_mask >> reconstruction.occlusion()` attachment protects
 foreground objects in target coordinates. White pixels are protected (threshold
 128); differing mask dimensions use nearest-neighbor resizing. Full geometric
-masks and erosion are computed before occlusion filtering. Sampled rays with an
-occluded endpoint use identity deformation, with a local angular transition in
-neighboring valid directions. The render is blended outside occlusion and
-protected original pixels are restored after blending. This does not change
+masks and erosion are computed before occlusion filtering. Only rays whose
+sampled eroded-destination point is occluded use identity deformation, with a
+local angular transition in neighboring valid directions. Occlusion at the
+original endpoint does not prevent contraction toward a free new contour. The
+render is blended outside occlusion and protected original pixels are restored
+after blending. This does not change
 inference or prevent occluder colors from being sampled elsewhere by the warp.
 
 ## External assets

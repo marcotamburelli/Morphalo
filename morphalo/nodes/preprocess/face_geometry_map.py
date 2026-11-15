@@ -254,8 +254,8 @@ class FaceGeometryMap(NodeRef):
        rasterize those values over the transformed source mesh. This produces a
        synthetic grayscale face with target-compatible lighting.
     6. Radially fit the unmodified original face silhouette under the eroded
-       synthetic mask, using rays from the mask-union centroid. Interpolate
-       to a fixed outer contour beyond both faces, preserving surrounding
+       synthetic mask, using rays from the mask-union centroid. Use a cubic
+       displacement ramp toward a fixed outer contour, preserving surrounding
        luminance outside the local transition. Rays use the furthest original
        boundary hit and nearest eroded-destination hit. Multiple crossings are
        allowed; invalid shared centers or missing intersections are rejected.

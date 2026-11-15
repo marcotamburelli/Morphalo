@@ -552,7 +552,7 @@ def prepare_output_mask(
     Processing order:
 
     1. morphological closing;
-    2. dilation;
+    2. dilation or erosion;
     3. Gaussian smoothing.
 
     Parameters
@@ -563,8 +563,9 @@ def prepare_output_mask(
         integer masks are cast to ``uint8``.
 
     dilate_radius : int, default=0
-        Radius in pixels used to expand the mask outward. ``0`` disables
-        dilation.
+        Signed radius in pixels: positive values dilate (expand), negative
+        values erode (shrink) using the absolute radius. ``0`` leaves the mask
+        unchanged at this step. Applied after closing and before smoothing.
 
     close_radius : int, default=0
         Radius in pixels used for morphological closing. ``0`` disables
@@ -601,11 +602,14 @@ def prepare_output_mask(
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
 
-    # --- dilation (expand mask) ---
-    if dilate_radius > 0:
-        k = 2 * dilate_radius + 1
+    # Expand or shrink before feathering, retaining the existing positive path.
+    if dilate_radius != 0:
+        k = 2 * abs(dilate_radius) + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        m = cv2.dilate(m, kernel, iterations=1)
+        if dilate_radius > 0:
+            m = cv2.dilate(m, kernel, iterations=1)
+        else:
+            m = cv2.erode(m, kernel, iterations=1)
 
     # --- smoothing / feather ---
     if smoothing_radius > 0:

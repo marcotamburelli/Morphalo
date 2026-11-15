@@ -31,6 +31,7 @@ def test_configuration_fixes_identity_pose_and_lighting_origins():
     model = {'face_landmarker_task': 'unused.task'}
     cfg = _read_cfg({'model': model}, 'reconstruction')
     assert cfg.preserve == ()
+    assert cfg.occlusion_threshold == 0.
     assert cfg.color_transfer == 0.
     assert cfg.save_debug is False
     assert cfg.repo_id == 'Zidu-Wang/3DDFA-V3'
@@ -259,6 +260,7 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
         files.append(str(path))
     occlusion_path = tmp_path / 'occlusion.png'
     occlusion = np.zeros((100, 100), np.uint8)
+    occlusion[55:60] = 128
     occlusion[60:] = 255
     if with_occlusion:
         Image.fromarray(occlusion).save(occlusion_path)
@@ -266,7 +268,7 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
     with DAG('face_reconstruction_test', out_dir=tmp_path) as dag:
         node = FaceReconstruction(name='reconstruct', spec={
             'model': {'face_landmarker_task': 'unused.task', 'device': device},
-            'params': {'preserve': preserve, 'color_transfer': color_transfer},
+            'params': {'preserve': preserve, 'color_transfer': color_transfer, 'occlusion_threshold': 0.5},
             **({'debug': {'save_debug': save_debug}} if save_debug is not None else {}),
         })
         if with_occlusion:
@@ -293,7 +295,7 @@ def test_node_persists_source_target_and_mixed_renders_and_rejects_missing_faces
     assert out['timing']['seconds'] == (4. if save_debug else 0.)
     assert out.get('cuda_mem', {}) == memory
     assert ('cuda_mem' in out) == bool(memory)
-    assert out['params'] == {'preserve': preserve, 'color_transfer': color_transfer}
+    assert out['params'] == {'preserve': preserve, 'color_transfer': color_transfer, 'occlusion_threshold': 0.5}
     if color_transfer:
         assert out['composition']['color_transfer']['applied']
         assert out['composition']['color_transfer']['sample_pixels'] > 0
@@ -465,14 +467,14 @@ def test_reconstruction_cache_uses_resolved_assets_device_and_file_signature(tmp
 
 
 
-def test_occlusion_loader_resizes_by_nearest_neighbor_and_uses_white_as_protected(tmp_path):
+def test_occlusion_loader_preserves_soft_values_when_resizing(tmp_path):
     from morphalo.nodes.preprocess.face_reconstruction import _load_occlusion
 
     values = np.array([[0, 127], [128, 255]], np.uint8)
     path = tmp_path / 'occlusion.png'
     Image.fromarray(values).save(path)
     actual = _load_occlusion(path, (4, 6, 3))
-    expected = np.repeat(np.repeat(values >= 128, 2, axis=0), 3, axis=1)
+    expected = np.repeat(np.repeat(values.astype(np.float32) / 255., 2, axis=0), 3, axis=1)
     np.testing.assert_array_equal(actual, expected)
 
 
@@ -493,3 +495,21 @@ def test_color_transfer_requires_target_albedo():
     cfg = _read_cfg({'model': model, 'params': {'preserve': ['expression'], 'color_transfer': 0.5}}, 'reconstruction')
     assert cfg.color_transfer == 0.5
     assert _read_cfg({'model': model, 'params': {'preserve': ['albedo'], 'color_transfer': 0}}, 'reconstruction').color_transfer == 0
+
+
+@pytest.mark.parametrize('threshold', [-0.1, 1.1, float('nan'), float('inf'), None, 'bad'])
+def test_configuration_rejects_invalid_occlusion_threshold(threshold):
+    with pytest.raises(ValueError, match='occlusion_threshold'):
+        _read_cfg({
+            'model': {'face_landmarker_task': 'unused.task'},
+            'params': {'occlusion_threshold': threshold},
+        }, 'reconstruction')
+
+
+@pytest.mark.parametrize('threshold', [0., 0.5, 1.])
+def test_configuration_accepts_occlusion_threshold(threshold):
+    cfg = _read_cfg({
+        'model': {'face_landmarker_task': 'unused.task'},
+        'params': {'occlusion_threshold': threshold},
+    }, 'reconstruction')
+    assert cfg.occlusion_threshold == threshold

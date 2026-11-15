@@ -588,7 +588,8 @@ def test_box_crop_full_frame_mask(tmp_path, mode, bbox, expected_bbox):
     assert out['crop']['bbox_size'] == [x2 - x1, y2 - y1]
 
 
-def test_box_crop_mask_processing_and_inversion(tmp_path):
+@pytest.mark.parametrize('radius', [2, -2])
+def test_box_crop_mask_processing_and_inversion(tmp_path, radius):
     src = tmp_path / 'src.png'
     Image.new('RGB', (24, 24)).save(src)
     results = {}
@@ -598,19 +599,23 @@ def test_box_crop_mask_processing_and_inversion(tmp_path):
                 name=mode, path=src,
                 spec={'params': {
                     'bbox': [8, 8, 16, 16], 'mode': mode,
-                    'close_radius': 1, 'dilate_radius': 2, 'smoothing_radius': 1,
+                    'close_radius': 1, 'dilate_radius': radius, 'smoothing_radius': 1,
                 }},
             )
         out = node.run(tmp_path)
         results[mode] = np.asarray(Image.open(out['image']))
         assert out['crop']['bbox_xyxy'] == [8, 8, 16, 16]
         assert out['params']['close_radius'] == 1
-        assert out['params']['dilate_radius'] == 2
+        assert out['params']['dilate_radius'] == radius
         assert out['params']['smoothing_radius'] == 1
 
     positive = results['mask']
-    assert positive[12, 6] > 0  # Dilation extends beyond the original rectangle.
-    assert 0 < positive[12, 5] < 255
+    if radius > 0:
+        assert positive[12, 6] > 0  # Dilation extends beyond the rectangle.
+        assert 0 < positive[12, 5] < 255
+    else:
+        assert positive[12, 8] == 0  # Erosion retreats inside the rectangle.
+        assert 0 < positive[12, 9] < 255
     assert positive[12, 12] == 255
     assert positive[0, 0] == 0
     np.testing.assert_array_equal(results['negative-mask'], 255 - positive)
@@ -644,7 +649,6 @@ def test_box_crop_mask_uses_scaled_transform_bbox(tmp_path):
     [
         ({'mode': 'crop'}, 'invalid mode'),
         ({'mode': 'unknown'}, 'invalid mode'),
-        ({'dilate_radius': -1}, 'dilate_radius must be >= 0'),
         ({'close_radius': -1}, 'close_radius must be >= 0'),
         ({'smoothing_radius': -1}, 'smoothing_radius must be >= 0'),
     ],

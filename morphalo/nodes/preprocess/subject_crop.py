@@ -3613,7 +3613,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     close_radius = int(params.get('close_radius', 0))
     smoothing_radius = int(params.get('smoothing_radius', 0))
     for name, value in (
-        ('dilate_radius', dilate_radius),
         ('close_radius', close_radius),
         ('smoothing_radius', smoothing_radius),
     ):
@@ -5033,7 +5032,9 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             Default: ``1.0``.
 
         ``dilate_radius`` : int, optional
-            Mask dilation radius in pixels.
+            Positive values dilate; negative values erode using the absolute
+            radius in pixels. Zero disables this step. Applied after closing
+            and before smoothing and any negative-mask inversion.
 
             In ``mode='mask'``, dilation expands the repaintable selected
             region. In ``mode='negative-mask'``, dilation is applied before

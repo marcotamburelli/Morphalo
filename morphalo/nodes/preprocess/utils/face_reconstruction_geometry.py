@@ -435,6 +435,7 @@ def compose_reconstructed_face(
     inserted: dict[str, np.ndarray],
     *,
     occlusion_mask: np.ndarray | None = None,
+    occlusion_threshold: float = 0.0,
     color_transfer: float = 0.0,
     collect_diagnostics: bool = True,
 ) -> tuple[np.ndarray, dict]:
@@ -452,7 +453,8 @@ def compose_reconstructed_face(
     including the eroded destination, or placement is rejected. The original
     silhouette is thus fitted under the render instead of merely displaced
     near its edge. A fixed contour beyond both silhouettes anchors a local,
-    continuous transition to the unchanged surrounding image.
+    cubic transition to the unchanged surrounding image. At that outer contour,
+    both displacement and its radial derivative vanish to soften texture drag.
 
     Optionally match the rendered colors to the unwarped original target in
     Lab space before blending. Estimate mean/std only from the common interior
@@ -465,11 +467,14 @@ def compose_reconstructed_face(
     width is controlled separately by ``FEATHER_RADIUS_FRACTION`` and its pixel
     minimum. Changing feathering does not change the mask erosion. One
     deformation map and one alpha field are shared across the RGB channels.
-    An optional target-space occlusion mask blocks warp directions whose
-    sampled endpoints are hidden. Full geometric masks still determine the
-    center and contours; destination erosion precedes visibility clipping.
-    Paste the new face only outside occlusion, then restore the protected
-    original target pixels after composition, including its feathered edge.
+    An optional target-space occlusion mask blocks warp directions only when
+    the sampled eroded-destination point is hidden. Original points in the
+    occlusion do not prevent deformation toward a free destination. Full
+    geometric masks still determine the center and contours; destination
+    erosion precedes the threshold test. Composite three layers: warped target,
+    complete new face with its ordinary feathering, then the unwarped target
+    using the grayscale occlusion mask as alpha. Apply protection exactly once;
+    do not clip the face or threshold the final protection alpha.
 
     This operation deforms existing pixels; it does not generate new hair or
     skin texture. Further image generation can refine the composite. Protecting
@@ -484,8 +489,13 @@ def compose_reconstructed_face(
     inserted : dict[str, numpy.ndarray]
         Mixed reconstruction color and mask in that same frame.
     occlusion_mask : numpy.ndarray or None, optional
-        Boolean ``(H, W)`` mask aligned with target; True protects original pixels.
-        Default: None. This limits visibility rather than changing inferred mesh.
+        Float ``(H, W)`` protection alpha in [0, 1], aligned with target.
+        White restores the original fully; black permits changes; gray blends
+        proportionally. Boolean masks are also accepted. Default: None.
+    occlusion_threshold : float, optional
+        Block a ray only if its eroded-destination mask value is strictly greater
+        than this threshold in [0, 1]. Default: 0 blocks any nonblack sample.
+        A value of 1 disables ray blocking. Final protection alpha is unaffected.
     color_transfer : float, optional
         Lab mean/std matching strength in [0, 1]. Default: 0 disables matching.
         Reference colors come from ``target`` before the background warp.
@@ -509,17 +519,22 @@ def compose_reconstructed_face(
     ValueError
         If the shared center is outside either face mask after erosion, a mask
         lacks a single valid external contour, a ray has no intersection, or
-        ``color_transfer`` is nonfinite or outside [0, 1].
+        a strength, threshold, or protection value is nonfinite or outside [0, 1].
     """
     if not np.isfinite(color_transfer) or not 0.0 <= color_transfer <= 1.0:
         raise ValueError('color_transfer must be finite and in [0, 1]')
 
+    if not np.isfinite(occlusion_threshold) or not 0.0 <= occlusion_threshold <= 1.0:
+        raise ValueError('occlusion_threshold must be finite and in [0, 1]')
+
     occlusion = None
     if occlusion_mask is not None:
-        occlusion = np.asarray(occlusion_mask, dtype=bool)
+        occlusion = np.asarray(occlusion_mask, dtype=np.float32)
         if occlusion.shape != target.shape[:2]:
             raise ValueError(
                 'Occlusion mask must match the target height and width')
+        if not np.all(np.isfinite(occlusion)) or np.any((occlusion < 0) | (occlusion > 1)):
+            raise ValueError('Occlusion mask values must be finite and in [0, 1]')
 
     insert_mask = inserted['mask']
     if not np.any(insert_mask) or not np.any(original_mask):
@@ -542,11 +557,10 @@ def compose_reconstructed_face(
         insert_mask,
         face_span=span,
         erosion_radius=INSERT_EROSION_RADIUS_PX,
-        occlusion_mask=occlusion,
+        occlusion_mask=None if occlusion is None else occlusion > occlusion_threshold,
         collect_diagnostics=collect_diagnostics,
     )
 
-    visible_mask = insert_mask if occlusion is None else insert_mask & ~occlusion
     face_color = inserted['color']
     color_metadata = {}
 
@@ -554,7 +568,11 @@ def compose_reconstructed_face(
         # Estimate using the unwarped original face, not the deformed corona
         # (which can contain hair/clothing). Remove both raster boundaries and
         # a margin near occluders, whose colors must not influence the match.
-        sampling = np.asarray(original_mask, dtype=bool) & visible_mask
+        sampling = np.asarray(original_mask, dtype=bool) & insert_mask
+        if occlusion is not None:
+            # Even faint protection may contain occluder colors; its exclusion
+            # from statistics is independent of the warp-blocking threshold.
+            sampling &= occlusion == 0
         margin = COLOR_TRANSFER_BORDER_RADIUS_PX
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -566,14 +584,14 @@ def compose_reconstructed_face(
         if sample_pixels:
             # Limit Lab conversions to the visible-face bounding box. Alpha
             # controls application; statistics_mask independently controls fitting.
-            ys, xs = np.nonzero(visible_mask)
+            ys, xs = np.nonzero(insert_mask)
             region = (
                 slice(ys.min(), ys.max() + 1),
                 slice(xs.min(), xs.max() + 1),
             )
             rgba = np.dstack((
                 face_color[region],
-                visible_mask[region].astype(np.uint8) * 255,
+                insert_mask[region].astype(np.uint8) * 255,
             ))
             corrected = match_lab_color_statistics(
                 Image.fromarray(rgba),
@@ -595,14 +613,17 @@ def compose_reconstructed_face(
     composed, _ = composite_face(
         warped,
         face_color,
-        visible_mask,
+        insert_mask,
         feather_radius=feather_radius,
     )
 
     if occlusion is not None:
-        # Restore after both background deformation and face blending: restoring
-        # before the paste would allow the rendered face to overwrite occluders.
-        composed[occlusion] = target[occlusion]
+        # The third layer uses the unwarped original. Apply this alpha only
+        # here: clipping the face with it too would double the protection.
+        alpha = occlusion[..., None]
+        composed = np.rint(
+            alpha * target + (1.0 - alpha) * composed,
+        ).astype(np.uint8)
 
     return composed, {
         'erosion_radius': INSERT_EROSION_RADIUS_PX,

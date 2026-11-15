@@ -159,8 +159,6 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             f"'{node_id}': strength must be in [0, 1]"
         )
     validate_size_expr(box_margin)
-    if dilate_radius < 0:
-        raise ValueError(f"'{node_id}': dilate_radius must be >= 0")
     if close_radius < 0:
         raise ValueError(f"'{node_id}': close_radius must be >= 0")
     if smoothing_radius < 0:
@@ -772,8 +770,12 @@ class ColorDrivenCrop(NodeRef):
                 Default: all disabled.
 
             ``dilate_radius`` : int, optional
-                Mask dilation radius in pixels, used only for ``mode='mask'``
-                and ``mode='negative-mask'``. Default: ``0``.
+                Positive values dilate; negative values erode using the absolute
+                radius in pixels. Zero disables this step. Applied after closing
+                and before smoothing and any negative-mask inversion.
+
+                Used only for ``mode='mask'`` and ``mode='negative-mask'``.
+                Default: ``0``.
 
             ``close_radius`` : int, optional
                 Morphological closing radius in pixels, used only for full-frame

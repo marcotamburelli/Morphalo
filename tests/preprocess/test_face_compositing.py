@@ -379,7 +379,7 @@ def test_radial_intersections_include_collinear_boundary_endpoints():
 
 
 @pytest.mark.parametrize('protected_columns', [(94, 100), (84, 89)])
-def test_occluded_endpoint_blocks_whole_ray_and_preserves_valid_directions(protected_columns):
+def test_only_occluded_destination_blocks_ray(protected_columns):
     y, x = np.mgrid[:128, :128]
     image = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
     original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
@@ -390,17 +390,24 @@ def test_occluded_endpoint_blocks_whole_ray_and_preserves_valid_directions(prote
         image, original, inserted, face_span=64., erosion_radius=0,
         occlusion_mask=occlusion,
     )
-    assert 0 < statistics['blocked_ray_count'] < statistics['ray_count']
-    # The +X contour pair is blocked by either its source or destination point.
-    # Pixels on that ray outside the protected stripe must also stay unchanged.
-    np.testing.assert_array_equal(warped[64, 70:84], image[64, 70:84])
-    assert not np.any(displacement[64, 70:84])
+    if protected_columns == (94, 100):
+        # Only the original endpoint is covered (e.g. adjacent hair). The new
+        # contour is free, so the face must still contract toward it.
+        assert statistics['blocked_ray_count'] == 0
+        baseline, baseline_displacement, _ = warp_face_background(
+            image, original, inserted, face_span=64., erosion_radius=0,
+        )
+        np.testing.assert_array_equal(warped[64, 70:84], baseline[64, 70:84])
+        np.testing.assert_array_equal(displacement[64, 70:84], baseline_displacement[64, 70:84])
+        assert np.any(displacement[64, 70:84] > 0)
+    else:
+        assert 0 < statistics['blocked_ray_count'] < statistics['ray_count']
+        np.testing.assert_array_equal(warped[64, 70:84], image[64, 70:84])
+        assert not np.any(displacement[64, 70:84])
+        # +X is the circular seam; both sides of 0/2pi stay blocked too.
+        np.testing.assert_array_equal(warped[63:66, 78:83], image[63:66, 78:83])
     assert displacement[64, 40] > 0
     assert not np.array_equal(warped[64, 40], image[64, 40])
-    np.testing.assert_array_equal(warped[occlusion], image[occlusion])
-    assert not np.any(displacement[occlusion])
-    # +X is also the circular angular seam; both sides of 0/2pi stay blocked.
-    np.testing.assert_array_equal(warped[63:66, 78:83], image[63:66, 78:83])
 
 
 def test_reconstruction_restores_occluders_after_blending_and_keeps_full_geometry(monkeypatch):
@@ -421,10 +428,10 @@ def test_reconstruction_restores_occluders_after_blending_and_keeps_full_geometr
         return actual_warp(target, old_mask, new_mask, **kwargs)
 
     def blend(background, face, visible_mask, **kwargs):
-        assert not np.any(visible_mask[occlusion])
+        np.testing.assert_array_equal(visible_mask, inserted)
         calls.append(True)
         # Deliberately overwrite protected pixels: final restoration must happen
-        # after this call, even though the visible mask is already clipped.
+        # after this call, using the complete face mask for the paste.
         return np.zeros_like(background), np.zeros(original.shape, np.float32)
 
     monkeypatch.setattr(geometry, 'warp_face_background', warp)
@@ -522,3 +529,124 @@ def test_face_color_transfer_without_common_visible_samples_leaves_render_unchan
     actual, metadata = compose_reconstructed_face(target, original, face, occlusion_mask=protected, color_transfer=1.)
     np.testing.assert_array_equal(actual, expected)
     assert metadata['color_transfer'] == {'applied': False, 'sample_pixels': 0}
+
+
+@pytest.mark.parametrize(('protected_x', 'blocked'), [(86, False), (84, True)])
+def test_occlusion_uses_eroded_destination_not_raw_face_edge(protected_x, blocked):
+    y, x = np.mgrid[:128, :128]
+    image = np.stack((x, y, x + y), axis=-1).astype(np.uint8)
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    inserted = (np.abs(x - 64) <= 22) & (np.abs(y - 64) <= 22)
+    occlusion = np.zeros(original.shape, bool)
+    # The raw +X boundary is x=86; after two-pixel erosion it is x=84.
+    occlusion[64, protected_x] = True
+    warped, displacement, statistics = warp_face_background(
+        image, original, inserted, face_span=64., erosion_radius=2,
+        occlusion_mask=occlusion,
+    )
+    assert (statistics['blocked_ray_count'] > 0) == blocked
+    assert (displacement[64, 75] == 0) == blocked
+
+
+def test_cubic_warp_displacement_becomes_tangent_at_fixed_outer_contour(monkeypatch):
+    y, x = np.mgrid[:192, :192]
+    image = np.stack((x, y, np.zeros_like(x)), axis=-1).astype(np.uint8)
+    original = (x - 96) ** 2 + (y - 96) ** 2 <= 32 ** 2
+    inserted = (x - 96) ** 2 + (y - 96) ** 2 <= 22 ** 2
+    remap = cv2.remap
+    maps = []
+
+    def capture(image, map_x, map_y, **kwargs):
+        maps.append((map_x.copy(), map_y.copy()))
+        return remap(image, map_x, map_y, **kwargs)
+
+    monkeypatch.setattr(cv2, 'remap', capture)
+    _, _, statistics = warp_face_background(
+        image, original, inserted, face_span=64., erosion_radius=0,
+    )
+    map_x, map_y = maps[0]
+    # The bounding-box corner is outside the deformation, so its identity
+    # coordinates locate the cropped remap grid in the full image.
+    left, top = int(round(map_x[0, 0])), int(round(map_y[0, 0]))
+    row = 96 - top
+    fixed = 96 + 32 + statistics['influence_radius']
+    assert map_x[row, 96 + 22 - left] == pytest.approx(96 + 32)
+    assert map_x[row, fixed - left] == pytest.approx(fixed)
+    last_displacement = float(map_x[row, fixed - 1 - left] - (fixed - 1))
+    previous_displacement = float(map_x[row, fixed - 2 - left] - (fixed - 2))
+    # A linear ramp would still move this pixel about 0.38px. The cubic
+    # enters much more gently, with displacement growing quadratically nearby.
+    assert 0 < last_displacement < 0.05
+    assert 3.5 * last_displacement < previous_displacement < 4.1 * last_displacement
+    assert np.all(np.diff(map_x[row, 96 - left:fixed - left + 1]) > 0)
+
+
+def test_cubic_warp_widens_transition_to_prevent_folds(monkeypatch):
+    y, x = np.mgrid[:192, :192]
+    image = np.zeros((192, 192), np.uint8)
+    original = (x - 96) ** 2 + (y - 96) ** 2 <= 70 ** 2
+    inserted = (x - 96) ** 2 + (y - 96) ** 2 <= 8 ** 2
+    remap = cv2.remap
+    maps = []
+
+    def capture(image, map_x, map_y, **kwargs):
+        maps.append((map_x.copy(), map_y.copy()))
+        return remap(image, map_x, map_y, **kwargs)
+
+    monkeypatch.setattr(cv2, 'remap', capture)
+    _, _, statistics = warp_face_background(
+        image, original, inserted, face_span=8., erosion_radius=0,
+    )
+    assert statistics['max_transition_width'] > statistics['influence_radius']
+    assert statistics['min_jacobian'] > 0
+    map_x, map_y = maps[0]
+    left, top = int(round(map_x[0, 0])), int(round(map_y[0, 0]))
+    assert np.all(np.diff(map_x[96 - top, 96 - left:]) > 0)
+
+
+@pytest.mark.parametrize('threshold', [0., 0.49, 0.5, 1.])
+def test_soft_protection_applied_once_after_full_face_paste(monkeypatch, threshold):
+    from morphalo.nodes.preprocess.utils import face_reconstruction_geometry as geometry
+
+    y, x = np.mgrid[:128, :128]
+    target = np.full((128, 128, 3), 40, np.uint8)
+    original = (x - 64) ** 2 + (y - 64) ** 2 <= 32 ** 2
+    insert_mask = (x - 64) ** 2 + (y - 64) ** 2 <= 22 ** 2
+    protection = np.full(original.shape, 0.5, np.float32)
+    # Exercise black, white and multiple intermediate alphas away from endpoints.
+    protection[:5] = np.array([0., 0.25, 0.5, 0.75, 1.])[:, None]
+    baseline = np.full_like(target, 200)
+
+    def paste(background, face, mask, **kwargs):
+        np.testing.assert_array_equal(mask, insert_mask)
+        return baseline.copy(), np.ones(original.shape, np.float32)
+
+    monkeypatch.setattr(geometry, 'composite_face', paste)
+    result, info = geometry.compose_reconstructed_face(
+        target, original, {'mask': insert_mask, 'color': baseline},
+        occlusion_mask=protection, occlusion_threshold=threshold,
+    )
+    expected = np.rint(protection[..., None] * target
+                       + (1 - protection[..., None]) * baseline).astype(np.uint8)
+    np.testing.assert_array_equal(result, expected)
+    # A half-protected endpoint is blocked strictly below 0.5, never at equality.
+    if threshold < 0.5:
+        assert info['warp']['blocked_ray_count'] == info['warp']['ray_count']
+    elif threshold < 1.:
+        assert info['warp']['blocked_ray_count'] == 0
+    else:
+        assert 'blocked_ray_count' not in info['warp']
+    np.testing.assert_array_equal(result[64, 64], [120, 120, 120])
+
+
+@pytest.mark.parametrize('value', [-0.1, 1.1, float('nan'), float('inf')])
+def test_composition_rejects_invalid_protection_values(value):
+    from morphalo.nodes.preprocess.utils.face_reconstruction_geometry import compose_reconstructed_face
+
+    target = np.zeros((16, 16, 3), np.uint8)
+    mask = np.ones((16, 16), bool)
+    with pytest.raises(ValueError, match='Occlusion mask values'):
+        compose_reconstructed_face(
+            target, mask, {'mask': mask, 'color': target},
+            occlusion_mask=np.full(mask.shape, value),
+        )
