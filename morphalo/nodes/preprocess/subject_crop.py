@@ -200,7 +200,7 @@ _LIMB_WORKSPACE_RELIEF_MICRO_SPUR_PX = 3
 class Config:
     device: str
     dtype: torch.dtype
-    yolo_model: str
+    yolo_model: Optional[str]
     segment_model: str
     pose_landmarker_task: Optional[str]
     mode: str
@@ -3556,7 +3556,8 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
 
     device = str(model.get('device', 'cuda'))
     dtype = resolve_dtype(str(model.get('dtype', 'bfloat16')))
-    yolo_model = str(model.get('yolo_model', 'yolov8n.pt'))
+    yolo_model_raw = model.get('yolo_model', 'yolov8n.pt')
+    yolo_model = None if yolo_model_raw is None else str(yolo_model_raw)
     segment_model = str(
         model.get('segment_model', 'facebook/sapiens2-seg-0.4b')
     )
@@ -3653,15 +3654,20 @@ def _resolve_person_bbox(
     node_id: str,
 ) -> tuple[int, int, int, int]:
     """
-    Resolve the Sapiens2 search bbox from YOLO person detections.
+    Resolve the search bbox from YOLO, or use the full frame when disabled.
 
     The bbox is used as the Sapiens2 segmentation search region. Limb landmark
     geometry is resolved independently through MediaPipe pose when needed.
     """
     h, w = img_rgb.shape[:2]
+    if cfg.yolo_model is None:
+        return (0, 0, w, h)
+
     yolo = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
+    # Ultralytics expects NumPy images in BGR order; the pipeline uses RGB.
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     res = yolo.predict(
-        img_rgb,
+        img_bgr,
         conf=float(cfg.conf),
         verbose=False,
         device=cfg.device,
@@ -4887,9 +4893,11 @@ class SubjectCrop(CudaPostRunMixin, NodeRef):
             Hugging Face Sapiens2 segmentation model identifier used for dense
             body-part parsing. Default: ``'facebook/sapiens2-seg-0.4b'``.
 
-        ``yolo_model`` : str, optional
+        ``yolo_model`` : str or None, optional
             YOLO weights used to propose the person search box. Default:
-            ``'yolov8n.pt'``.
+            ``'yolov8n.pt'``. Explicit ``None`` disables YOLO and runs Sapiens2
+            and any required MediaPipe pose inference on the full image.
+            In this case ``conf`` and ``search_expansion`` have no effect.
 
         ``pose_landmarker_task`` : str, optional
             MediaPipe PoseLandmarker ``.task`` path. Required only for
