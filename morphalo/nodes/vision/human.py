@@ -99,6 +99,7 @@ def mp_pose_landmarks_full(
     *,
     min_visibility: float = 0.0,
     min_presence: float = 0.0,
+    require_stable_pose: bool = True,
 ) -> PoseLandmarksResult:
     """
     Return a rich MediaPipe pose result for the most prominent detected pose.
@@ -114,8 +115,8 @@ def mp_pose_landmarks_full(
     - validity and strong-landmark flags
 
     Landmarks are first filtered using the caller-provided thresholds
-    (``min_visibility``, ``min_presence``), then additional robustness checks
-    are applied to ensure that the result represents a plausible human pose.
+    (``min_visibility``, ``min_presence``). By default, additional checks
+    require enough strong landmarks and a visible shoulder or nose.
 
     This function is intended for:
     - pose analysis
@@ -135,6 +136,10 @@ def mp_pose_landmarks_full(
         Minimum visibility required for a landmark to be considered valid.
     min_presence : float, optional
         Minimum presence required for a landmark to be considered valid.
+    require_stable_pose : bool, optional
+        Require at least eight strong landmarks and a strong shoulder or
+        nose landmark. Set to ``False`` when the caller validates the body
+        joints it needs for a partial pose. Defaults to ``True``.
 
     Returns
     -------
@@ -271,24 +276,22 @@ def mp_pose_landmarks_full(
             world_xyz[i, 1] = float(wlm.y)
             world_xyz[i, 2] = float(wlm.z)
 
-    # -------------------------------------------------------------
-    # Basic robustness checks
-    # -------------------------------------------------------------
-    strong_count = int(np.count_nonzero(strong))
+    if require_stable_pose:
+        strong_count = int(np.count_nonzero(strong))
 
-    if strong_count < 8:
-        raise RuntimeError(
-            'MediaPipe pose landmarks are too weak to identify a person reliably.'
-        )
+        if strong_count < 8:
+            raise RuntimeError(
+                'MediaPipe pose landmarks are too weak to identify a person reliably.'
+            )
 
-    left_shoulder = bool(strong[11])
-    right_shoulder = bool(strong[12])
-    nose = bool(strong[0])
+        left_shoulder = bool(strong[11])
+        right_shoulder = bool(strong[12])
+        nose = bool(strong[0])
 
-    if not (left_shoulder or right_shoulder or nose):
-        raise RuntimeError(
-            'MediaPipe pose landmarks lack stable anchors (no shoulders or nose).'
-        )
+        if not (left_shoulder or right_shoulder or nose):
+            raise RuntimeError(
+                'MediaPipe pose landmarks lack stable anchors (no shoulders or nose).'
+            )
 
     return PoseLandmarksResult(
         xy=xy,

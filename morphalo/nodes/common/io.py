@@ -3,13 +3,41 @@ from pathlib import Path
 from typing import List, Union
 
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 from morphalo.core.paths import make_node_output_path
 
 
-def load_init_image(image: Union[str, Path, Image.Image]) -> Image.Image:
+def load_init_image(
+    image: Union[str, Path, Image.Image],
+    *,
+    apply_exif_orientation: bool = False,
+) -> Image.Image:
+    """
+    Load a path or a PIL image as RGB.
+
+    Parameters
+    ----------
+    image : str or pathlib.Path or PIL.Image.Image
+        Input image or its filesystem path.
+    apply_exif_orientation : bool, optional
+        Apply the rotation or reflection recorded in the image's EXIF tags.
+        Defaults to retaining the stored pixel orientation.
+
+    Returns
+    -------
+    PIL.Image.Image
+        Converted RGB image.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the input path does not exist.
+    """
     if isinstance(image, Image.Image):
+        if apply_exif_orientation:
+            image = ImageOps.exif_transpose(image)
+
         return image.convert('RGB')
 
     p = Path(str(image)).expanduser()
@@ -17,7 +45,11 @@ def load_init_image(image: Union[str, Path, Image.Image]) -> Image.Image:
     if not p.exists():
         raise FileNotFoundError(f'Input image not found: {p}')
 
-    return Image.open(p).convert('RGB')
+    with Image.open(p) as opened:
+        if apply_exif_orientation:
+            opened = ImageOps.exif_transpose(opened)
+
+        return opened.convert('RGB')
 
 
 def load_faceid_embeds(path_or_paths: Union[str, List[str]], device: str, dtype: torch.dtype) -> torch.Tensor:

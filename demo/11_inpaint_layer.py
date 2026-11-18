@@ -22,7 +22,7 @@ Pipeline
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.10_inpaint_layer --dag inpaint_layer_tshirt
+    ./bin/run_dag.sh demo.11_inpaint_layer --dag inpaint_layer_tshirt
 
 Inputs (local paths)
 --------------------

@@ -48,7 +48,7 @@ face ref embedding --------------------------------------> FaceScorer.identity()
 
 How to run
 ----------
-    ./bin/run_dag.sh demo.14_faceid_refine_score --dag faceid_refine_score
+    ./bin/run_dag.sh demo.15_faceid_refine_score --dag faceid_refine_score
 
 Notes
 -----

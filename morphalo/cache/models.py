@@ -86,6 +86,7 @@ def _resolve_single_file_checkpoint(checkpoint: Any) -> Optional[str]:
 
 
 if TYPE_CHECKING:
+    from third_party.instanthmr.runtime import InstantHMRRuntime
     from third_party.tddfa_v3.runtime import FaceReconstructionRuntime
     from diffusers import (AutoencoderKL, ControlNetModel, DiffusionPipeline,
                            OmniGenPipeline, QwenImageControlNetInpaintPipeline,
@@ -1394,6 +1395,57 @@ def get_face_reconstruction_model(
         return cached
     runtime = FaceReconstructionRuntime(assets=paths, device=device)
     return ModelCache.put(key, runtime)
+
+
+def get_instanthmr_model(
+    *,
+    checkpoint: Path | dict[str, str],
+    rig_path: Path,
+    device: str,
+) -> InstantHMRRuntime:
+    """
+    Load or reuse the InstantHMR network and MHR mesh decoder.
+
+    Parameters
+    ----------
+    checkpoint : pathlib.Path or dict[str, str]
+        Local safetensors path or a Hugging Face mapping with ``repo_id``,
+        ``filename``, and optional ``revision``.
+    rig_path : pathlib.Path
+        Local MHR v1.0.1 LOD 1 TorchScript model.
+    device : str
+        Torch device for the InstantHMR network.
+
+    Returns
+    -------
+    InstantHMRRuntime
+        Runtime cached by device and both asset paths, sizes, and
+        modification times.
+    """
+    from third_party.instanthmr.runtime import InstantHMRRuntime
+
+    if isinstance(checkpoint, dict):
+        from huggingface_hub import hf_hub_download
+
+        checkpoint = Path(
+            hf_hub_download(
+                repo_id=checkpoint['repo_id'],
+                filename=checkpoint['filename'],
+                revision=checkpoint.get('revision'),
+            )
+        )
+
+    signature = '|'.join(
+        f'{path}:{path.stat().st_size}:{path.stat().st_mtime_ns}'
+        for path in (checkpoint, rig_path)
+    )
+    key = CacheKey('instanthmr', signature, device, 'float32')
+    cached = ModelCache.get(key)
+
+    if cached is not None:
+        return cached
+
+    return ModelCache.put(key, InstantHMRRuntime(checkpoint, rig_path, device))
 
 
 def get_mediapipe_face_landmarker(

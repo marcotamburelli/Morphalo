@@ -120,7 +120,7 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
     if not isinstance(debug, dict):
         raise ValueError(f"'{node_id}': debug must be an object")
 
-    device = str(model.get('device', 'cpu'))
+    device = str(model.get('device', 'cuda'))
 
     return Config(
         device=device,
@@ -322,7 +322,8 @@ class FaceReconstruction(CudaPostRunMixin, NodeRef):
 
             ``device`` : str, optional
                 Torch device for coefficient inference and mesh decoding.
-                Default: ``'cpu'``. MediaPipe landmark detection runs on CPU.
+                Default: ``'cuda'``. Set ``'cpu'`` for CPU inference.
+                MediaPipe landmark detection runs on CPU.
 
             ``id`` : str, optional
                 Asset dataset repository. Default: ``'Zidu-Wang/3DDFA-V3'``.

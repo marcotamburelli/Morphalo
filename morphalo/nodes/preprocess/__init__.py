@@ -1,4 +1,5 @@
 from .any_crop import AnyCrop
+from .body_geometry_map import BodyGeometryMap
 from .box_crop import BoxCrop
 from .color_driven_crop import ColorDrivenCrop
 from .face_geometry_map import FaceGeometryMap
@@ -14,6 +15,7 @@ from .visual_reference_selector import VisualReferenceSelector
 
 __all__ = [
     'AnyCrop',
+    'BodyGeometryMap',
     'BoxCrop',
     'ColorDrivenCrop',
     'FaceGeometryMap',

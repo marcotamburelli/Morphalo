@@ -402,9 +402,9 @@ The repository is structured as a small execution engine plus optional local wor
 
 - `demo/` - Example DAGs and macro workflows. Useful starting points include:
     - `01_minimal_txt2img.py` for the smallest image-generation DAG
-    - `11_foundation_minimal.py` for Qwen Image and OmniGen
-    - `13_scorers.py` for candidate ranking and chained evaluators
-    - `15_video_wip.py` for current LTX-Video workflows
+    - `12_foundation_minimal.py` for Qwen Image and OmniGen
+    - `14_scorers.py` for candidate ranking and chained evaluators
+    - `16_video_wip.py` for current LTX-Video workflows
     - `macro/` for reusable higher-level graph composition
 - `tests/` - Unit tests (including DAG-level tests).
 - `third_party/`
@@ -415,6 +415,7 @@ Root-level scripts:
 
 - `init_project.sh` – bootstrap local virtual environment
 - `fetch_media_pipe.sh` – download MediaPipe task models
+- `fetch_mhr.sh` – download the MHR TorchScript rig for `BodyGeometryMap`
 - `requirements.txt` – Python dependencies
 - `config.ini` – configuration
 
@@ -478,6 +479,53 @@ Helper scripts are provided:
 ```
 
 - MediaPipe models are placed under `~/models/mediapipe`.
+
+### BodyGeometryMap
+
+Run `./fetch_mhr.sh` to install the MHR v1.0.1 TorchScript rig at
+`~/models/mhr/mhr_model.pt`. Set `model.mhr_model_pt` to that path.
+On first use, the node fetches
+`instanthmr_medium_commercial.safetensors` from Hugging Face and stores it
+in the Hub cache. The node uses the project's YOLO person detector.
+Ultralytics loads the default `yolov8n.pt` from `~/models/yolo` or
+downloads it to that directory on first use.
+
+The default checkpoint permits commercial use under the SAM License terms.
+The publisher lists Nano, Tiny, Small, and standard Medium as non-commercial.
+[InstantHMR checkpoint licenses](https://huggingface.co/jtydhr88/ComfyUI-InstantHMR#licence)
+
+Inside a DAG, wire the pose image to the main input and optionally supply one
+or more views of the same source person through a single attachment.
+
+```python
+from morphalo.nodes import FileImage
+from morphalo.nodes.preprocess import BodyGeometryMap
+
+target = FileImage(name='pose', path='~/images/pose.png')
+sources = FileImage(name='body_views', path='~/images/body_views')
+body = BodyGeometryMap(
+    name='mannequin',
+    spec={'model': {'mhr_model_pt': '~/models/mhr/mhr_model.pt'}},
+)
+target >> body
+sources >> body.source()
+```
+
+The output `image` is a full-frame PNG with an opaque mannequin and transparent
+background. Set `params.body_color` to customize the mannequin or
+`params.background_color` to fill the background before passing the image to an
+RGB annotator such as `ImgAuxMap`. Both accept hex RGB colors and CSS color names.
+Override the default checkpoint, detector, or device in `spec['model']` using
+`checkpoint`, `yolo_model`, or `device`. Set `checkpoint` to a local
+safetensors path or a Hugging Face mapping with `repo_id`, `filename`, and
+optional `revision`.
+YOLO and InstantHMR default to CUDA.
+The TorchScript mesh decoder runs on CPU.
+
+Set `model.pose_landmarker_task` to a local MediaPipe Pose task to refine the
+visible body joints while keeping the selected proportions and camera fixed.
+The file installed by `./fetch_media_pipe.sh` is
+`~/models/mediapipe/pose_landmarker_heavy.task`.
 
 ## Running DAGs
 

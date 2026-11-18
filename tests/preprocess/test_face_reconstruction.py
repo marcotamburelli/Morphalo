@@ -30,6 +30,7 @@ def _alignment_fixture():
 def test_configuration_fixes_identity_pose_and_lighting_origins():
     model = {'face_landmarker_task': 'unused.task'}
     cfg = _read_cfg({'model': model}, 'reconstruction')
+    assert cfg.device == 'cuda'
     assert cfg.preserve == ()
     assert cfg.occlusion_threshold == 0.
     assert cfg.color_transfer == 0.
