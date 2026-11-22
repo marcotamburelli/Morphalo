@@ -29,13 +29,16 @@ Inputs (local paths)
 - Person detector: Ultralytics loads ``yolov8n.pt`` from ``~/models/yolo``
   or downloads it to that directory on first use.
 - Pose refinement: run ``./fetch_media_pipe.sh`` and provide the pose task.
-  Both renders fit the visible body joints to the target photo.
+  Both renders fit the pelvis and spine, refine projected torso widths, then
+  align the limbs using MediaPipe joint positions and relative depth order.
 
 Outputs
 -------
 The two RGBA PNGs are saved under ``outputs/body_geometry_map``. Both have a
 transparent background by default. Set ``background_color`` to an RGB color
 to render on an opaque background.
+The debug folders contain a ``pose_overlay.png`` comparing the rendered
+skeleton with the target landmarks.
 """
 
 from pathlib import Path
@@ -47,6 +50,7 @@ from morphalo.nodes.preprocess import BodyGeometryMap
 ROOT = Path(__file__).resolve().parents[1]
 
 TARGET_IMG = '~/images/init_img_4.png'
+
 SOURCE_VIEWS = '~/images/body_x'
 
 BODY_SPEC = {
@@ -59,6 +63,7 @@ BODY_SPEC = {
         'body_color': '#b8b8b8',
         'background_color': None,
     },
+    'debug': {'save_debug': True},
 }
 
 with DAG(
@@ -76,7 +81,16 @@ with DAG(
 
     transferred_body = BodyGeometryMap(
         name='transferred_body',
-        spec=BODY_SPEC,
+        spec={
+            **BODY_SPEC,
+            'params': {
+                'body_color': '#b8b8b8',
+                'background_color': None,
+                'gender': 'f',
+                'chest_volume': 2,
+                'hip_volume': 1,
+            },
+        },
     )
     target >> transferred_body
     references >> transferred_body.source()

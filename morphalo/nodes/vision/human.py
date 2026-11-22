@@ -100,6 +100,7 @@ def mp_pose_landmarks_full(
     min_visibility: float = 0.0,
     min_presence: float = 0.0,
     require_stable_pose: bool = True,
+    keep_out_of_frame: bool = False,
 ) -> PoseLandmarksResult:
     """
     Return a rich MediaPipe pose result for the most prominent detected pose.
@@ -140,6 +141,10 @@ def mp_pose_landmarks_full(
         Require at least eight strong landmarks and a strong shoulder or
         nose landmark. Set to ``False`` when the caller validates the body
         joints it needs for a partial pose. Defaults to ``True``.
+    keep_out_of_frame : bool, optional
+        Keep finite coordinates outside the image that pass the requested
+        confidence thresholds. Defaults to ``False``. Strong-landmark
+        checks still require in-frame points.
 
     Returns
     -------
@@ -251,6 +256,9 @@ def mp_pose_landmarks_full(
         presence[i] = pres
         z[i] = z_rel
 
+        if not np.isfinite((x_norm, y_norm)).all():
+            continue
+
         x_px = int(round(x_norm * w))
         y_px = int(round(y_norm * h))
 
@@ -258,7 +266,7 @@ def mp_pose_landmarks_full(
         passes_valid = (vis >= min_visibility) and (pres >= min_presence)
         passes_strong = (vis >= 0.5) and (pres >= 0.5)
 
-        if in_bounds and passes_valid:
+        if (in_bounds or keep_out_of_frame) and passes_valid:
             xy[i] = (x_px, y_px)
             xyz_px[i, 0] = float(x_px)
             xyz_px[i, 1] = float(y_px)

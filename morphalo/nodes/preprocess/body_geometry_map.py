@@ -1,6 +1,9 @@
 """Render a posed MHR mannequin with optional source body proportions."""
 
 from dataclasses import dataclass, field
+from functools import partial
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 
 import cv2
@@ -17,8 +20,14 @@ from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import load_init_image, write_json_sidecar
-from morphalo.nodes.preprocess.utils.body_pose_fit import refine_body_pose
+from morphalo.nodes.preprocess.utils.body_pose_debug import draw_body_pose_overlay
+from morphalo.nodes.preprocess.utils.body_pose_fit import (
+    detect_body_landmarks,
+    project_body_joints,
+    refine_body_pose,
+)
 from morphalo.nodes.preprocess.utils.body_render import render_body
+from morphalo.nodes.preprocess.utils.body_shape import adjust_body_volumes
 from morphalo.nodes.preprocess.utils.color_ops import parse_color
 from morphalo.nodes.sdxl_resolve import (
     resolve_image_paths,
@@ -36,11 +45,17 @@ CHECKPOINT = {
     'filename': 'instanthmr_medium_commercial.safetensors',
     'revision': '964effb58c3358ca8a0e35da386f49de1480ac9e',
 }
+GENDER_VOLUMES = {
+    'estimated': (0.0, 0.0),
+    'masculine': (-0.85, -0.45),
+    'feminine': (0.65, 0.5),
+}
+GENDER_ALIASES = {'m': 'masculine', 'f': 'feminine'}
 
 
 @dataclass(frozen=True)
 class Config:
-    """Resolved model assets, inference settings, and render colors."""
+    """Resolved model assets, inference settings, and render parameters."""
 
     checkpoint: Path | dict[str, str]
     rig_path: Path
@@ -49,35 +64,45 @@ class Config:
     device: str
     body_color: tuple[int, int, int]
     background_color: tuple[int, int, int] | None
+    chest_volume: float
+    hip_volume: float
+    save_debug: bool
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
     """
-    Resolve model settings and validate the render colors.
+    Resolve model, render, and body-shape settings.
 
     Parameters
     ----------
     spec : dict
-        Resolved specification with a ``model`` block and optional ``params``.
+        Resolved specification with ``model``, optional ``params``, and optional
+        ``debug`` blocks.
     node_id : str
         Node identifier included in validation errors.
 
     Returns
     -------
     Config
-        Configuration with parsed RGB colors and absolute paths for local
-        assets. A checkpoint mapping describes a file on Hugging Face.
+        Configuration with parsed colors, effective volume adjustments and
+        absolute local asset paths. A checkpoint mapping describes a file
+        on Hugging Face.
 
     Raises
     ------
     ValueError
-        If a configuration block, checkpoint, model path, or color is invalid.
+        If a configuration block, checkpoint, model path, color, or shape
+        setting is invalid.
     """
     model = spec.get('model', {})
     params = spec.get('params', {})
+    debug = spec.get('debug', {})
 
     if not isinstance(model, dict) or not isinstance(params, dict):
         raise ValueError(f"'{node_id}': model and params must be objects")
+
+    if not isinstance(debug, dict):
+        raise ValueError(f"'{node_id}': debug must be an object")
 
     rig_path = model.get('mhr_model_pt')
 
@@ -143,6 +168,32 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
             node_id=f'{node_id}: params.background_color',
         )
 
+    gender = params.get('gender', 'estimated')
+
+    if isinstance(gender, str):
+        gender = gender.strip().lower()
+        gender = GENDER_ALIASES.get(gender, gender)
+
+    if not isinstance(gender, str) or gender not in GENDER_VOLUMES:
+        raise ValueError(
+            f"'{node_id}': params.gender must be estimated, masculine (m), or feminine (f)"
+        )
+
+    volumes = []
+
+    for name, preset in zip(('chest_volume', 'hip_volume'), GENDER_VOLUMES[gender]):
+        value = params.get(name, 0)
+
+        try:
+            valid = isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
+        except OverflowError:
+            valid = False
+
+        if not valid:
+            raise ValueError(f"'{node_id}': params.{name} must be a finite number")
+
+        volumes.append(preset + float(value))
+
     return Config(
         checkpoint=checkpoint,
         rig_path=Path(rig_path).expanduser().resolve(),
@@ -151,6 +202,9 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         device=str(model.get('device', 'cuda')),
         body_color=body_color,
         background_color=background_color,
+        chest_volume=volumes[0],
+        hip_volume=volumes[1],
+        save_debug=bool(debug.get('save_debug', False)),
     )
 
 
@@ -217,8 +271,9 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
        the pose, camera, and body proportions with InstantHMR.
     2. Estimate proportions for each usable reference image and average the
        shape, skeletal lengths and widths, and bone-scale coefficients.
-    3. If configured, refine the pose against visible MediaPipe joints
-       using the chosen proportions and the original camera.
+    3. If configured, fit body segment directions against MediaPipe in the
+       image plane and in relative depth. Use the hip midpoint to align the
+       pelvis in the target frame.
     4. Decode the MHR mesh with the chosen proportions and the target pose.
        Project it into the target frame and use depth ordering to resolve
        surfaces that overlap.
@@ -247,11 +302,12 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                 The installer places it at
                 ``~/models/mhr/mhr_model.pt``.
             ``pose_landmarker_task`` : str or pathlib.Path, optional
-                Local MediaPipe Pose Landmarker task. A path enables
-                refinement of body articulation using visible shoulders,
-                elbows, wrists, hips, knees, and ankles. Omit it to render
-                the direct InstantHMR pose. The task installed by
-                ``./fetch_media_pipe.sh`` is
+                Local MediaPipe Pose Landmarker task. A path enables 3D pose
+                refinement using shoulders, elbows, wrists, hips, knees,
+                ankles, and forefeet. The fitting accepts usable observations
+                outside the image and uses no visibility or presence weighting.
+                Omit the path to render the direct InstantHMR pose.
+                ``./fetch_media_pipe.sh`` installs the task at
                 ``~/models/mediapipe/pose_landmarker_heavy.task``.
             ``yolo_model`` : str, optional
                 Person detector checkpoint name. Defaults to ``'yolov8n.pt'``.
@@ -262,11 +318,33 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                 TorchScript mesh decoding runs on CPU.
 
         ``params`` : dict, optional
+            ``gender`` : str, optional
+                Rest-mesh volume preset. Defaults to ``'estimated'``, which
+                contributes zero to both controls. ``'masculine'`` (``'m'``)
+                contributes -0.85 to the chest and -0.45 to the hips.
+                ``'feminine'`` (``'f'``) contributes +0.65 to the chest and
+                +0.50 to the hips.
+            ``chest_volume`` : float, optional
+                Unitless signed adjustment added to the chest preset.
+                Defaults to zero. Positive values increase forward projection
+                and negative values reduce it. The maximum displacement
+                approaches 4 cm on the unposed mesh.
+            ``hip_volume`` : float, optional
+                Unitless signed adjustment added to the hip preset.
+                Defaults to zero. Positive values widen the hip surface
+                and negative values narrow it. The maximum lateral
+                displacement approaches 3.5 cm per side on the unposed mesh.
             ``body_color`` : str or sequence of numbers, optional
                 Mannequin base color before shading. Defaults to ``'#b8b8b8'``.
             ``background_color`` : str or sequence of numbers or None, optional
                 Fill color. Defaults to ``None`` for a transparent background.
                 Both colors accept CSS names, hex strings, or RGB triplets.
+
+        ``debug`` : dict, optional
+            ``save_debug`` : bool, optional
+                Save an overlay of the rendered MHR skeleton and any
+                MediaPipe pose observations in a separate color.
+                Defaults to ``False``.
 
     Inputs
     ------
@@ -289,8 +367,20 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
         ``rejected_source_images`` : list[dict]
             Rejected reference paths and their failure reasons.
         ``pose_fit`` : dict, optional
-            Status, visible joint count, and weighted pixel reprojection
-            error when available. Present when a pose task is configured.
+            Status and available diagnostics when a pose task is configured.
+            These include the selected MediaPipe world X/Y signs and
+            ``world_depth_scale``, the positive Z-to-XY calibration ratio.
+            The output also reports the
+            ``root_retargeted``, ``spine_retargeted``, ``limbs_retargeted``,
+            ``torso_width_refined``, and ``feet_retargeted`` stage flags, and
+            errors before and after fitting. Direction errors and torso
+            twist angles are in degrees.
+            Joint reprojection RMS, pelvis offset and projected shoulder and
+            hip widths are in pixels. The distance between the torso
+            midpoints is in centimetres.
+        ``debug`` : dict, optional
+            Diagnostic directory and ``pose_overlay`` PNG path when
+            ``debug.save_debug`` is true.
         ``metadata`` : str
             Path to the JSON sidecar used by the DAG.
 
@@ -314,13 +404,35 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
     For a partial target, the full mesh is projected into the target frame
     and any geometry outside the image bounds is clipped.
 
-    Pose refinement keeps the inferred camera and the selected body
-    proportions fixed. It adjusts torso and limb angles while retaining
-    the local clavicle, head, wrist, and finger rotations estimated by
-    InstantHMR. Keeping the clavicles fixed preserves the 3D distance
-    between the two shoulder joints. The projected width can still change
-    with torso rotation. A fit with too few visible joints or no
-    reprojection improvement uses the initial pose.
+    Pose refinement matches landmarks by anatomical side. It selects global
+    X/Y signs for the MediaPipe world coordinates by comparing their segment
+    directions with the image observations. It calibrates relative Z scale
+    by projecting the MediaPipe world joints with the InstantHMR focal length
+    and the observed hip midpoint. A positive scale preserves depth order.
+    With insufficient observations, the fitter uses a scale of 1.
+
+    The fitting first orients the rig at the pelvis using the hip axis and
+    the torso centerline. A lateral camera shift aligns the hip midpoint.
+    It then adjusts the spine to align the shoulder axis and centerline.
+    A separate pass refines the projected shoulder and hip widths, allowing
+    up to three degrees of change in torso directions and signed twist.
+    With the torso fixed, elbows, wrists, knees, and ankles are fitted to
+    their image positions. The sign of MediaPipe depth differences guides
+    which end of each segment is nearer. Stages with no limb pixels use 3D
+    directions when available. A final pass refines ankle flexion.
+    Priors favor the InstantHMR angles for axial twists and spine curvature.
+
+    The chosen proportions set the bone lengths. The distance between the
+    virtual shoulder and hip midpoints can vary as the spine bends. Focal
+    length and camera depth are fixed throughout the fit. Local clavicle,
+    head, wrist, finger, and toe rotations come from InstantHMR.
+
+    Volume controls deform the transferred or estimated surface before
+    skinning. The selected skeletal proportions determine joint placement.
+    Each control adds its value to the preset and passes the sum through
+    ``tanh``. Effective magnitudes of 0.5, 1, and 2 produce about 46%, 76%,
+    and 96% of the maximum displacement, respectively, at full influence.
+    Displacement tapers smoothly across each region.
 
     The PNG can be composited over a background or passed to an RGB
     annotator with ``background_color`` set.
@@ -459,25 +571,45 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
 
         # Fit body joints using the final proportions so their lengths agree
         # with the rendered skeleton.
+        height, width = target_rgb.shape[:2]
         pose_fit = None
+        landmarks = None
 
         if cfg.pose_landmarker_task is not None:
             pose_landmarker = get_mediapipe_pose_landmarker(
                 model_asset_path=str(cfg.pose_landmarker_task),
                 device='cpu',
             )
-            target, pose_fit = refine_body_pose(
-                runtime=runtime,
-                target=target,
-                proportions=proportions,
-                rgb=target_rgb,
-                bbox=target_bbox,
-                pose_landmarker=pose_landmarker,
-            )
+            try:
+                landmarks = detect_body_landmarks(
+                    rgb=target_rgb,
+                    bbox=target_bbox,
+                    pose_landmarker=pose_landmarker,
+                )
+            except RuntimeError as exc:
+                pose_fit = {'status': 'skipped', 'reason': str(exc)}
+            else:
+                target, pose_fit = refine_body_pose(
+                    runtime=runtime,
+                    target=target,
+                    proportions=proportions,
+                    landmarks=landmarks,
+                    image_size=(width, height),
+                )
 
         # Render the resulting mesh in the target camera frame.
-        vertices = runtime.mesh(target, proportions)
-        height, width = target_rgb.shape[:2]
+        if cfg.chest_volume or cfg.hip_volume:
+            vertices = runtime.mesh(
+                target,
+                proportions,
+                rest_deformation=partial(
+                    adjust_body_volumes,
+                    chest_volume=cfg.chest_volume,
+                    hip_volume=cfg.hip_volume,
+                ),
+            )
+        else:
+            vertices = runtime.mesh(target, proportions)
         image = render_body(
             vertices,
             runtime.faces,
@@ -506,6 +638,22 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
 
         if pose_fit is not None:
             output['pose_fit'] = pose_fit
+
+        if cfg.save_debug:
+            debug_dir = out_path.with_name(out_path.stem + '_debug')
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            overlay_path = debug_dir / 'pose_overlay.png'
+            rig_xy = project_body_joints(
+                runtime=runtime,
+                target=target,
+                proportions=proportions,
+                image_size=(width, height),
+            )
+            draw_body_pose_overlay(image, rig_xy, landmarks).save(overlay_path)
+            output['debug'] = {
+                'debug_directory': str(debug_dir),
+                'pose_overlay': str(overlay_path),
+            }
 
         output['metadata'] = str(write_json_sidecar(out_path, output))
 

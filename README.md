@@ -523,7 +523,10 @@ YOLO and InstantHMR default to CUDA.
 The TorchScript mesh decoder runs on CPU.
 
 Set `model.pose_landmarker_task` to a local MediaPipe Pose task to refine the
-visible body joints while keeping the selected proportions and camera fixed.
+directions of the limbs and torso in the image plane and in relative depth,
+and align the pelvis in the target frame. The fit treats landmark observations
+equally and preserves the selected proportions and the 3D torso midpoint length
+within a small tolerance.
 The file installed by `./fetch_media_pipe.sh` is
 `~/models/mediapipe/pose_landmarker_heavy.task`.
 

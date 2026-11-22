@@ -1,6 +1,7 @@
 """Image crops, InstantHMR inference, and the MHR TorchScript mesh."""
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
@@ -193,6 +194,8 @@ class InstantHMRRuntime:
         self,
         target: BodyEstimate,
         proportions: BodyProportions,
+        *,
+        rest_deformation: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> np.ndarray:
         """
         Decode a body with the requested proportions in the target camera.
@@ -203,6 +206,10 @@ class InstantHMRRuntime:
             Estimate supplying joint pose and camera translation.
         proportions : BodyProportions
             Single-image CPU coefficients from the target or source views.
+        rest_deformation : callable, optional
+            Transforms the identity-shaped rest vertices using the neutral
+            reference mesh before the rig skins them. Both tensors use MHR
+            vertex ordering and centimetres.
 
         Returns
         -------
@@ -218,12 +225,24 @@ class InstantHMRRuntime:
         """
         params = pack_body(target.pose, proportions, self.tables)
         expression = params.new_zeros((params.shape[0], 72))
-        vertices, _ = self.rig(
-            proportions.shape,
-            params,
-            expression,
-            False,
-        )
+
+        if rest_deformation is None:
+            vertices, _ = self.rig(
+                proportions.shape,
+                params,
+                expression,
+                False,
+            )
+        else:
+            character = self.rig.character_torch
+            rest = character.blend_shape.forward(proportions.shape)
+            rest = rest + self.rig.face_expressions_model.forward(expression)
+            rest = rest_deformation(rest, character.mesh.rest_vertices)
+            joint_params = character.model_parameters_to_joint_parameters(
+                torch.cat((params, torch.zeros_like(proportions.shape)), dim=1),
+            )
+            state = character.joint_parameters_to_skeleton_state(joint_params)
+            vertices = character.skin_points(state, rest)
 
         # MHR gives centimetres, Y up and Z towards the viewer. InstantHMR's
         # perspective camera expects metres, Y down and positive Z away.
