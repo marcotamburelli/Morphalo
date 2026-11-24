@@ -4,6 +4,77 @@ import numpy as np
 from PIL import Image
 
 
+NEAR_PLANE = 1e-4
+CANVAS_MARGIN_FRACTION = 0.03
+
+
+def _project_vertices(
+    vertices: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    focal: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return pixel positions in the target frame and inverse depths."""
+    inverse_z = 1.0 / np.maximum(vertices[:, 2], NEAR_PLANE)
+    projected = vertices[:, :2] * (focal * inverse_z[:, None])
+    projected += np.array((width / 2, height / 2), dtype=projected.dtype)
+
+    return projected, inverse_z
+
+
+def fit_body_canvas(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    focal: float,
+) -> tuple[int, int, int, int]:
+    """
+    Determine how much to expand the target canvas for the projected mesh.
+
+    Parameters
+    ----------
+    vertices : numpy.ndarray
+        Mesh vertices in camera-space metres.
+    faces : numpy.ndarray
+        Zero-based triangle indices. Only faces in front of the near plane
+        contribute to the projected bounds.
+    width, height : int
+        Original target dimensions in pixels.
+    focal : float
+        Target focal length in pixels.
+
+    Returns
+    -------
+    tuple[int, int, int, int]
+        Left, top, right, and bottom padding in pixels. A side that overflows
+        also receives a margin of 3% of the full projected mesh height.
+    """
+    visible_faces = faces[np.all(vertices[faces, 2] >= NEAR_PLANE, axis=1)]
+
+    if not visible_faces.size:
+        return (0, 0, 0, 0)
+
+    projected, _ = _project_vertices(
+        vertices[np.unique(visible_faces)],
+        width=width,
+        height=height,
+        focal=focal,
+    )
+    lower = projected.min(axis=0).astype(np.float64)
+    upper = projected.max(axis=0).astype(np.float64)
+    overflow = (*(-lower), *(upper - (width - 1, height - 1)))
+    margin = CANVAS_MARGIN_FRACTION * (upper[1] - lower[1])
+    left, top, right, bottom = (
+        int(np.ceil(distance + margin)) if distance > 0 else 0
+        for distance in overflow
+    )
+
+    return left, top, right, bottom
+
+
 def _vertex_shading(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     """
     Compute a shading multiplier for each vertex in camera space.
@@ -60,11 +131,13 @@ def render_body(
     focal: float,
     body_color: tuple[int, int, int],
     background_color: tuple[int, int, int] | None,
+    padding: tuple[int, int, int, int] = (0, 0, 0, 0),
 ) -> Image.Image:
     """
     Project and shade a mesh with a perspective camera.
 
-    The camera's principal point is at ``(width / 2, height / 2)`` in pixels.
+    The principal point is centered in the original target frame. Padding
+    translates that frame within the output canvas.
     An inverse-depth buffer selects the nearest surface at each pixel.
     The renderer skips triangles with any vertex at a depth below 0.1 mm.
 
@@ -76,13 +149,15 @@ def render_body(
     faces : numpy.ndarray
         Zero-based triangle indices of shape ``(F, 3)``.
     width, height : int
-        Output dimensions in pixels.
+        Target dimensions in pixels, before padding.
     focal : float
         Target focal length in pixels.
     body_color : tuple[int, int, int]
         Base RGB color before applying shading. Components are in [0, 255].
     background_color : tuple[int, int, int] or None
         Opaque RGB fill, or ``None`` for a transparent background.
+    padding : tuple[int, int, int, int], optional
+        Left, top, right, and bottom canvas extension in pixels.
 
     Returns
     -------
@@ -94,26 +169,25 @@ def render_body(
     ValueError
         If the projected mesh covers no pixel in the output frame.
     """
-    near = 1e-4
-    faces_in_front = faces[np.all(vertices[faces, 2] >= near, axis=1)]
-
-    inverse_z = 1.0 / np.maximum(vertices[:, 2], near)
-    projected = vertices[:, :2] * (focal * inverse_z[:, None])
-    projected += np.array((width / 2, height / 2), dtype=projected.dtype)
+    faces_in_front = faces[np.all(vertices[faces, 2] >= NEAR_PLANE, axis=1)]
+    projected, inverse_z = _project_vertices(vertices, width=width, height=height, focal=focal)
+    left, top, right, bottom = padding
+    width += left + right
+    height += top + bottom
     shading = _vertex_shading(vertices, faces)
 
-    # One grid for all triangles. Each triangle only evaluates its bounding box.
-    pixel_x = np.arange(width, dtype=np.float32)[None, :]
-    pixel_y = np.arange(height, dtype=np.float32)[:, None]
+    # Sample in target coordinates and write into the padded canvas.
+    pixel_x = np.arange(-left, width - left, dtype=np.float32)[None, :]
+    pixel_y = np.arange(-top, height - top, dtype=np.float32)[:, None]
     z_buffer = np.zeros((height, width), dtype=np.float32)
     illumination = np.zeros_like(z_buffer)
 
     for indices in faces_in_front:
         xy = projected[indices]
-        x0 = max(0, int(np.ceil(xy[:, 0].min())))
-        x1 = min(width, int(np.floor(xy[:, 0].max())) + 1)
-        y0 = max(0, int(np.ceil(xy[:, 1].min())))
-        y1 = min(height, int(np.floor(xy[:, 1].max())) + 1)
+        x0 = max(0, int(np.ceil(xy[:, 0].min())) + left)
+        x1 = min(width, int(np.floor(xy[:, 0].max())) + left + 1)
+        y0 = max(0, int(np.ceil(xy[:, 1].min())) + top)
+        y1 = min(height, int(np.floor(xy[:, 1].max())) + top + 1)
 
         if x0 >= x1 or y0 >= y1:
             continue

@@ -3,18 +3,19 @@
 from dataclasses import dataclass, replace
 from math import pi
 
+import cv2
 import numpy as np
 from scipy.optimize import least_squares
 import torch
 from torch.nn import functional as F
 
 from morphalo.nodes.preprocess.utils.geometry import expand_clip_bbox
-from morphalo.nodes.vision.human import mp_pose_landmarks_full
+from morphalo.nodes.vision.human import PoseLandmarksResult, mp_pose_landmarks_full
 from third_party.instanthmr.parameters import BodyEstimate, BodyProportions, pack_body
 from third_party.instanthmr.runtime import InstantHMRRuntime
 
 
-# MediaPipe landmark index paired with the corresponding MHR joint name.
+# MediaPipe landmark indices paired with the corresponding MHR joint names.
 BODY_JOINTS = (
     (11, 'l_uparm'),
     (12, 'r_uparm'),
@@ -31,9 +32,13 @@ BODY_JOINTS = (
     # The MHR ball joint is the closest rig reference to MediaPipe's forefoot.
     (31, 'l_ball'),
     (32, 'r_ball'),
+    # The index–pinky midpoint follows the middle finger without fitting digits.
+    ((17, 19), 'l_middle2'),
+    ((18, 20), 'r_middle2'),
 )
 SHOULDERS = (0, 1)
 HIPS = (6, 7)
+HAND_SEGMENTS = ((4, 14), (5, 15))
 FOOT_SEGMENTS = ((10, 12), (11, 13))
 LIMB_CHAINS = (
     ((0, 2, 4), 'l_uparm', 'l_elbow_bend'),
@@ -41,11 +46,14 @@ LIMB_CHAINS = (
     ((6, 8, 10), 'l_upleg', 'l_knee_bend'),
     ((7, 9, 11), 'r_upleg', 'r_knee_bend'),
 )
-LIMB_TARGET_JOINTS = [joint for (
-    _, *distal), _, _ in LIMB_CHAINS for joint in distal]
+LIMB_TARGET_JOINTS = [
+    *(joint for (_, *distal), _, _ in LIMB_CHAINS for joint in distal),
+    *(hand for _, hand in HAND_SEGMENTS),
+]
 LIMB_SEGMENTS = (
     (0, 2), (2, 4), (1, 3), (3, 5),
     (6, 8), (8, 10), (7, 9), (9, 11),
+    *HAND_SEGMENTS,
     *FOOT_SEGMENTS,
 )
 # The last two points are the virtual shoulder and hip midpoints.
@@ -62,11 +70,30 @@ LIMB_DEPTH_ORDER_WEIGHT = 0.08
 LIMB_DEPTH_ORDER_MARGIN = 0.02
 TORSO_WIDTH_ANGLE_LIMIT = pi / 60
 TORSO_WIDTH_WEIGHT = 4.0
+SPLIT_POSE_OVERLAP = 0.05
 ROOT_ANGLE_NAMES = ('root_rx', 'root_ry', 'root_rz')
 TORSO_ANGLE_NAMES = (
     'spine_twist0', 'spine_lean0', 'spine_bend0',
     'spine_twist1', 'spine_lean1', 'spine_bend1',
 )
+HEAD_ANGLE_NAMES = (
+    'neck_twist', 'neck_lean', 'neck_bend', 'head_twist', 'head_lean', 'head_bend',
+)
+# MediaPipe Pose indices and rigid head vertices for the verified MHR LOD 1 mesh.
+# Order is nose, anatomical left/right eye, then anatomical left/right ear.
+HEAD_LANDMARKS = [0, 2, 5, 7, 8]
+HEAD_VERTICES = [2765, 2619, 5505, 247, 3133]
+
+
+@dataclass(frozen=True)
+class BodyPoseCrop:
+    """Exact MediaPipe input pixels, target bounds, and crop-local results."""
+
+    box: tuple[int, int, int, int]
+    rgb: np.ndarray
+    landmarks: PoseLandmarksResult | None = None
+    error: str | None = None
+    target_corners: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -77,19 +104,30 @@ class BodyLandmarks:
     Attributes
     ----------
     xy : numpy.ndarray
-        Full-frame pixel coordinates of shape ``(14, 2)``. Missing coordinates
+        Full-frame pixel coordinates of shape ``(16, 2)``. Missing coordinates
         are represented by NaNs. Finite predictions may extend outside the frame.
     world_xyz : numpy.ndarray
-        MediaPipe world landmarks of shape ``(14, 3)`` in its hip-relative
-        frame. Their relative 3D segment directions guide anatomical retargeting;
-        absolute segment lengths remain determined by the MHR rig.
+        Full-person MediaPipe world landmarks of shape ``(16, 3)`` in its
+        hip-relative frame. The MHR rig determines absolute segment lengths.
     person_size : int
         Long side in pixels of the selected person's bounding box.
+    full_frame_xy : numpy.ndarray or None
+        Original full-person landmarks for calibrating the full-person
+        world coordinates when regional detections update ``xy``.
+    split_world_vectors : numpy.ndarray or None
+        Local 3D segment displacements from the regional detections in
+        ``FIT_SEGMENTS`` order. NaNs select the full-person displacement.
+    head_xy : numpy.ndarray or None
+        Full-person MediaPipe head landmarks in target pixels, in
+        ``HEAD_LANDMARKS`` order. NaNs mark points unavailable for head fitting.
     """
 
     xy: np.ndarray
     world_xyz: np.ndarray
     person_size: int
+    full_frame_xy: np.ndarray | None = None
+    split_world_vectors: np.ndarray | None = None
+    head_xy: np.ndarray | None = None
 
 
 def detect_body_landmarks(
@@ -97,6 +135,8 @@ def detect_body_landmarks(
     rgb: np.ndarray,
     bbox: tuple[int, int, int, int],
     pose_landmarker,
+    split_pose_detection: bool = False,
+    crop_debug: dict[str, BodyPoseCrop] | None = None,
 ) -> BodyLandmarks:
     """
     Detect body joints inside the selected person crop.
@@ -109,6 +149,13 @@ def detect_body_landmarks(
         Target person box in full-frame pixels.
     pose_landmarker : mediapipe.tasks.python.vision.PoseLandmarker
         Detector used on the selected person's crop.
+    split_pose_detection : bool, optional
+        Redetect the upper and lower body in overlapping crops. Use a
+        vertical cut when the torso axis is at least 45 degrees from
+        the image vertical. Defaults to a single detection.
+    crop_debug : dict[str, BodyPoseCrop] or None, optional
+        Receives the bounds and detector output of each attempted crop
+        before its observations are mapped to the full frame and merged.
 
     Returns
     -------
@@ -122,25 +169,301 @@ def detect_body_landmarks(
         If the selected crop does not yield a valid MediaPipe pose result.
     """
     height, width = rgb.shape[:2]
-    x0, y0, x1, y1 = expand_clip_bbox(*bbox, w=width, h=height, margin=0.12)
-    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
-
-    landmarks = mp_pose_landmarks_full(
-        crop,
+    crop_box = expand_clip_bbox(*bbox, w=width, h=height, margin=0.12)
+    xy, world, head_xy = _detect_body_crop(
+        rgb,
+        crop_box,
         pose_landmarker,
-        require_stable_pose=False,
         keep_out_of_frame=True,
+        region='full',
+        crop_debug=crop_debug,
     )
-    indices = [index for index, _ in BODY_JOINTS]
-    xy = landmarks.xy[indices].astype(np.float32)
-    xy += (x0, y0)
-    xy[~landmarks.valid[indices]] = np.nan
-
-    return BodyLandmarks(
+    full = BodyLandmarks(
         xy=xy,
-        world_xyz=landmarks.world_xyz[indices],
+        world_xyz=world,
         person_size=max(bbox[2] - bbox[0], bbox[3] - bbox[1]),
+        head_xy=head_xy,
     )
+
+    if not split_pose_detection:
+        return full
+
+    return _merge_split_landmarks(
+        rgb,
+        crop_box,
+        pose_landmarker,
+        full,
+        person_size=(bbox[2] - bbox[0], bbox[3] - bbox[1]),
+        crop_debug=crop_debug,
+    )
+
+
+def _detect_body_crop(
+    rgb: np.ndarray,
+    box: tuple[int, int, int, int],
+    pose_landmarker,
+    *,
+    keep_out_of_frame: bool,
+    region: str,
+    crop_debug: dict[str, BodyPoseCrop] | None,
+    frame_to_target: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Detect body joints in a crop and map their pixels back to the target.
+
+    Parameters
+    ----------
+    rgb : numpy.ndarray
+        RGB image in the frame used for detection.
+    box : tuple[int, int, int, int]
+        Crop bounds in detection-frame pixels, with exclusive right and bottom.
+    pose_landmarker : mediapipe.tasks.python.vision.PoseLandmarker
+        Detector used for the crop.
+    keep_out_of_frame : bool
+        Keep finite image landmarks outside the crop when true.
+    region : str
+        Name of the crop in the debug output.
+    crop_debug : dict[str, BodyPoseCrop] or None
+        Receives the crop bounds and result or detection error.
+    frame_to_target : numpy.ndarray or None, optional
+        Inverse affine transform mapping a rectified frame to target pixels.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        Target pixels and axis-aligned world landmarks in ``BODY_JOINTS``
+        order, followed by head landmark pixels. Missing points use NaNs.
+    """
+    x0, y0, x1, y1 = box
+    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    target_corners = None
+    target_box = box
+
+    if crop_debug is not None and frame_to_target is not None:
+        edges = np.array(((x0, y0), (x1, y0), (x1, y1), (x0, y1))) - 0.5
+        target_corners = edges @ frame_to_target[:, :2].T + frame_to_target[:, 2] + 0.5
+        target_box = (
+            *np.floor(target_corners.min(axis=0)).astype(int).tolist(),
+            *np.ceil(target_corners.max(axis=0)).astype(int).tolist(),
+        )
+
+    try:
+        landmarks = mp_pose_landmarks_full(
+            crop,
+            pose_landmarker,
+            require_stable_pose=False,
+            keep_out_of_frame=keep_out_of_frame,
+        )
+    except RuntimeError as exc:
+        if crop_debug is not None:
+            crop_debug[region] = BodyPoseCrop(
+                target_box, crop, error=str(exc), target_corners=target_corners,
+            )
+
+        raise
+
+    if crop_debug is not None:
+        crop_debug[region] = BodyPoseCrop(
+            target_box, crop, landmarks=landmarks, target_corners=target_corners,
+        )
+
+    sources = np.asarray([
+        indices if isinstance(indices, tuple) else (indices, indices)
+        for indices, _ in BODY_JOINTS
+    ])
+    xy = landmarks.xy[sources].mean(axis=1, dtype=np.float32)
+    xy += (x0, y0)
+    xy[~landmarks.valid[sources].all(axis=1)] = np.nan
+
+    head_xy = landmarks.xy[HEAD_LANDMARKS].astype(np.float32)
+    head_xy += (x0, y0)
+    head_xy[~landmarks.strong[HEAD_LANDMARKS]] = np.nan
+    world = landmarks.world_xyz[sources].mean(axis=1)
+
+    if frame_to_target is not None:
+        rotation = frame_to_target[:, :2]
+        offset = frame_to_target[:, 2]
+        xy = (xy @ rotation.T + offset).astype(np.float32)
+        head_xy = (head_xy @ rotation.T + offset).astype(np.float32)
+        world[:, :2] = world[:, :2] @ rotation.T
+
+    return xy, world, head_xy
+
+
+def _torso_crop_transform(
+    box: tuple[int, int, int, int],
+    points: np.ndarray,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    """
+    Rotate the crop by quarter turns according to the projected torso direction.
+
+    Parameters
+    ----------
+    box : tuple[int, int, int, int]
+        Target-frame bounds of the expanded person crop.
+    points : numpy.ndarray
+        Full-person landmark pixels in ``BODY_JOINTS`` order.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, tuple[int, int]] or None
+        Forward affine transform and the width and height of the rotated
+        bounds. None keeps the original frame for a downward-facing torso
+        closer to vertical than horizontal, or an unusable torso axis.
+    """
+    shoulders = points[list(SHOULDERS)].mean(axis=0)
+    hips = points[list(HIPS)].mean(axis=0)
+    axis = (hips - shoulders).astype(np.float64)
+    length = np.linalg.norm(axis)
+
+    if not np.isfinite(length) or length < 2:
+        return None
+
+    dx, dy = axis
+
+    if abs(dx) >= abs(dy):
+        dx, dy = np.sign(dx), 0
+    elif dy > 0:
+        return None
+    else:
+        dx, dy = 0, -1
+
+    rotation = np.array(((dy, -dx), (dx, dy)))
+    x0, y0, x1, y1 = box
+    edges = np.array(((x0, y0), (x1, y0), (x1, y1), (x0, y1))) - 0.5
+    corners = edges @ rotation.T
+    origin = corners.min(axis=0)
+    size = tuple(np.ceil(corners.max(axis=0) - origin).astype(int).tolist())
+
+    return np.column_stack((rotation, -origin - 0.5)), size
+
+
+def _merge_split_landmarks(
+    rgb: np.ndarray,
+    box: tuple[int, int, int, int],
+    pose_landmarker,
+    full: BodyLandmarks,
+    *,
+    person_size: tuple[int, int],
+    crop_debug: dict[str, BodyPoseCrop] | None,
+) -> BodyLandmarks:
+    """
+    Replace upper and lower image joints with observations from overlapping crops.
+
+    Choose a horizontal or vertical cut from the dominant direction of the
+    shoulder-to-hip axis, preferring a vertical cut at 45 degrees. Place the
+    split at the hip estimates and pad the lower crop by 5% of the person box
+    extent along the crop frame. Missing regional image joints
+    keep the original estimate. When both detections have a complete shoulder
+    or hip axis, align its midpoint height to the full-person detection while
+    preserving the regional horizontal position and axis direction. Use a
+    regional 3D displacement only when both endpoints come from that crop.
+    The torso centerline always uses the full-person 3D displacement.
+
+    Parameters
+    ----------
+    rgb : numpy.ndarray
+        Target RGB image.
+    box : tuple[int, int, int, int]
+        Bounds of the initial person crop in target pixels.
+    pose_landmarker : mediapipe.tasks.python.vision.PoseLandmarker
+        Detector reused for both regional crops.
+    full : BodyLandmarks
+        Initial full-person observations used to locate the split and fill
+        gaps in the regional detections.
+    person_size : tuple[int, int]
+        Width and height of the person box before expansion.
+    crop_debug : dict[str, BodyPoseCrop] or None
+        Receives the crop bounds and regional detection results before merging.
+
+    Returns
+    -------
+    BodyLandmarks
+        Merged image landmarks and optional regional 3D segment displacements.
+    """
+    hips = full.xy[list(HIPS)]
+
+    if not np.isfinite(hips).all():
+        return full
+
+    frame = rgb
+    frame_to_target = None
+    person_extent = person_size[1]
+    transform = _torso_crop_transform(box, full.xy)
+
+    if transform is not None:
+        target_to_frame, size = transform
+        frame_to_target = cv2.invertAffineTransform(target_to_frame)
+        frame = cv2.warpAffine(rgb, target_to_frame, size)
+        hips = hips @ target_to_frame[:, :2].T + target_to_frame[:, 2]
+        person_extent = np.abs(target_to_frame[1, :2]) @ person_size
+        box = (0, 0, *size)
+
+    hips_y = hips[:, 1]
+    x0, y0, x1, y1 = box
+
+    if not y0 < hips_y.mean() < y1:
+        return full
+
+    upper_end = int(np.ceil(hips_y.mean()))
+    lower_start = max(y0, int(np.floor(hips_y.min() - SPLIT_POSE_OVERLAP * person_extent)))
+    first_hand = HAND_SEGMENTS[0][1]
+    upper_joints = [*range(HIPS[0]), *range(first_hand, len(BODY_JOINTS))]
+    lower_joints = list(range(HIPS[0], first_hand))
+    regions = (
+        ('upper', (x0, y0, x1, upper_end), upper_joints, SHOULDERS),
+        ('lower', (x0, lower_start, x1, y1), lower_joints, HIPS),
+    )
+    merged_xy = full.xy.copy()
+    segments = np.asarray(FIT_SEGMENTS)
+    segment_ids = np.flatnonzero((segments < len(BODY_JOINTS)).all(axis=1))
+    starts, ends = segments[segment_ids].T
+    vectors = np.full((len(segments), 3), np.nan, dtype=full.world_xyz.dtype)
+    updated = False
+
+    for region, crop_box, joints, torso_axis in regions:
+
+        try:
+            xy, world, _ = _detect_body_crop(
+                frame,
+                crop_box,
+                pose_landmarker,
+                keep_out_of_frame=False,
+                region=region,
+                crop_debug=crop_debug,
+                frame_to_target=frame_to_target,
+            )
+        except RuntimeError:
+            continue
+
+        accepted = np.zeros(len(BODY_JOINTS), dtype=bool)
+        accepted[joints] = np.isfinite(xy[joints]).all(axis=1)
+
+        if frame_to_target is not None:
+            height, width = rgb.shape[:2]
+            accepted &= ((xy >= 0) & (xy < (width, height))).all(axis=1)
+
+        if not accepted.any():
+            continue
+
+        updated = True
+        merged_xy[accepted] = xy[accepted]
+        axis = list(torso_axis)
+        full_axis_y = full.xy[axis, 1]
+
+        if accepted[axis].all() and np.isfinite(full_axis_y).all():
+            merged_xy[axis, 1] += full_axis_y.mean() - xy[axis, 1].mean()
+
+        usable = accepted & np.isfinite(world).all(axis=1)
+        use_segment = usable[starts] & usable[ends]
+        regional_vectors = world[ends[use_segment]] - world[starts[use_segment]]
+        nonzero = np.linalg.norm(regional_vectors, axis=1) > 1e-4
+        vectors[segment_ids[use_segment][nonzero]] = regional_vectors[nonzero]
+
+    if not updated:
+        return full
+
+    return replace(full, xy=merged_xy, full_frame_xy=full.xy, split_world_vectors=vectors)
 
 
 def refine_body_pose(
@@ -150,6 +473,7 @@ def refine_body_pose(
     proportions: BodyProportions,
     landmarks: BodyLandmarks,
     image_size: tuple[int, int],
+    fit_head: bool = False,
 ) -> tuple[BodyEstimate, dict]:
     """
     Retarget MHR articulation hierarchically to MediaPipe 3D observations.
@@ -172,6 +496,9 @@ def refine_body_pose(
         Target-frame positions and relative 3D joint estimates from MediaPipe.
     image_size : tuple[int, int]
         Target width and height in pixels.
+    fit_head : bool, optional
+        Refine the neck and head against MediaPipe face points after the body
+        fit. Defaults to false.
 
     Returns
     -------
@@ -190,13 +517,128 @@ def refine_body_pose(
             'joints': joint_count,
         }
 
-    return _fit_body_joints(
+    fitted, summary = _fit_body_joints(
         runtime=runtime,
         target=target,
         proportions=proportions,
         landmarks=landmarks,
         image_size=image_size,
     )
+
+    if fit_head and landmarks.head_xy is not None:
+        fitted, summary['head_fit'] = _fit_head_pose(
+            runtime=runtime,
+            target=fitted,
+            proportions=proportions,
+            head_xy=landmarks.head_xy,
+            image_size=image_size,
+        )
+
+    return fitted, summary
+
+
+def _rotate_head_points(quaternion: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+    """Rotate 3D points by an MHR skeleton-state quaternion in XYZW order."""
+    axis = quaternion[:3].expand_as(points)
+    cross = 2 * torch.linalg.cross(axis, points)
+
+    return points + quaternion[3] * cross + torch.linalg.cross(axis, cross)
+
+
+@torch.enable_grad()
+def _fit_head_pose(
+    *,
+    runtime: InstantHMRRuntime,
+    target: BodyEstimate,
+    proportions: BodyProportions,
+    head_xy: np.ndarray,
+    image_size: tuple[int, int],
+) -> tuple[BodyEstimate, dict]:
+    """
+    Align rigid MHR head landmarks in target pixels through neck and head rotations.
+
+    Parameters
+    ----------
+    runtime : InstantHMRRuntime
+        Validated MHR LOD 1 rig and its parameter tables.
+    target : BodyEstimate
+        Pose and camera after the body fitting stages.
+    proportions : BodyProportions
+        Shape and scale used to render the mannequin.
+    head_xy : numpy.ndarray
+        Head observations in target pixels in ``HEAD_LANDMARKS`` order.
+    image_size : tuple[int, int]
+        Full target width and height in pixels.
+
+    Returns
+    -------
+    tuple[BodyEstimate, dict]
+        Updated neck and head rotation parameters and head-fit diagnostics.
+    """
+    valid = np.isfinite(head_xy).all(axis=1)
+
+    if valid.sum() < 3:
+        return target, {'status': 'skipped', 'reason': 'fewer than three head landmarks'}
+
+    rig = runtime.rig
+    character = rig.character_torch
+    parameter_names = rig.get_parameter_names()
+    angle_indices = [parameter_names.index(name) for name in HEAD_ANGLE_NAMES]
+    head = rig.get_joint_names().index('c_head')
+    params = pack_body(target.pose, proportions, runtime.tables).detach()
+    params = torch.cat((params, torch.zeros_like(proportions.shape)), dim=1)
+    camera = target.camera_translation
+    points = params.new_tensor(head_xy[valid])
+    axes = params.new_tensor((0.01, -0.01, -0.01))
+    center = params.new_tensor(image_size) / 2
+
+    # All five anchors are rigidly skinned to c_head on the LOD 1 topology.
+    with torch.no_grad():
+        rest = character.blend_shape.forward(proportions.shape)[0, HEAD_VERTICES][valid]
+        bind = character.linear_blend_skinning.inverse_bind_pose[head]
+        local = _rotate_head_points(bind[3:7], rest * bind[7]) + bind[:3]
+
+    def project(candidate: torch.Tensor, translation: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the selected rigid head anchors from the candidate pose."""
+        joints = character.model_parameters_to_joint_parameters(candidate)
+        state = character.joint_parameters_to_skeleton_state(joints)[0, head]
+        xyz = (_rotate_head_points(state[3:7], local * state[7]) + state[:3]) * axes + translation
+
+        return target.focal_length * xyz[:, :2] / xyz[:, 2:].clamp_min(1e-4) + center, xyz
+
+    initial = params[0, angle_indices]
+    limits = rig.get_parameter_limits()[angle_indices].to(params)
+    max_change = params.new_tensor((0.26, 0.26, 0.26, 0.52, 0.52, 0.52))
+    lower = torch.maximum(torch.minimum(limits[:, 0], initial), initial - max_change)
+    upper = torch.minimum(torch.maximum(limits[:, 1], initial), initial + max_change)
+    scale = max(float((points.amax(dim=0) - points.amin(dim=0)).norm()), 1.0)
+    empty = torch.empty((0, 2), dtype=torch.long, device=params.device)
+    candidate, _, improved = _fit_pose_stage(
+        project=project,
+        params=params,
+        camera=camera,
+        angle_indices=angle_indices,
+        bounds=(lower, upper),
+        image_targets=(empty, params.new_empty((0, 2))),
+        world_targets=(empty, params.new_empty((0, 3))),
+        pelvis_hint=None,
+        joint_targets=(torch.arange(len(points), device=params.device), points, scale, 1.0),
+        prior_weights=params.new_tensor((0.18, 0.18, 0.18, 0.06, 0.06, 0.06)),
+        steps=100,
+    )
+    with torch.no_grad():
+        before_px = (project(params, camera)[0] - points).square().sum(dim=1).mean().sqrt()
+        after_px = (project(candidate, camera)[0] - points).square().sum(dim=1).mean().sqrt()
+
+    summary = {
+        'status': 'fitted' if improved else 'unchanged',
+        'landmarks': len(points),
+        'before_px': round(float(before_px), 2),
+        'after_px': round(float(after_px), 2),
+    }
+    pose = candidate[:, :target.pose.shape[1]].clone()
+
+    return replace(target, pose=pose), summary
 
 
 def _project_rig_joints(
@@ -296,7 +738,7 @@ def _with_torso_centers(points: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     points : torch.Tensor
-        Body joint centers of shape ``(14, D)`` in BODY_JOINTS order, where
+        Body joint centers of shape ``(16, D)`` in BODY_JOINTS order, where
         D is two for pixel coordinates or three for camera-space coordinates.
 
     Returns
@@ -408,11 +850,11 @@ def _align_world_xy_to_image(
     Parameters
     ----------
     world : torch.Tensor
-        MediaPipe world-space joint positions of shape ``(16, 3)``, including
+        MediaPipe world-space joint positions of shape ``(18, 3)``, including
         the two virtual torso centers.
     observations : torch.Tensor
         MediaPipe pixel positions with the same joint ordering, shape
-        ``(16, 2)``.
+        ``(18, 2)``.
 
     Returns
     -------
@@ -573,7 +1015,6 @@ def _estimate_world_depth_scale(
     return float(np.clip(depth_scale / xy_scale, 0.25, 4.0))
 
 
-@torch.inference_mode(False)
 @torch.enable_grad()
 def _fit_body_joints(
     *,
@@ -639,12 +1080,25 @@ def _fit_body_joints(
             device=params.device,
         )
     )
+    calibration_points = observations
+
+    if landmarks.full_frame_xy is not None:
+        calibration_points = _with_torso_centers(
+            torch.as_tensor(
+                landmarks.full_frame_xy, dtype=params.dtype, device=params.device,
+            )
+        )
+
+    # Use the body landmarks for global calibration. Hand points only guide the arm fit.
+    calibration_points = calibration_points.clone()
+    calibration_points[[hand for _, hand in HAND_SEGMENTS]] = torch.nan
+
     world, world_xy_signs, world_xy_error = _align_world_xy_to_image(
-        raw_world, observations
+        raw_world, calibration_points,
     )
     world_depth_scale = _estimate_world_depth_scale(
         world,
-        observations,
+        calibration_points,
         focal_length=target.focal_length,
         image_size=image_size,
         person_size=landmarks.person_size,
@@ -654,6 +1108,15 @@ def _fit_body_joints(
     starts, ends = endpoints.unbind(dim=1)
     expected = observations[ends] - observations[starts]
     world_vectors = world[ends] - world[starts]
+
+    if landmarks.split_world_vectors is not None:
+        regional_vectors = torch.as_tensor(
+            landmarks.split_world_vectors, dtype=params.dtype, device=params.device,
+        )
+        regional = torch.isfinite(regional_vectors).all(dim=1)
+        world_vectors[regional] = regional_vectors[regional] * world.new_tensor(
+            (*world_xy_signs, world_depth_scale)
+        )
 
     # A nearly collapsed segment gives no reliable projected direction.
     image_segments = torch.isfinite(expected).all(
@@ -800,8 +1263,6 @@ def _fit_body_joints(
     limits = rig.get_parameter_limits().to(
         device=params.device, dtype=params.dtype
     )
-    foot_start = len(FIT_SEGMENTS) - len(FOOT_SEGMENTS)
-
     def fit_segment_stage(
         candidate: torch.Tensor,
         translation: torch.Tensor,
@@ -854,6 +1315,8 @@ def _fit_body_joints(
         selected = torch.as_tensor(
             segment_indices, dtype=torch.long, device=params.device
         )
+        stage_expected = expected[selected]
+        stage_vectors = world_vectors[selected]
         image_mask = image_segments[selected]
         world_mask = depth_segments[selected]
 
@@ -915,11 +1378,11 @@ def _fit_body_joints(
             bounds=(lower, upper),
             image_targets=(
                 endpoints[selected][image_mask],
-                F.normalize(expected[selected][image_mask], dim=1),
+                F.normalize(stage_expected[image_mask], dim=1),
             ),
             world_targets=(
                 endpoints[selected][world_mask],
-                F.normalize(world_vectors[selected][world_mask], dim=1),
+                F.normalize(stage_vectors[world_mask], dim=1),
             ),
             joint_targets=(
                 observed_positions,
@@ -937,120 +1400,31 @@ def _fit_body_joints(
             use_depth_order=use_depth_order,
             width_targets=(
                 endpoints[selected][image_mask],
-                expected[selected][image_mask].norm(dim=1),
+                stage_expected[image_mask].norm(dim=1),
                 max(landmarks.person_size, 1),
             ) if width_only else None,
         )
 
-    # Align the anatomical pelvis first. The complete 3D right/left hip axis
-    # removes the front/back sign ambiguity of an undirected image segment.
-    params, camera, root_fitted = fit_segment_stage(
+    hip_axis = expected[1]
+    hip_axis_visible = bool(torch.isfinite(hip_axis).all() and hip_axis.norm() >= 2)
+    params, camera, torso_fitted = _fit_torso(
         params,
         camera,
-        (1, 2),
-        ROOT_ANGLE_NAMES,
-        joint_indices_to_fit=HIPS,
-        joint_weight=TORSO_JOINT_WEIGHT,
-        fit_placement=True,
-        steps=220,
+        fit_stage=fit_segment_stage,
+        project=project,
+        hip_axis_visible=hip_axis_visible,
+        summary=summary,
     )
-    summary['root_retargeted'] = bool(root_fitted)
-
-    # Spine rotations distribute the upper-torso orientation over MHR's two
-    # overlapping bending controls. Their original values remain soft priors.
-    params, camera, spine_fitted = fit_segment_stage(
+    params, camera, limbs_fitted = _fit_limbs(
         params,
         camera,
-        (0, 2),
-        TORSO_ANGLE_NAMES,
-        joint_indices_to_fit=SHOULDERS,
-        joint_weight=TORSO_JOINT_WEIGHT,
-        steps=180,
+        fit_stage=fit_segment_stage,
+        observed_joints=observed_joints,
+        image_segments=image_segments,
+        depth_segments=depth_segments,
+        summary=summary,
     )
-    summary['spine_retargeted'] = bool(spine_fitted)
-    torso_xy, torso_xyz = project(params, camera)
-    summary['before_width_refinement_signed_twist_deg'] = _signed_torso_twist_deg(torso_xyz)
-
-    for label, (left, right) in (('shoulders', SHOULDERS), ('hips', HIPS)):
-        summary[f'before_width_refinement_{label}_px'] = round(
-            float((torso_xy[right] - torso_xy[left]).norm()), 2
-        )
-
-    width_angles = TORSO_ANGLE_NAMES
-
-    if image_segments[1]:
-        width_angles = (*ROOT_ANGLE_NAMES, *width_angles)
-
-    params, camera, width_fitted = fit_segment_stage(
-        params,
-        camera,
-        (0, 1),
-        width_angles,
-        steps=80,
-        width_only=True,
-    )
-    summary['torso_width_refined'] = bool(width_fitted)
-    fitted = root_fitted or spine_fitted or width_fitted
-
-    limb_joints = []
-    limb_angles = []
-
-    for (proximal, middle, distal), upper, hinge in LIMB_CHAINS:
-        # The original axial twists remain regularized, since sparse
-        # landmarks do not determine rotation around an individual bone.
-        available = [
-            joint for joint in (middle, distal)
-            if observed_joints[joint]
-        ]
-        bone_segments = (
-            FIT_SEGMENTS.index((proximal, middle)),
-            FIT_SEGMENTS.index((middle, distal)),
-        )
-
-        if available or depth_segments[list(bone_segments)].any():
-            limb_joints.extend(available)
-            limb_angles.extend(
-                f'{upper}_{suffix}' for suffix in ('twist', 'ry', 'rz')
-            )
-            limb_angles.append(hinge)
-
-    if limb_angles:
-        params, camera, limbs_fitted = fit_segment_stage(
-            params,
-            camera,
-            tuple(range(len(TORSO_SEGMENTS), foot_start)),
-            limb_angles,
-            joint_indices_to_fit=tuple(limb_joints),
-            joint_weight=LIMB_JOINT_WEIGHT,
-            steps=200,
-            use_depth_order=bool(limb_joints),
-        )
-        fitted |= limbs_fitted
-        summary['limbs_retargeted'] = bool(limbs_fitted)
-    else:
-        summary['limbs_retargeted'] = False
-
-    foot_angles = tuple(
-        f'{side}_foot_bend'
-        for side, segment in zip(('l', 'r'), FOOT_SEGMENTS)
-        if (
-            image_segments[FIT_SEGMENTS.index(segment)]
-            or depth_segments[FIT_SEGMENTS.index(segment)]
-        )
-    )
-    params, camera, feet_fitted = fit_segment_stage(
-        params,
-        camera,
-        tuple(range(foot_start, len(FIT_SEGMENTS))),
-        foot_angles,
-        joint_indices_to_fit=tuple(
-            joint for _, joint in FOOT_SEGMENTS if observed_joints[joint]
-        ),
-        joint_weight=FOOT_JOINT_WEIGHT,
-        steps=100,
-    )
-    fitted |= feet_fitted
-    summary['feet_retargeted'] = bool(feet_fitted)
+    fitted = torso_fitted or limbs_fitted
 
     if not fitted:
         summary['reason'] = 'no feasible pose improvement'
@@ -1094,6 +1468,190 @@ def _fit_body_joints(
     pose = params[:, :target.pose.shape[1]].clone()
 
     return replace(target, pose=pose, camera_translation=camera), summary
+
+
+def _fit_torso(
+    params: torch.Tensor,
+    camera: torch.Tensor,
+    *,
+    fit_stage,
+    project,
+    hip_axis_visible: bool,
+    summary: dict,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """
+    Fit the pelvis, spine, and projected torso widths in order.
+
+    Parameters
+    ----------
+    params, camera : torch.Tensor
+        Rig parameters and camera at the start of fitting.
+    fit_stage : callable
+        Optimizes a stage against the observed torso landmarks.
+    project : callable
+        Returns projected and camera-space joints for a candidate pose.
+    hip_axis_visible : bool
+        Whether the hip axis constrains the projected width refinement.
+    summary : dict
+        Receives per-stage diagnostics and the torso geometry before width refinement.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, bool]
+        Fitted torso parameters, camera, and whether any stage improved.
+    """
+    # Align the anatomical pelvis first. The complete 3D right/left hip axis
+    # removes the front/back sign ambiguity of an undirected image segment.
+    params, camera, root_fitted = fit_stage(
+        params,
+        camera,
+        (1, 2),
+        ROOT_ANGLE_NAMES,
+        joint_indices_to_fit=HIPS,
+        joint_weight=TORSO_JOINT_WEIGHT,
+        fit_placement=True,
+        steps=220,
+    )
+    summary['root_retargeted'] = bool(root_fitted)
+
+    # Spine rotations distribute the upper-torso orientation over MHR's two
+    # overlapping bending controls. Their original values remain soft priors.
+    params, camera, spine_fitted = fit_stage(
+        params,
+        camera,
+        (0, 2),
+        TORSO_ANGLE_NAMES,
+        joint_indices_to_fit=SHOULDERS,
+        joint_weight=TORSO_JOINT_WEIGHT,
+        steps=180,
+    )
+    summary['spine_retargeted'] = bool(spine_fitted)
+    torso_xy, torso_xyz = project(params, camera)
+    summary['before_width_refinement_signed_twist_deg'] = _signed_torso_twist_deg(torso_xyz)
+
+    for label, (left, right) in (('shoulders', SHOULDERS), ('hips', HIPS)):
+        summary[f'before_width_refinement_{label}_px'] = round(
+            float((torso_xy[right] - torso_xy[left]).norm()), 2
+        )
+
+    width_angles = TORSO_ANGLE_NAMES
+
+    if hip_axis_visible:
+        width_angles = (*ROOT_ANGLE_NAMES, *width_angles)
+
+    params, camera, width_fitted = fit_stage(
+        params,
+        camera,
+        (0, 1),
+        width_angles,
+        steps=80,
+        width_only=True,
+    )
+    summary['torso_width_refined'] = bool(width_fitted)
+    return params, camera, root_fitted or spine_fitted or width_fitted
+
+
+
+def _fit_limbs(
+    params: torch.Tensor,
+    camera: torch.Tensor,
+    *,
+    fit_stage,
+    observed_joints: torch.Tensor,
+    image_segments: torch.Tensor,
+    depth_segments: torch.Tensor,
+    summary: dict,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """
+    Fit arms, hands, legs, and feet against the MediaPipe observations.
+
+    Parameters
+    ----------
+    params, camera : torch.Tensor
+        Rig parameters and camera after fitting the torso.
+    fit_stage : callable
+        Optimizes a stage against the selected MediaPipe observations.
+    observed_joints : torch.Tensor
+        Availability mask for joint positions in the target image.
+    image_segments, depth_segments : torch.Tensor
+        Availability masks for projected and 3D segment directions.
+    summary : dict
+        Receives the limb and foot stage diagnostics.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, bool]
+        Limb parameters, camera, and whether either stage improved.
+    """
+    foot_start = len(FIT_SEGMENTS) - len(FOOT_SEGMENTS)
+    hand_by_wrist = dict(HAND_SEGMENTS)
+    limb_joints = []
+    limb_angles = []
+
+    for (proximal, middle, distal), upper, hinge in LIMB_CHAINS:
+        # The original axial twists remain regularized, since sparse
+        # landmarks do not determine rotation around an individual bone.
+        hand = hand_by_wrist.get(distal)
+        joints = (middle, distal) if hand is None else (middle, distal, hand)
+        available = [
+            joint for joint in joints
+            if observed_joints[joint]
+        ]
+        bone_segments = [
+            FIT_SEGMENTS.index(pair) for pair in zip((proximal, *joints[:-1]), joints)
+        ]
+
+        if available or depth_segments[bone_segments].any():
+            limb_joints.extend(available)
+            limb_angles.extend(
+                f'{upper}_{suffix}' for suffix in ('twist', 'ry', 'rz')
+            )
+            limb_angles.append(hinge)
+
+            if hand is not None and (
+                observed_joints[hand] or depth_segments[bone_segments[-1]]
+            ):
+                side = upper[0]
+                limb_angles.extend((f'{side}_wrist_ry', f'{side}_wrist_rz'))
+
+    if limb_angles:
+        params, camera, limbs_fitted = fit_stage(
+            params,
+            camera,
+            tuple(range(len(TORSO_SEGMENTS), foot_start)),
+            limb_angles,
+            joint_indices_to_fit=tuple(limb_joints),
+            joint_weight=LIMB_JOINT_WEIGHT,
+            steps=200,
+            use_depth_order=bool(limb_joints),
+        )
+        summary['limbs_retargeted'] = bool(limbs_fitted)
+    else:
+        limbs_fitted = False
+        summary['limbs_retargeted'] = False
+
+    foot_angles = tuple(
+        f'{side}_foot_bend'
+        for side, segment in zip(('l', 'r'), FOOT_SEGMENTS)
+        if (
+            image_segments[FIT_SEGMENTS.index(segment)]
+            or depth_segments[FIT_SEGMENTS.index(segment)]
+        )
+    )
+    params, camera, feet_fitted = fit_stage(
+        params,
+        camera,
+        tuple(range(foot_start, len(FIT_SEGMENTS))),
+        foot_angles,
+        joint_indices_to_fit=tuple(
+            joint for _, joint in FOOT_SEGMENTS if observed_joints[joint]
+        ),
+        joint_weight=FOOT_JOINT_WEIGHT,
+        steps=100,
+    )
+    summary['feet_retargeted'] = bool(feet_fitted)
+
+    return params, camera, limbs_fitted or feet_fitted
 
 
 def _fit_pose_stage(

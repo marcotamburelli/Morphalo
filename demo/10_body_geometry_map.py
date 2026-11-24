@@ -31,12 +31,16 @@ Inputs (local paths)
 - Pose refinement: run ``./fetch_media_pipe.sh`` and provide the pose task.
   Both renders fit the pelvis and spine, refine projected torso widths, then
   align the limbs using MediaPipe joint positions and relative depth order.
+  Set ``params.split_pose_detection`` to ``True`` to redetect the upper and
+  lower body in overlapping crops before fitting.
 
 Outputs
 -------
 The two RGBA PNGs are saved under ``outputs/body_geometry_map``. Both have a
-transparent background by default. Set ``background_color`` to an RGB color
-to render on an opaque background.
+transparent background by default. Set ``params.long_side`` to resize the
+base canvas proportionally to the target. The canvas expands around any
+overflowing mesh unless ``params.fit_canvas`` is set to ``False``.
+Set ``background_color`` to an RGB color to render on an opaque background.
 The debug folders contain a ``pose_overlay.png`` comparing the rendered
 skeleton with the target landmarks.
 """
@@ -60,6 +64,7 @@ BODY_SPEC = {
         'pose_landmarker_task': '~/models/mediapipe/pose_landmarker_heavy.task',
     },
     'params': {
+        'split_pose_detection': True,
         'body_color': '#b8b8b8',
         'background_color': None,
     },
@@ -84,11 +89,12 @@ with DAG(
         spec={
             **BODY_SPEC,
             'params': {
-                'body_color': '#b8b8b8',
-                'background_color': None,
+                **BODY_SPEC['params'],
                 'gender': 'f',
-                'chest_volume': 2,
-                'hip_volume': 1,
+                'body_volume': 1,
+                'chest_volume': 0.5,
+                'hip_volume': 0.3,
+                'waist_size': 0.90,
             },
         },
     )

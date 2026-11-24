@@ -8,6 +8,7 @@ import torch
 
 from morphalo.dag import DAG
 from morphalo.nodes.preprocess import body_geometry_map as node_module
+from morphalo.nodes.preprocess.utils import body_collision
 from morphalo.nodes.preprocess.utils import body_pose_fit
 from morphalo.nodes.preprocess.utils.body_pose_fit import (
     BODY_JOINTS,
@@ -18,8 +19,14 @@ from morphalo.nodes.preprocess.utils.body_pose_fit import (
     detect_body_landmarks,
     refine_body_pose,
 )
-from morphalo.nodes.preprocess.utils.body_render import render_body
-from morphalo.nodes.preprocess.utils.body_shape import adjust_body_volumes
+from morphalo.nodes.preprocess.utils.body_pose_debug import (
+    LANDMARK_COLOR,
+    RIG_COLOR,
+    draw_body_pose_overlay,
+    save_pose_crop_debug,
+)
+from morphalo.nodes.preprocess.utils.body_render import fit_body_canvas, render_body
+from morphalo.nodes.preprocess.utils.body_shape import BodyAxes, adjust_body_volumes
 from third_party.instanthmr.parameters import BodyEstimate, BodyProportions, pack_body
 
 
@@ -65,6 +72,246 @@ def test_world_xy_alignment_preserves_joint_order_and_depth():
     assert disagreement < 0.1
     torch.testing.assert_close(aligned, world, equal_nan=True)
     torch.testing.assert_close(reflected, original, equal_nan=True)
+
+
+@pytest.mark.parametrize('upper_detection', ['complete', 'partial', 'failed'])
+def test_split_pose_detection_merges_local_joints_and_preserves_full_frame_fallback(
+    monkeypatch, tmp_path, upper_detection,
+):
+    calls = []
+    indices = [index for index, _ in BODY_JOINTS[:-2]]
+    full_pixels = np.full((len(BODY_JOINTS), 2), 40)
+    full_pixels[6:8, 1] = [58, 62]
+    full_world = np.zeros((len(BODY_JOINTS), 3), dtype=np.float32)
+    upper_world = full_world.copy()
+    upper_world[1] = [0.25, 0.01, 0.03]
+    lower_world = full_world.copy()
+    lower_world[7:9] = [[0.23, 0.03, -0.08], [0.02, 0.15, -0.1]]
+
+    def detect(crop, detector, *, require_stable_pose, keep_out_of_frame):
+        calls.append((crop.shape[0], keep_out_of_frame))
+        local_xy = np.full((33, 2), 12)
+        world = np.zeros((33, 3), dtype=np.float32)
+        valid = np.ones(33, dtype=bool)
+
+        if len(calls) == 1:
+            local_xy[indices] = full_pixels[:-2]
+            world[indices] = full_world[:-2]
+            local_xy[[17, 19, 18, 20]] = 40
+        elif len(calls) == 2:
+            if upper_detection == 'failed':
+                raise RuntimeError('No upper pose')
+
+            local_xy[indices[:2]] = [[8, 10], [24, 16]]
+            world[indices] = upper_world[:-2]
+            local_xy[[17, 19]] = [[16, 25], [24, 29]]
+            world[[17, 19]] = [[0.10, 0.02, 0.04], [0.20, 0.04, 0.08]]
+            valid[18] = False
+            valid[indices[4]] = False
+            valid[indices[1]] = upper_detection == 'complete'
+        else:
+            local_xy[indices[6:8]] = [[9, 10], [25, 18]]
+            world[indices] = lower_world[:-2]
+            valid[indices[8]] = False
+
+        return SimpleNamespace(xy=local_xy, world_xyz=world, valid=valid, strong=valid)
+
+    monkeypatch.setattr(body_pose_fit, 'mp_pose_landmarks_full', detect)
+    rgb = np.zeros((100, 100, 3), dtype=np.uint8)
+    crop_debug = {}
+    detection = detect_body_landmarks(
+        rgb=rgb,
+        bbox=(0, 0, 100, 100),
+        pose_landmarker=object(),
+        split_pose_detection=True,
+        crop_debug=crop_debug,
+    )
+
+    assert calls == [(100, True), (60, False), (47, False)]
+    expected_shoulders = {
+        'complete': [[8, 37], [24, 43]],
+        'partial': [[8, 10], [40, 40]],
+        'failed': [[40, 40], [40, 40]],
+    }
+    np.testing.assert_array_equal(detection.xy[:2], expected_shoulders[upper_detection])
+    np.testing.assert_array_equal(detection.xy[4], full_pixels[4])
+    np.testing.assert_array_equal(detection.xy[5], [40, 40] if upper_detection == 'failed' else [12, 12])
+    np.testing.assert_array_equal(detection.xy[6:8], [[9, 56], [25, 64]])
+    np.testing.assert_array_equal(detection.xy[8], full_pixels[8])
+    np.testing.assert_array_equal(detection.xy[10], [12, 65])
+    expected_hand = [40, 40] if upper_detection == 'failed' else [20, 27]
+    np.testing.assert_array_equal(detection.xy[14], expected_hand)
+    np.testing.assert_array_equal(detection.xy[15], [40, 40])
+    np.testing.assert_array_equal(detection.full_frame_xy, full_pixels)
+    np.testing.assert_array_equal(detection.world_xyz, full_world)
+
+    vectors = detection.split_world_vectors
+    np.testing.assert_array_equal(vectors[1], lower_world[7] - lower_world[6])
+    assert np.isnan(vectors[2]).all()
+    assert np.isnan(vectors[body_pose_fit.FIT_SEGMENTS.index((6, 8))]).all()
+    assert np.isnan(vectors[body_pose_fit.FIT_SEGMENTS.index((4, 14))]).all()
+
+    artifacts = save_pose_crop_debug(crop_debug, tmp_path)
+    assert set(artifacts) == {'full', 'upper', 'lower'}
+    assert artifacts['lower']['bbox_xyxy'] == [0, 53, 100, 100]
+    assert 'image' not in artifacts['lower']
+    assert not (tmp_path / 'mediapipe_lower.png').exists()
+    assert 'image' not in artifacts['full']
+    assert not (tmp_path / 'mediapipe_full.png').exists()
+    with Image.open(artifacts['full']['pose_overlay']) as overlay:
+        assert overlay.size == (100, 100)
+    with Image.open(artifacts['lower']['pose_overlay']) as overlay:
+        assert overlay.getpixel((9, 10)) == LANDMARK_COLOR
+
+    if upper_detection == 'failed':
+        assert artifacts['upper']['error'] == 'No upper pose'
+        assert 'pose_overlay' not in artifacts['upper']
+        with Image.open(artifacts['upper']['image']) as original:
+            np.testing.assert_array_equal(np.array(original), rgb[:60])
+    else:
+        assert 'image' not in artifacts['upper']
+        assert not (tmp_path / 'mediapipe_upper.png').exists()
+
+    if upper_detection == 'complete':
+        np.testing.assert_array_equal(vectors[0], upper_world[1] - upper_world[0])
+    else:
+        assert np.isnan(vectors[0]).all()
+
+
+def test_split_pose_detection_is_an_opt_in_boolean():
+    spec = {'model': {'mhr_model_pt': 'rig.pt'}}
+
+    assert node_module._read_cfg(spec, 'body').split_pose_detection is False
+
+    spec['params'] = {'split_pose_detection': True}
+    assert node_module._read_cfg(spec, 'body').split_pose_detection is True
+
+    spec['params']['split_pose_detection'] = 'true'
+    with pytest.raises(ValueError, match='split_pose_detection'):
+        node_module._read_cfg(spec, 'body')
+
+
+@pytest.mark.parametrize(
+    ('axis', 'rotation'),
+    [
+        ((19, 20), None),
+        ((20, 20), [[0, -1], [1, 0]]),
+        ((-20, -20), [[0, 1], [-1, 0]]),
+        ((19, -20), [[-1, 0], [0, -1]]),
+    ],
+)
+def test_split_pose_cut_switches_at_45_degrees(axis, rotation):
+    points = np.full((len(BODY_JOINTS), 2), np.nan)
+    points[[0, 1]] = [[30, 15], [50, 15]]
+    points[[6, 7]] = points[[0, 1]] + axis
+    transform = body_pose_fit._torso_crop_transform((0, 0, 100, 60), points)
+
+    if rotation is None:
+        assert transform is None
+    else:
+        np.testing.assert_array_equal(transform[0][:, :2], rotation)
+
+
+def test_split_pose_detection_rotates_crops_and_maps_observations_back(monkeypatch, tmp_path):
+    inputs = []
+
+    def detect(crop, detector, *, require_stable_pose, keep_out_of_frame):
+        inputs.append(crop.copy())
+        xy = np.full((33, 2), -1)
+        world = np.full((33, 3), np.nan, dtype=np.float32)
+
+        if keep_out_of_frame:
+            xy[[11, 12, 23, 24]] = [[20, 25], [20, 35], [66, 25], [72, 35]]
+        elif len(inputs) == 3:
+            xy[[23, 24, 27]] = [[30, 10], [20, 16], [7, 8]]
+            world[[23, 24]] = [[0, 0, 0], [0.1, 0.2, 0.3]]
+
+        valid = (xy >= 0).all(axis=1)
+        return SimpleNamespace(xy=xy, world_xyz=world, valid=valid, strong=valid)
+
+    monkeypatch.setattr(body_pose_fit, 'mp_pose_landmarks_full', detect)
+    rgb = np.arange(60 * 100 * 3, dtype=np.uint8).reshape(60, 100, 3)
+    crop_debug = {}
+    result = detect_body_landmarks(
+        rgb=rgb,
+        bbox=(0, 0, 100, 60),
+        pose_landmarker=object(),
+        split_pose_detection=True,
+        crop_debug=crop_debug,
+    )
+
+    rectified = np.rot90(rgb, -1)
+    np.testing.assert_array_equal(inputs[0], rgb)
+    np.testing.assert_array_equal(inputs[1], rectified[:69])
+    np.testing.assert_array_equal(inputs[2], rectified[61:])
+    np.testing.assert_array_equal(result.xy[6:8], [[71, 25], [77, 35]])
+    np.testing.assert_array_equal(result.xy[10], [69, 52])
+    hip_vector = result.split_world_vectors[body_pose_fit.FIT_SEGMENTS.index((6, 7))]
+    np.testing.assert_allclose(hip_vector, [0.2, -0.1, 0.3])
+
+    artifacts = save_pose_crop_debug(crop_debug, tmp_path)
+    assert artifacts['lower']['bbox_xyxy'] == [61, 0, 100, 60]
+    np.testing.assert_array_equal(
+        artifacts['lower']['corners_xy'], [[61, 60], [61, 0], [100, 0], [100, 60]],
+    )
+    with Image.open(artifacts['lower']['pose_overlay']) as overlay:
+        assert overlay.size == (60, 39)
+
+
+def test_head_fit_moves_only_neck_and_head_parameters(monkeypatch):
+    rest = torch.tensor([
+        [0., -4., 12.], [3., 0., 9.], [-3., 0., 9.],
+        [7., -2., 0.], [-7., -2., 0.],
+    ])
+    monkeypatch.setattr(body_pose_fit, 'HEAD_VERTICES', list(range(len(rest))))
+    names = ['root_ry', *body_pose_fit.HEAD_ANGLE_NAMES]
+    yaw_index = names.index('head_twist')
+
+    def skeleton(parameters):
+        half_yaw = parameters[0, yaw_index] / 2
+        zero = half_yaw.new_zeros(())
+        one = half_yaw.new_ones(())
+        return torch.stack((
+            zero, zero, zero, zero, half_yaw.sin(), zero, half_yaw.cos(), one,
+        )).reshape(1, 1, 8)
+
+    rig = SimpleNamespace(
+        get_parameter_names=lambda: names,
+        get_parameter_limits=lambda: torch.tensor([[-1., 1.]] * len(names)),
+        get_joint_names=lambda: ['c_head'],
+        character_torch=SimpleNamespace(
+            model_parameters_to_joint_parameters=lambda parameters: parameters,
+            joint_parameters_to_skeleton_state=skeleton,
+            blend_shape=SimpleNamespace(forward=lambda shape: rest.unsqueeze(0)),
+            linear_blend_skinning=SimpleNamespace(
+                inverse_bind_pose=torch.tensor([[0., 0., 0., 0., 0., 0., 1., 1.]]),
+            ),
+        ),
+    )
+    runtime = SimpleNamespace(
+        rig=rig, tables={'scale_mean': torch.zeros(68), 'scale_comps': torch.zeros(28, 68)},
+    )
+    proportions = BodyProportions(torch.zeros(1, 45), torch.zeros(1, 6), torch.zeros(1, 28))
+    pose = torch.zeros(1, 130)
+    pose[0, 0] = 0.4
+    camera = torch.tensor([[0., 0., 2.]])
+    target = BodyEstimate(pose, proportions, camera, 800.)
+    yaw = torch.tensor(0.4)
+    x, y, z = rest.unbind(dim=1)
+    rotated = torch.stack((yaw.cos() * x + yaw.sin() * z, y, -yaw.sin() * x + yaw.cos() * z), dim=1)
+    xyz = rotated * torch.tensor((0.01, -0.01, -0.01)) + camera
+    pixels = (target.focal_length * xyz[:, :2] / xyz[:, 2:] + 256).numpy()
+
+    result, summary = body_pose_fit._fit_head_pose(
+        runtime=runtime, target=target, proportions=proportions, head_xy=pixels, image_size=(512, 512),
+    )
+
+    assert summary['status'] == 'fitted'
+    assert summary['after_px'] < summary['before_px']
+    assert result.pose[0, yaw_index] > 0
+    torch.testing.assert_close(result.pose[:, :1], pose[:, :1])
+    torch.testing.assert_close(result.pose[:, len(names):], pose[:, len(names):])
+    torch.testing.assert_close(result.camera_translation, camera)
 
 
 def test_world_depth_scale_recovers_relative_scale_from_perspective_projection():
@@ -273,7 +520,34 @@ def test_body_pose_fit_uses_arm_depth_order_independent_of_depth_scale():
     torch.testing.assert_close(*fitted_poses)
 
 
-def test_body_pose_fit_uses_body_joints_without_face_or_hand_landmarks():
+def test_hand_point_and_wrist_angles_participate_in_the_arm_fit():
+    observed = torch.zeros(len(BODY_JOINTS), dtype=torch.bool)
+    observed[[4, 5, 14]] = True
+    projected = torch.zeros(len(body_pose_fit.FIT_SEGMENTS), dtype=torch.bool)
+    spatial = projected.clone()
+    hand_segment = body_pose_fit.FIT_SEGMENTS.index((4, 14))
+    spatial[hand_segment] = True
+    fit_stage = MagicMock(side_effect=lambda pose, camera, *_args, **_kwargs: (pose, camera, False))
+
+    body_pose_fit._fit_limbs(
+        torch.zeros(1, 130),
+        torch.zeros(1, 3),
+        fit_stage=fit_stage,
+        observed_joints=observed,
+        image_segments=projected,
+        depth_segments=spatial,
+        summary={},
+    )
+
+    limb_stage = fit_stage.call_args_list[0]
+    assert hand_segment in limb_stage.args[2]
+    assert {'l_wrist_ry', 'l_wrist_rz'} <= set(limb_stage.args[3])
+    assert {'r_wrist_ry', 'r_wrist_rz'}.isdisjoint(limb_stage.args[3])
+    assert limb_stage.kwargs['joint_indices_to_fit'] == (4, 14, 5)
+    assert limb_stage.kwargs['use_depth_order']
+
+
+def test_body_pose_fit_uses_body_joints_without_face_or_hand_observations():
     # The synthetic rig can move the elbows and adjust ankle flexion.
     initial_joints = torch.tensor([
         [-30.0, 35.0, 0.0],
@@ -290,6 +564,8 @@ def test_body_pose_fit_uses_body_joints_without_face_or_hand_landmarks():
         [20.0, -120.0, 0.0],
         [-20.0, -130.0, 0.0],
         [20.0, -130.0, 0.0],
+        [-58.0, -5.0, 0.0],
+        [58.0, -5.0, 0.0],
     ])
     elbow_shift = torch.zeros_like(initial_joints)
     elbow_shift[2:4, 0] = 50
@@ -454,59 +730,256 @@ def test_body_render_keeps_the_nearest_surface_and_transparent_background():
     assert output[10, 10, 3] == 255
 
 
-def test_body_volume_controls_deform_only_their_respective_regions():
-    reference = torch.tensor([
-        [8.5, 129.0, 12.0],
-        [-8.5, 129.0, 12.0],
-        [8.5, 129.0, -12.0],
-        [19.0, 94.0, 0.0],
-        [-19.0, 94.0, 0.0],
-        [0.0, 155.0, 10.0],
-    ])
-    vertices = reference.unsqueeze(0).clone()
-    chest = adjust_body_volumes(vertices, reference, chest_volume=-1, hip_volume=0)
-    hips = adjust_body_volumes(vertices, reference, chest_volume=0, hip_volume=1)
+def test_body_canvas_expands_overflowing_edges_at_the_original_scale():
+    vertices = np.array(((0, -14, 1), (-11, 0, 1), (2, 5, 1)), dtype=np.float32)
+    faces = np.array(((0, 1, 2),))
+    frame = {'width': 20, 'height': 20, 'focal': 1}
+    colors = {'body_color': (180, 180, 180), 'background_color': None}
 
-    assert (chest[0, :2, 2] < vertices[0, :2, 2]).all()
-    torch.testing.assert_close(chest[0, 2:], vertices[0, 2:])
-    torch.testing.assert_close(chest[..., :2], vertices[..., :2])
-    assert hips[0, 3, 0] > vertices[0, 3, 0]
-    assert hips[0, 4, 0] < vertices[0, 4, 0]
-    torch.testing.assert_close(hips[0, [0, 1, 2, 5]], vertices[0, [0, 1, 2, 5]])
-    torch.testing.assert_close(hips[..., 1:], vertices[..., 1:])
-    torch.testing.assert_close(vertices[0], reference)
+    padding = fit_body_canvas(vertices, faces, **frame)
+    narrow = render_body(vertices, faces, **frame, **colors)
+    expanded = render_body(vertices, faces, **frame, **colors, padding=padding)
+
+    assert padding == (2, 5, 0, 0)
+    assert expanded.size == (22, 25)
+    assert expanded.getchannel('A').getbbox()[:2] == (1, 1)
+    np.testing.assert_array_equal(
+        np.array(expanded.crop((2, 5, 22, 25))),
+        np.array(narrow),
+    )
+    assert fit_body_canvas(vertices * (0.5, 0.5, 1), faces, **frame) == (0, 0, 0, 0)
 
 
 @pytest.mark.parametrize(
-    ('params', 'chest', 'hips'),
+    ('scale', 'offset', 'rig_pixel', 'landmark_pixel'),
     [
-        ({}, 0, 0),
-        ({'gender': 'm'}, -0.85, -0.45),
-        ({'gender': 'masculine'}, -0.85, -0.45),
-        ({'gender': 'f'}, 0.65, 0.5),
-        ({'gender': 'feminine', 'chest_volume': -1.0, 'hip_volume': 0.25}, -0.35, 0.75),
-        ({'chest_volume': 0.5, 'hip_volume': -0.5}, 0.5, -0.5),
+        (1.0, (7, 12), (52, 62), (82, 62)),
+        (0.8, (7.25, 20.25), (43, 60), (67, 60)),
     ],
 )
-def test_body_geometry_map_resolves_volume_presets(params, chest, hips):
+def test_body_pose_overlay_scales_and_shifts_both_skeletons(
+    scale, offset, rig_pixel, landmark_pixel,
+):
+    render = Image.new('RGBA', (120, 120))
+    rig_xy = np.full((len(BODY_JOINTS), 2), np.nan, dtype=np.float32)
+    rig_xy[0] = (45, 50)
+    landmark_xy = rig_xy.copy()
+    landmark_xy[0] = (75, 50)
+    landmarks = BodyLandmarks(landmark_xy, np.zeros((len(BODY_JOINTS), 3)), 100)
+
+    overlay = draw_body_pose_overlay(render, rig_xy, landmarks, scale=scale, offset=offset)
+
+    assert overlay.getpixel(rig_pixel) == RIG_COLOR
+    assert overlay.getpixel(landmark_pixel) == LANDMARK_COLOR
+    np.testing.assert_array_equal(landmarks.xy[0], (75, 50))
+
+
+@pytest.fixture
+def terminal_contact_geometry():
+    vertices = np.array([
+        [-0.1, -0.1, 0.95], [0.1, -0.1, 0.95], [0, 0.1, 0.95],
+        [-0.1, -0.1, 1.05], [0.1, -0.1, 1.05], [0, 0.1, 1.05],
+        [0, 0, 1.02], [0, 0, 1.2], [0, 0, 0.8],
+    ], dtype=np.float32)
+    region = body_collision.TerminalRegion(
+        name='l_hand',
+        samples=np.arange(6, 9),
+        obstacle_faces=np.array([[0, 2, 1], [3, 4, 5]]),
+        joint_indices=(4, 2),
+        angles=('wrist_y', 'wrist_z', 'wrist_twist', 'elbow', 'arm_y', 'arm_z'),
+    )
+
+    return vertices, region
+
+
+def test_terminal_collision_distinguishes_penetration_from_occlusion(terminal_contact_geometry):
+    vertices, region = terminal_contact_geometry
+
+    collision = body_collision.detect_terminal_collisions(vertices, (region,))['l_hand']
+
+    np.testing.assert_array_equal(collision.indices, [6])
+    np.testing.assert_allclose(collision.depths, [0.03], atol=1e-6)
+
+
+def test_terminal_collision_refines_only_the_penetrating_limb(monkeypatch, terminal_contact_geometry):
+    vertices, region = terminal_contact_geometry
+    monkeypatch.setattr(body_collision, 'terminal_regions', lambda runtime: (region,))
+    monkeypatch.setattr(
+        body_collision, 'project_body_joints', lambda **kwargs: np.zeros((len(BODY_JOINTS), 2)),
+    )
+    rig = SimpleNamespace(
+        get_parameter_names=lambda: list(region.angles),
+        get_parameter_limits=lambda: torch.tensor([[-1.0, 1.0]] * len(region.angles)),
+    )
+    proportions = BodyProportions(torch.zeros((1, 45)), torch.zeros((1, 6)), torch.zeros((1, 28)))
+    target = BodyEstimate(torch.zeros((1, 130)), proportions, torch.tensor([[0.0, 0.0, 2.0]]), 200)
+
+    def mesh(estimate):
+        deformed = vertices.copy()
+        deformed[6, 2] += 0.12 * float(estimate.pose[0, 0])
+
+        return deformed
+
+    refined, corrected, diagnostic = body_collision.refine_terminal_collisions(
+        runtime=SimpleNamespace(rig=rig),
+        target=target,
+        proportions=proportions,
+        image_size=(200, 200),
+        vertices=vertices,
+        mesh=mesh,
+    )
+
+    assert diagnostic['adjusted'] == ['l_hand']
+    assert diagnostic['after'] == {}
+    assert corrected[6, 2] >= 1.049
+    np.testing.assert_array_equal(corrected[[*range(6), 7, 8]], vertices[[*range(6), 7, 8]])
+    torch.testing.assert_close(refined.pose[:, 1:], target.pose[:, 1:])
+    assert refined.camera_translation is target.camera_translation
+
+
+def _rest_shape_reference():
+    return torch.tensor([
+        [8.5, 129, 17], [-8.5, 129, 17], [8.5, 129, -12],
+        [0, 129, 14], [14.5, 129, 10], [-14.5, 129, 10],
+        [21, 94, 0], [-21, 94, 0], [18, 82, 0], [-18, 82, 0],
+        [18, 102, 0], [-18, 102, 0], [14, 111, 0], [-14, 111, 0],
+        [16, 122, 0], [-16, 122, 0], [0, 155, 10],
+    ], dtype=torch.float32)
+
+
+def test_local_body_targets_measure_neutral_profiles_from_the_current_shape():
+    reference = _rest_shape_reference()
+    vertices = reference.repeat(2, 1, 1)
+    vertices[1, :2, 2] += 4
+    vertices[1, 6:8, 0] *= 1.1
+    vertices[1, 12:14, 0] *= 0.9
+
+    chest = adjust_body_volumes(vertices, reference, chest_volume=0.0)
+    hips = adjust_body_volumes(vertices, reference, hip_volume=0.0)
+    waist = adjust_body_volumes(vertices, reference, waist_size=1.0)
+
+    torch.testing.assert_close(chest[0, :2], chest[1, :2])
+    assert (chest[:, :2, 2] < vertices[:, :2, 2]).all()
+    torch.testing.assert_close(chest[:, 2:], vertices[:, 2:])
+    torch.testing.assert_close(hips[:, 6:8, 0].abs(), torch.full((2, 2), 18.))
+    torch.testing.assert_close(hips[..., 1:], vertices[..., 1:])
+    torch.testing.assert_close(waist[:, 12:14, 0].abs(), torch.full((2, 2), 17.1))
+    torch.testing.assert_close(waist[..., 1:], vertices[..., 1:])
+    torch.testing.assert_close(adjust_body_volumes(vertices, reference), vertices)
+
+
+def test_global_body_volume_scales_radial_thickness_and_blends_skinning_weights():
+    reference = torch.tensor([[2., 3., 4.], [-2., 5., 4.], [2., 8., 4.]])
+    axes = BodyAxes(
+        origins=torch.zeros(1, 3),
+        directions=torch.tensor([[0., 1., 0.]]),
+        weights=torch.tensor([[1.], [0.5], [0.]]),
+    )
+
+    shaped = adjust_body_volumes(reference.unsqueeze(0), reference, body_volume=1.2, body_axes=axes)
+
+    torch.testing.assert_close(shaped[0], torch.tensor([
+        [2.4, 3.0, 4.8], [-2.2, 5.0, 4.4], [2.0, 8.0, 4.0],
+    ]))
+
+
+def test_neck_thickness_scales_only_the_weighted_radial_offsets():
+    reference = torch.tensor([[2., 3., 4.], [-2., 5., 4.], [2., 8., 4.]])
+    neck_axis = BodyAxes(
+        origins=torch.zeros(1, 3),
+        directions=torch.tensor([[0., 1., 0.]]),
+        weights=torch.tensor([[1.], [0.5], [0.]]),
+    )
+    shaped = adjust_body_volumes(
+        reference.unsqueeze(0), reference, neck_thickness=0.8, neck_axis=neck_axis,
+    )
+
+    torch.testing.assert_close(shaped[0], torch.tensor([
+        [1.6, 3.0, 3.2], [-1.8, 5.0, 3.6], [2.0, 8.0, 4.0],
+    ]))
+
+
+@pytest.mark.parametrize(
+    ('params', 'chest', 'hips', 'waist', 'body_volume'),
+    [
+        ({}, None, None, None, 1.0),
+        ({'gender': 'm'}, 0.0, 0.0, 1.0, 1.0),
+        ({'gender': 'f'}, 0.65, None, 0.90, 1.0),
+        ({'gender': 'f', 'chest_volume': 0, 'hip_volume': 0.25}, 0.0, 0.25, 0.90, 1.0),
+        ({'gender': 'm', 'chest_volume': None, 'waist_size': None}, None, 0.0, None, 1.0),
+        ({'chest_volume': 0.5, 'hip_volume': 2.5}, 0.5, 2.5, None, 1.0),
+        ({'waist_size': 1.1, 'body_volume': 0.9}, None, None, 1.1, 0.9),
+    ],
+)
+def test_body_geometry_map_resolves_volume_presets(params, chest, hips, waist, body_volume):
     config = node_module._read_cfg(
         {'model': {'mhr_model_pt': 'mhr_model.pt'}, 'params': params},
         'body',
     )
 
-    assert config.chest_volume == pytest.approx(chest)
-    assert config.hip_volume == pytest.approx(hips)
+    assert (config.chest_volume, config.hip_volume, config.waist_size) == (chest, hips, waist)
+    assert config.body_volume == body_volume
+    assert config.neck_thickness == 1.0
+
+
+def test_neck_thickness_is_independent_of_the_body_multiplier():
+    config = node_module._read_cfg(
+        {
+            'model': {'mhr_model_pt': 'mhr_model.pt'},
+            'params': {'gender': 'feminine', 'body_volume': 1.15, 'neck_thickness': 0.9},
+        },
+        'body',
+    )
+
+    assert config.neck_thickness == 0.9
+    assert config.body_volume == 1.15
 
 
 @pytest.mark.parametrize(
-    ('shape_params', 'deformed'),
-    [({}, False), ({'gender': 'f', 'chest_volume': 0.25}, True)],
+    ('params', 'error'),
+    [
+        ({'body_volume': 1.5}, 'body_volume'),
+        ({'body_volume': True}, 'body_volume'),
+        ({'neck_thickness': 0.7}, 'neck_thickness'),
+        ({'neck_thickness': 1.3}, 'neck_thickness'),
+        ({'waist_size': 0}, 'waist_size'),
+        ({'hip_volume': float('inf')}, 'hip_volume'),
+        ({'chest_volume': -0.01}, 'chest_volume'),
+        ({'hip_volume': -0.01}, 'hip_volume'),
+    ],
+)
+def test_body_geometry_map_rejects_invalid_volume_targets(params, error):
+    with pytest.raises(ValueError, match=error):
+        node_module._read_cfg({'model': {'mhr_model_pt': 'mhr_model.pt'}, 'params': params}, 'body')
+
+
+@pytest.mark.parametrize('value', [0, -1, True, 1024.5, '1024'])
+def test_body_geometry_map_rejects_invalid_long_side(value):
+    spec = {'model': {'mhr_model_pt': 'rig.pt'}, 'params': {'long_side': value}}
+
+    with pytest.raises(ValueError, match='params.long_side'):
+        node_module._read_cfg(spec, 'body')
+
+
+@pytest.mark.parametrize(
+    ('params', 'deformed', 'target_size', 'output_size', 'padding'),
+    [
+        ({}, False, (20, 20), (24, 24), (0, 0, 4, 4)),
+        ({'gender': 'f', 'chest_volume': 0.25, 'fit_canvas': False}, True,
+         (20, 20), (20, 20), (0, 0, 0, 0)),
+        ({'long_side': 10, 'fit_canvas': False}, False, (20, 13), (10, 6), (0, 0, 0, 0)),
+        ({'long_side': 10}, False, (20, 13), (13, 13), (0, 2, 3, 5)),
+        ({'long_side': 32, 'fit_canvas': False}, False, (11, 20), (18, 32), (0, 0, 0, 0)),
+    ],
 )
 def test_body_geometry_map_averages_all_size_channels_and_keeps_target_pose(
-    tmp_path, monkeypatch, shape_params, deformed,
+    tmp_path, monkeypatch, params, deformed, target_size, output_size, padding,
 ):
     def estimate(rgb, bbox):
         value = float(rgb[0, 0, 0])
+
+        assert rgb.shape[:2] == target_size[::-1]
+
         return BodyEstimate(
             pose=torch.full((1, 130), value),
             proportions=BodyProportions(
@@ -529,10 +1002,11 @@ def test_body_geometry_map_averages_all_size_channels_and_keeps_target_pose(
         torch.testing.assert_close(packed[:, 136:], torch.full((1, 68), 34.0 * 28))
 
         if deformed:
-            reference = torch.tensor([[8.5, 129.0, 12.0], [19.0, 94.0, 0.0]])
+            reference = _rest_shape_reference()
             vertices = rest_deformation(reference.unsqueeze(0), reference)
-            assert vertices[0, 0, 2] > reference[0, 2]
-            assert vertices[0, 1, 0] > reference[1, 0]
+            assert vertices[0, 0, 2] < reference[0, 2]
+            torch.testing.assert_close(vertices[0, 6:8], reference[6:8])
+            torch.testing.assert_close(vertices[0, 12:14, 0].abs(), torch.full((2,), 15.39))
         else:
             assert rest_deformation is None
 
@@ -541,10 +1015,10 @@ def test_body_geometry_map_averages_all_size_channels_and_keeps_target_pose(
     runtime = SimpleNamespace(estimate=estimate, mesh=mesh, faces=np.array(((0, 1, 2),)))
     monkeypatch.setattr(node_module, 'get_instanthmr_model', lambda **kwargs: runtime)
     monkeypatch.setattr(node_module, 'get_yolo', lambda **kwargs: None)
-    monkeypatch.setattr(node_module, '_person_bbox', lambda *args: (0, 0, 20, 20))
+    monkeypatch.setattr(node_module, '_person_bbox', lambda *args: (0, 0, *target_size))
     target, first, second = (tmp_path / f'{value}.png' for value in (4, 12, 16))
     for value, path in zip((4, 12, 16), (target, first, second)):
-        Image.new('RGB', (20, 20), (value, 0, 0)).save(path)
+        Image.new('RGB', target_size, (value, 0, 0)).save(path)
     asset = tmp_path / 'mock-weight'
     asset.touch()
     with DAG(name='test_body_geometry_map', out_dir=tmp_path):
@@ -552,13 +1026,14 @@ def test_body_geometry_map_averages_all_size_channels_and_keeps_target_pose(
             name='body',
             spec={
                 'model': {'checkpoint': str(asset), 'mhr_model_pt': str(asset)},
-                'params': {'background_color': 'navy', **shape_params},
+                'params': {'background_color': 'navy', **params},
             },
         )
 
     result = node.run(tmp_path, {'default': {'image': target}, 'source': {'images': [first, second]}})
     assert result['source_images'] == [str(first), str(second)]
+    assert result['canvas_padding'] == dict(zip(('left', 'top', 'right', 'bottom'), padding))
     with Image.open(result['image']) as image:
-        assert image.size == (20, 20)
+        assert image.size == output_size
         assert image.mode == 'RGBA'
         assert image.getpixel((0, 0)) == (0, 0, 128, 255)

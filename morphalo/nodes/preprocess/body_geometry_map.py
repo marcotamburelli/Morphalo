@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from functools import partial
 from math import isfinite
-from numbers import Real
+from numbers import Integral, Real
 from pathlib import Path
 
 import cv2
@@ -20,14 +20,24 @@ from morphalo.dag import AttachmentSink, NodeRef
 from morphalo.nodes.common.config_resolve import SpecInput, resolve_spec
 from morphalo.nodes.common.device import is_cuda_device
 from morphalo.nodes.common.io import load_init_image, write_json_sidecar
-from morphalo.nodes.preprocess.utils.body_pose_debug import draw_body_pose_overlay
+from morphalo.nodes.img import resolve_long_side_size
+from morphalo.nodes.preprocess.utils.body_collision import refine_terminal_collisions
+from morphalo.nodes.preprocess.utils.body_pose_debug import (
+    draw_body_pose_overlay,
+    save_pose_crop_debug,
+)
 from morphalo.nodes.preprocess.utils.body_pose_fit import (
+    BodyPoseCrop,
     detect_body_landmarks,
     project_body_joints,
     refine_body_pose,
 )
-from morphalo.nodes.preprocess.utils.body_render import render_body
-from morphalo.nodes.preprocess.utils.body_shape import adjust_body_volumes
+from morphalo.nodes.preprocess.utils.body_render import fit_body_canvas, render_body
+from morphalo.nodes.preprocess.utils.body_shape import (
+    adjust_body_volumes,
+    rest_body_axes,
+    rest_neck_axis,
+)
 from morphalo.nodes.preprocess.utils.color_ops import parse_color
 from morphalo.nodes.sdxl_resolve import (
     resolve_image_paths,
@@ -45,10 +55,10 @@ CHECKPOINT = {
     'filename': 'instanthmr_medium_commercial.safetensors',
     'revision': '964effb58c3358ca8a0e35da386f49de1480ac9e',
 }
-GENDER_VOLUMES = {
-    'estimated': (0.0, 0.0),
-    'masculine': (-0.85, -0.45),
-    'feminine': (0.65, 0.5),
+BODY_SHAPE_PRESETS = {
+    'estimated': (None, None, None),
+    'masculine': (0.0, 0.0, 1.0),
+    'feminine': (0.65, None, 0.90),
 }
 GENDER_ALIASES = {'m': 'masculine', 'f': 'feminine'}
 
@@ -64,9 +74,46 @@ class Config:
     device: str
     body_color: tuple[int, int, int]
     background_color: tuple[int, int, int] | None
-    chest_volume: float
-    hip_volume: float
+    chest_volume: float | None
+    hip_volume: float | None
+    waist_size: float | None
+    body_volume: float
+    neck_thickness: float
+    long_side: int | None
+    fit_canvas: bool
+    split_pose_detection: bool
+    fit_head: bool
     save_debug: bool
+
+
+def _shape_value(
+    value: object,
+    name: str,
+    node_id: str,
+    *,
+    bounds: tuple[float, float | None] | None = None,
+) -> float:
+    """Validate a finite body-shape value and any inclusive lower and upper bounds."""
+    try:
+        valid = isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
+    except OverflowError:
+        valid = False
+
+    if not valid:
+        raise ValueError(f"'{node_id}': params.{name} must be a finite number")
+
+    number = float(value)
+
+    if bounds is not None:
+        minimum, maximum = bounds
+
+        if maximum is None and number < minimum:
+            raise ValueError(f"'{node_id}': params.{name} must be at least {minimum}")
+
+        if maximum is not None and not minimum <= number <= maximum:
+            raise ValueError(f"'{node_id}': params.{name} must be between {minimum} and {maximum}")
+
+    return number
 
 
 def _read_cfg(spec: dict, node_id: str) -> Config:
@@ -174,25 +221,54 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         gender = gender.strip().lower()
         gender = GENDER_ALIASES.get(gender, gender)
 
-    if not isinstance(gender, str) or gender not in GENDER_VOLUMES:
+    if not isinstance(gender, str) or gender not in BODY_SHAPE_PRESETS:
         raise ValueError(
             f"'{node_id}': params.gender must be estimated, masculine (m), or feminine (f)"
         )
 
-    volumes = []
+    chest_preset, hip_preset, waist_preset = BODY_SHAPE_PRESETS[gender]
+    chest_volume = params.get('chest_volume', chest_preset)
+    hip_volume = params.get('hip_volume', hip_preset)
+    waist_size = params.get('waist_size', waist_preset)
 
-    for name, preset in zip(('chest_volume', 'hip_volume'), GENDER_VOLUMES[gender]):
-        value = params.get(name, 0)
+    if chest_volume is not None:
+        chest_volume = _shape_value(chest_volume, 'chest_volume', node_id, bounds=(0.0, None))
 
-        try:
-            valid = isinstance(value, Real) and not isinstance(value, bool) and isfinite(value)
-        except OverflowError:
-            valid = False
+    if hip_volume is not None:
+        hip_volume = _shape_value(hip_volume, 'hip_volume', node_id, bounds=(0.0, None))
 
-        if not valid:
-            raise ValueError(f"'{node_id}': params.{name} must be a finite number")
+    if waist_size is not None:
+        waist_size = _shape_value(waist_size, 'waist_size', node_id, bounds=(0.8, 1.2))
 
-        volumes.append(preset + float(value))
+    body_volume = _shape_value(
+        params.get('body_volume', 1.0), 'body_volume', node_id, bounds=(0.75, 1.25),
+    )
+    neck_thickness = _shape_value(
+        params.get('neck_thickness', 1.0), 'neck_thickness', node_id, bounds=(0.75, 1.25),
+    )
+
+    long_side = params.get('long_side')
+
+    if long_side is not None:
+        if isinstance(long_side, bool) or not isinstance(long_side, Integral) or long_side <= 0:
+            raise ValueError(f"'{node_id}': params.long_side must be a positive integer or None")
+
+        long_side = int(long_side)
+
+    fit_canvas = params.get('fit_canvas', True)
+
+    if not isinstance(fit_canvas, bool):
+        raise ValueError(f"'{node_id}': params.fit_canvas must be a boolean")
+
+    split_pose_detection = params.get('split_pose_detection', False)
+
+    if not isinstance(split_pose_detection, bool):
+        raise ValueError(f"'{node_id}': params.split_pose_detection must be a boolean")
+
+    fit_head = params.get('fit_head', False)
+
+    if not isinstance(fit_head, bool):
+        raise ValueError(f"'{node_id}': params.fit_head must be a boolean")
 
     return Config(
         checkpoint=checkpoint,
@@ -202,8 +278,15 @@ def _read_cfg(spec: dict, node_id: str) -> Config:
         device=str(model.get('device', 'cuda')),
         body_color=body_color,
         background_color=background_color,
-        chest_volume=volumes[0],
-        hip_volume=volumes[1],
+        chest_volume=chest_volume,
+        hip_volume=hip_volume,
+        waist_size=waist_size,
+        body_volume=body_volume,
+        neck_thickness=neck_thickness,
+        long_side=long_side,
+        fit_canvas=fit_canvas,
+        split_pose_detection=split_pose_detection,
+        fit_head=fit_head,
         save_debug=bool(debug.get('save_debug', False)),
     )
 
@@ -303,7 +386,7 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                 ``~/models/mhr/mhr_model.pt``.
             ``pose_landmarker_task`` : str or pathlib.Path, optional
                 Local MediaPipe Pose Landmarker task. A path enables 3D pose
-                refinement using shoulders, elbows, wrists, hips, knees,
+                refinement using shoulders, elbows, wrists, hands, hips, knees,
                 ankles, and forefeet. The fitting accepts usable observations
                 outside the image and uses no visibility or presence weighting.
                 Omit the path to render the direct InstantHMR pose.
@@ -318,22 +401,73 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                 TorchScript mesh decoding runs on CPU.
 
         ``params`` : dict, optional
+            ``split_pose_detection`` : bool, optional
+                With a MediaPipe pose task configured, redetect the upper
+                and lower body in overlapping crops before fitting. Use a
+                horizontal cut below 45 degrees from the image vertical and
+                a vertical cut at 45 degrees or more.
+                Missing regional landmarks fall back to the full-person
+                detection. Defaults to ``False``.
+            ``fit_head`` : bool, optional
+                Refine the neck and head after body fitting using MediaPipe
+                nose, eye, and ear landmarks. Defaults to ``False``.
+            ``long_side`` : int or None, optional
+                Positive length in pixels of the longer render canvas side
+                before padding. The shorter side follows the EXIF-oriented
+                target's aspect ratio, rounded to at least one pixel.
+                Defaults to ``None`` to use the target dimensions. Detection
+                and fitting use the original target resolution.
+            ``fit_canvas`` : bool, optional
+                Expand the render canvas on sides where the mannequin
+                overflows, adding a margin of 3% of its projected height.
+                Runs after ``long_side`` is applied. Defaults to ``True``.
             ``gender`` : str, optional
-                Rest-mesh volume preset. Defaults to ``'estimated'``, which
-                contributes zero to both controls. ``'masculine'`` (``'m'``)
-                contributes -0.85 to the chest and -0.45 to the hips.
-                ``'feminine'`` (``'f'``) contributes +0.65 to the chest and
-                +0.50 to the hips.
-            ``chest_volume`` : float, optional
-                Unitless signed adjustment added to the chest preset.
-                Defaults to zero. Positive values increase forward projection
-                and negative values reduce it. The maximum displacement
-                approaches 4 cm on the unposed mesh.
-            ``hip_volume`` : float, optional
-                Unitless signed adjustment added to the hip preset.
-                Defaults to zero. Positive values widen the hip surface
-                and negative values narrow it. The maximum lateral
-                displacement approaches 3.5 cm per side on the unposed mesh.
+                Default surface targets on the source mesh, or on the target
+                mesh when no source is connected. ``'estimated'`` (default)
+                leaves all three regions without a local target.
+                ``'masculine'`` (``'m'``) uses neutral chest and hips and a
+                neutral waist size of 1.0. ``'feminine'`` (``'f'``) uses a
+                chest target of 0.65 and a waist size of 0.90, leaving the
+                hips without a local target. Explicit values replace the
+                preset for their own region. Pass ``None`` to disable a
+                region's local target even when the preset defines one.
+            ``body_volume`` : float, optional
+                Radial thickness multiplier for the torso and limbs, from
+                0.75 to 1.25. Defaults to 1.0. For example, 1.10 increases
+                thickness around the bones by up to 10%. The effect tapers
+                into the head, hands and feet. Applied before local targets.
+                The multiplier controls thickness, and the rig's bone
+                lengths and joint centers remain fixed.
+            ``neck_thickness`` : float, optional
+                Radial thickness multiplier for the neck, from 0.75 to
+                1.25. Defaults to 1.0 for the estimated neck thickness,
+                independently of ``gender``. For example, 0.90 reduces
+                thickness by up to 10%, with a smooth taper where the
+                neck meets the head and shoulders. The neck length and
+                the head and neck pose remain fixed.
+            ``chest_volume`` : float or None, optional
+                Unitless target relative to the rib-cage profile estimated
+                from the shaped sternum and ribs. Accepts finite values
+                greater than or equal to zero. Use 0 to bring the chest
+                toward that profile and positive values to add forward
+                prominence. Start between 0 and 0.5 for modest changes.
+                At full influence, values of 0.5, 1, and 2 target
+                about 1.85, 3.05, and 3.86 cm from neutral, respectively.
+                The target approaches 4 cm via ``tanh``, so values above
+                2 add little effect.
+            ``hip_volume`` : float or None, optional
+                Unitless target relative to the side contour interpolated
+                between the upper thigh and pelvis. Accepts finite values
+                greater than or equal to zero. Use 0 to bring the hip sides
+                toward that contour and positive values to widen it.
+                Start between 0 and 0.5 for modest changes. At full influence, values
+                of 0.5, 1, and 2 target about 1.62, 2.67, and 3.37 cm per
+                side from neutral, respectively. The target approaches
+                3.5 cm per side via ``tanh``, so values above 2 add little effect.
+            ``waist_size`` : float or None, optional
+                Target waist-width multiplier from 0.8 to 1.2, relative
+                to the neutral contour between the pelvis and lower ribs.
+                1.0 follows that contour and 0.90 targets 90% of its width.
             ``body_color`` : str or sequence of numbers, optional
                 Mannequin base color before shading. Defaults to ``'#b8b8b8'``.
             ``background_color`` : str or sequence of numbers or None, optional
@@ -343,7 +477,9 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
         ``debug`` : dict, optional
             ``save_debug`` : bool, optional
                 Save an overlay of the rendered MHR skeleton and any
-                MediaPipe pose observations in a separate color.
+                MediaPipe pose observations in a separate color. Also save
+                pre-merge overlays for the MediaPipe crops and the original
+                input image of each failed crop.
                 Defaults to ``False``.
 
     Inputs
@@ -360,8 +496,12 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
     -------
     dict
         ``image`` : str
-            PNG path. The image matches the EXIF-oriented target dimensions.
-            Visible mannequin pixels are opaque.
+            PNG path. The base canvas uses the EXIF-oriented target size
+            or the size requested by ``long_side``, and may expand around
+            the projection. Visible mannequin pixels are opaque.
+        ``canvas_padding`` : dict[str, int]
+            Added render pixels on the left, top, right, and bottom. The
+            left and top values locate the base canvas within the PNG.
         ``source_images`` : list[str]
             Reference paths that contributed to the arithmetic mean.
         ``rejected_source_images`` : list[dict]
@@ -374,13 +514,22 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
             ``root_retargeted``, ``spine_retargeted``, ``limbs_retargeted``,
             ``torso_width_refined``, and ``feet_retargeted`` stage flags, and
             errors before and after fitting. Direction errors and torso
-            twist angles are in degrees.
+            twist angles are in degrees. MediaPipe twist diagnostics use the
+            full-person detection.
             Joint reprojection RMS, pelvis offset and projected shoulder and
             hip widths are in pixels. The distance between the torso
             midpoints is in centimetres.
+            ``terminal_collisions`` reports hand and foot surface samples
+            detected inside the mesh before and after local correction.
+            ``head_fit`` reports the optional head fit status and landmark
+            reprojection errors in pixels.
         ``debug`` : dict, optional
             Diagnostic directory and ``pose_overlay`` PNG path when
-            ``debug.save_debug`` is true.
+            ``debug.save_debug`` is true. ``mediapipe_crops`` records each
+            attempted crop's full-frame bounds and either the MediaPipe-only
+            overlay or the detection error. Failed crops also include the
+            input image path, and rotated crops include their four corners
+            in target pixels.
         ``metadata`` : str
             Path to the JSON sidecar used by the DAG.
 
@@ -401,8 +550,8 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
     proportions for regions outside the frame or hidden by occlusion can
     therefore be less reliable. Every usable source view contributes equally
     to the proportion average, including its estimates for hidden regions.
-    For a partial target, the full mesh is projected into the target frame
-    and any geometry outside the image bounds is clipped.
+    For a partial target, the full mesh is projected at the target scale
+    and can extend the canvas when ``fit_canvas`` is enabled.
 
     Pose refinement matches landmarks by anatomical side. It selects global
     X/Y signs for the MediaPipe world coordinates by comparing their segment
@@ -414,13 +563,22 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
     The fitting first orients the rig at the pelvis using the hip axis and
     the torso centerline. A lateral camera shift aligns the hip midpoint.
     It then adjusts the spine to align the shoulder axis and centerline.
+    With split pose detection, image landmarks are merged in target pixels.
+    Complete shoulder and hip axes are translated vertically to match the
+    heights of their full-person midpoints. Their horizontal positions and
+    the other regional landmarks are retained. Local 3D directions come from
+    the crop containing both joints when available. The 3D torso centerline
+    comes from the full-person detection.
     A separate pass refines the projected shoulder and hip widths, allowing
     up to three degrees of change in torso directions and signed twist.
-    With the torso fixed, elbows, wrists, knees, and ankles are fitted to
+    With the torso fixed, elbows, wrists, hands, knees, and ankles are fitted to
     their image positions. The sign of MediaPipe depth differences guides
     which end of each segment is nearer. Stages with no limb pixels use 3D
     directions when available. A final pass refines ankle flexion.
     Priors favor the InstantHMR angles for axial twists and spine curvature.
+    A final collision pass can adjust hand or foot articulation when the
+    skinned surface penetrates another region. It keeps the projected
+    limb joints close to the fitted positions.
 
     The chosen proportions set the bone lengths. The distance between the
     virtual shoulder and hip midpoints can vary as the spine bends. Focal
@@ -429,10 +587,12 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
 
     Volume controls deform the transferred or estimated surface before
     skinning. The selected skeletal proportions determine joint placement.
-    Each control adds its value to the preset and passes the sum through
-    ``tanh``. Effective magnitudes of 0.5, 1, and 2 produce about 46%, 76%,
-    and 96% of the maximum displacement, respectively, at full influence.
-    Displacement tapers smoothly across each region.
+    Body thickness is scaled first. Local targets then move the surface
+    toward profiles measured from the surrounding anatomy, with smooth
+    transitions at the edges. The targets share their meaning across
+    presets. For example, ``gender='feminine'`` and ``chest_volume=0``
+    target the neutral rib cage, while ``chest_volume=None`` retains the
+    chest from the selected shape after the general thickness adjustment.
 
     The PNG can be composited over a background or passed to an RGB
     annotator with ``background_color`` set.
@@ -523,9 +683,19 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
 
         # The target estimate defines the output frame, camera, and joint pose.
         detector = get_yolo(model_name=cfg.yolo_model, device=cfg.device)
-        target_rgb = np.array(
-            load_init_image(target_path, apply_exif_orientation=True)
-        )
+        target_image = load_init_image(target_path, apply_exif_orientation=True)
+        render_width, render_height = target_image.size
+        render_scale = 1.0
+
+        if cfg.long_side is not None:
+            render_scale = cfg.long_side / max(target_image.size)
+            render_width, render_height = resolve_long_side_size(
+                image=target_image, long_side=cfg.long_side, multiple=1,
+            )
+            render_width = max(1, render_width)
+            render_height = max(1, render_height)
+
+        target_rgb = np.array(target_image)
         target_bbox = _person_bbox(
             detector, target_rgb, cfg.device, target_path
         )
@@ -574,6 +744,7 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
         height, width = target_rgb.shape[:2]
         pose_fit = None
         landmarks = None
+        crop_debug: dict[str, BodyPoseCrop] | None = {} if cfg.save_debug else None
 
         if cfg.pose_landmarker_task is not None:
             pose_landmarker = get_mediapipe_pose_landmarker(
@@ -585,6 +756,8 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                     rgb=target_rgb,
                     bbox=target_bbox,
                     pose_landmarker=pose_landmarker,
+                    split_pose_detection=cfg.split_pose_detection,
+                    crop_debug=crop_debug,
                 )
             except RuntimeError as exc:
                 pose_fit = {'status': 'skipped', 'reason': str(exc)}
@@ -595,29 +768,68 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                     proportions=proportions,
                     landmarks=landmarks,
                     image_size=(width, height),
+                    fit_head=cfg.fit_head,
                 )
 
-        # Render the resulting mesh in the target camera frame.
-        if cfg.chest_volume or cfg.hip_volume:
-            vertices = runtime.mesh(
-                target,
-                proportions,
+        mesh = partial(runtime.mesh, proportions=proportions)
+
+        local_targets = (cfg.chest_volume, cfg.hip_volume, cfg.waist_size)
+
+        if (
+            cfg.body_volume != 1.0
+            or cfg.neck_thickness != 1.0
+            or any(value is not None for value in local_targets)
+        ):
+            body_axes = rest_body_axes(runtime.rig) if cfg.body_volume != 1.0 else None
+            neck_axis = rest_neck_axis(runtime.rig) if cfg.neck_thickness != 1.0 else None
+            mesh = partial(
+                mesh,
                 rest_deformation=partial(
                     adjust_body_volumes,
                     chest_volume=cfg.chest_volume,
                     hip_volume=cfg.hip_volume,
+                    waist_size=cfg.waist_size,
+                    body_volume=cfg.body_volume,
+                    body_axes=body_axes,
+                    neck_thickness=cfg.neck_thickness,
+                    neck_axis=neck_axis,
                 ),
             )
-        else:
-            vertices = runtime.mesh(target, proportions)
+
+        vertices = mesh(target)
+
+        if pose_fit is not None and pose_fit['status'] == 'fitted':
+            target, vertices, collisions = refine_terminal_collisions(
+                runtime=runtime,
+                target=target,
+                proportions=proportions,
+                image_size=(width, height),
+                vertices=vertices,
+                mesh=mesh,
+            )
+            pose_fit['terminal_collisions'] = collisions
+
+        render_focal = target.focal_length * render_scale
+        padding = (0, 0, 0, 0)
+
+        if cfg.fit_canvas:
+            padding = fit_body_canvas(
+                vertices,
+                runtime.faces,
+                width=render_width,
+                height=render_height,
+                focal=render_focal,
+            )
+
         image = render_body(
             vertices,
             runtime.faces,
-            width=width,
-            height=height,
-            focal=target.focal_length,
+            width=render_width,
+            height=render_height,
+            focal=render_focal,
             body_color=cfg.body_color,
             background_color=cfg.background_color,
+            padding=padding,
         )
 
         # Persist the PNG and the source diagnostics for downstream DAG runs.
@@ -632,6 +844,7 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
             'node': self.op,
             'id': self.id,
             'image': str(out_path),
+            'canvas_padding': dict(zip(('left', 'top', 'right', 'bottom'), padding)),
             'source_images': sources,
             'rejected_source_images': rejected,
         }
@@ -649,11 +862,27 @@ class BodyGeometryMap(CudaPostRunMixin, NodeRef):
                 proportions=proportions,
                 image_size=(width, height),
             )
-            draw_body_pose_overlay(image, rig_xy, landmarks).save(overlay_path)
+            # Account for integer rounding of the shorter side at the principal point.
+            offset = (
+                padding[0] + (render_width - width * render_scale) / 2,
+                padding[1] + (render_height - height * render_scale) / 2,
+            )
+            draw_body_pose_overlay(
+                image,
+                rig_xy,
+                landmarks,
+                scale=render_scale,
+                offset=offset,
+            ).save(overlay_path)
             output['debug'] = {
                 'debug_directory': str(debug_dir),
                 'pose_overlay': str(overlay_path),
             }
+
+            if crop_debug:
+                output['debug']['mediapipe_crops'] = save_pose_crop_debug(
+                    crop_debug, debug_dir,
+                )
 
         output['metadata'] = str(write_json_sidecar(out_path, output))
 

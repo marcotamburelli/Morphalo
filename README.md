@@ -511,8 +511,12 @@ target >> body
 sources >> body.source()
 ```
 
-The output `image` is a full-frame PNG with an opaque mannequin and transparent
-background. Set `params.body_color` to customize the mannequin or
+The output `image` is a PNG with an opaque mannequin and transparent
+background. By default, the target canvas expands on any side the projected
+mesh overflows, with a margin of 3% of the projected mannequin height.
+Set `params.fit_canvas` to `False` for target-size output. The `canvas_padding`
+left and top values give the original target's origin in the expanded PNG.
+Set `params.body_color` to customize the mannequin or
 `params.background_color` to fill the background before passing the image to an
 RGB annotator such as `ImgAuxMap`. Both accept hex RGB colors and CSS color names.
 Override the default checkpoint, detector, or device in `spec['model']` using
